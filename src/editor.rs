@@ -1,5 +1,6 @@
 use crate::document::SaveCompletion;
 use crate::{Document, DocumentError};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,6 +80,14 @@ struct SaveJob {
     rx: mpsc::Receiver<Result<SaveCompletion, DocumentError>>,
 }
 
+#[derive(Debug)]
+struct LoadJob {
+    path: PathBuf,
+    total_bytes: u64,
+    loaded_bytes: Arc<AtomicU64>,
+    rx: mpsc::Receiver<Result<Document, DocumentError>>,
+}
+
 /// Lightweight editor-tab state with a document, cursor, and async save tracking.
 #[derive(Debug)]
 pub struct EditorTab {
@@ -87,7 +96,9 @@ pub struct EditorTab {
     generation: u64,
     cursor: CursorPosition,
     pinned: bool,
+    load_job: Option<LoadJob>,
     save_job: Option<SaveJob>,
+    clear_dirty_after_open: bool,
 }
 
 impl EditorTab {
@@ -99,7 +110,9 @@ impl EditorTab {
             generation: 0,
             cursor: CursorPosition::default(),
             pinned: false,
+            load_job: None,
             save_job: None,
+            clear_dirty_after_open: false,
         }
     }
 
@@ -120,25 +133,65 @@ impl EditorTab {
         self.save_job.is_some()
     }
 
+    /// Returns `true` while any background load/save worker is active.
+    pub fn is_busy(&self) -> bool {
+        self.is_loading() || self.is_saving()
+    }
+
     /// Returns `true` while a background load is in progress.
-    ///
-    /// The current implementation always returns `false`.
     pub fn is_loading(&self) -> bool {
-        false
+        self.load_job.is_some()
+    }
+
+    /// Returns document indexing progress as `(indexed_bytes, total_bytes)`.
+    pub fn indexing_progress(&self) -> Option<(usize, usize)> {
+        self.doc.indexing_progress()
     }
 
     /// Returns background-load progress.
-    ///
-    /// The current implementation always returns `None`.
     pub fn loading_progress(&self) -> Option<(u64, u64, PathBuf)> {
-        None
+        let job = self.load_job.as_ref()?;
+        Some((
+            job.loaded_bytes
+                .load(Ordering::Relaxed)
+                .min(job.total_bytes),
+            job.total_bytes,
+            job.path.clone(),
+        ))
     }
 
     /// Polls the background-load state.
-    ///
-    /// The current implementation always returns `None`.
     pub fn poll_load_job(&mut self) -> Option<Result<(), DocumentError>> {
-        None
+        let state = match self.load_job.as_ref()?.rx.try_recv() {
+            Ok(res) => res,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let job = self.load_job.take().expect("load job must exist");
+                return Some(Err(DocumentError::Open {
+                    path: job.path,
+                    source: io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "load worker disconnected unexpectedly",
+                    ),
+                }));
+            }
+        };
+
+        self.load_job = None;
+        Some(match state {
+            Ok(doc) => {
+                self.finish_open(doc);
+                Ok(())
+            }
+            Err(err) => Err(err),
+        })
+    }
+
+    /// Polls whichever background job is active.
+    ///
+    /// Load jobs are checked first because open/save are mutually exclusive.
+    pub fn poll_background_job(&mut self) -> Option<Result<(), DocumentError>> {
+        self.poll_load_job().or_else(|| self.poll_save_job())
     }
 
     /// Returns immutable access to the tab document.
@@ -204,25 +257,72 @@ impl EditorTab {
                 source: io::Error::other("cannot open while save is in progress"),
             });
         }
-        self.doc = Document::open(path)?;
-        self.generation = self.generation.wrapping_add(1);
-        self.cursor = CursorPosition::default();
+        if self.is_loading() {
+            return Err(DocumentError::Open {
+                path,
+                source: io::Error::other("cannot open while another load is in progress"),
+            });
+        }
+        let doc = Document::open(path)?;
+        self.finish_open(doc);
+        Ok(())
+    }
+
+    /// Starts opening a file on a background worker.
+    ///
+    /// # Errors
+    /// Returns [`DocumentError`] if another background load or save is already
+    /// in progress for the tab.
+    pub fn open_file_async(&mut self, path: PathBuf) -> Result<(), DocumentError> {
+        if self.is_saving() {
+            return Err(DocumentError::Write {
+                path,
+                source: io::Error::other("cannot open while save is in progress"),
+            });
+        }
+        if self.is_loading() {
+            return Err(DocumentError::Open {
+                path,
+                source: io::Error::other("load already in progress"),
+            });
+        }
+
+        let total_bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        let loaded_bytes = Arc::new(AtomicU64::new(0));
+        let rx = spawn_load_worker(path.clone(), total_bytes, Arc::clone(&loaded_bytes));
+        self.load_job = Some(LoadJob {
+            path,
+            total_bytes,
+            loaded_bytes,
+            rx,
+        });
+        self.clear_dirty_after_open = false;
         Ok(())
     }
 
     /// Closes the current document and replaces it with an empty one.
     pub fn close_file(&mut self) {
+        self.load_job = None;
         self.save_job = None;
         self.doc = Document::new();
         self.generation = self.generation.wrapping_add(1);
         self.cursor = CursorPosition::default();
+        self.clear_dirty_after_open = false;
     }
 
-    /// Reserved for post-edit-frame state synchronization.
-    pub fn after_text_edit_frame(&mut self) {}
+    /// Clears a deferred dirty flag scheduled after a clean document open.
+    pub fn after_text_edit_frame(&mut self) {
+        if !self.clear_dirty_after_open {
+            return;
+        }
+        self.doc.mark_clean();
+        self.clear_dirty_after_open = false;
+    }
 
-    /// Reserved for cancelling a deferred dirty-flag clear after open.
-    pub fn cancel_clear_dirty_after_open(&mut self) {}
+    /// Cancels the deferred dirty-flag clear scheduled after a clean open.
+    pub fn cancel_clear_dirty_after_open(&mut self) {
+        self.clear_dirty_after_open = false;
+    }
 
     /// Saves the document synchronously to its current path.
     ///
@@ -233,6 +333,12 @@ impl EditorTab {
         let Some(path) = self.current_path().map(|p| p.to_path_buf()) else {
             return Err(SaveError::NoPath);
         };
+        if self.is_loading() {
+            return Err(SaveError::Io(DocumentError::Write {
+                path,
+                source: io::Error::other("cannot save while load is in progress"),
+            }));
+        }
         if !self.doc.is_dirty() {
             return Ok(());
         }
@@ -246,6 +352,12 @@ impl EditorTab {
     /// # Errors
     /// Returns [`DocumentError`] if the write operation fails.
     pub fn save_as(&mut self, path: PathBuf) -> Result<(), DocumentError> {
+        if self.is_loading() {
+            return Err(DocumentError::Write {
+                path,
+                source: io::Error::other("cannot save while load is in progress"),
+            });
+        }
         self.doc.save_to(&path)?;
         self.generation = self.generation.wrapping_add(1);
         Ok(())
@@ -339,6 +451,12 @@ impl EditorTab {
                 source: io::Error::other("save already in progress"),
             });
         }
+        if self.is_loading() {
+            return Err(DocumentError::Write {
+                path,
+                source: io::Error::other("cannot save while load is in progress"),
+            });
+        }
 
         if !self.doc.is_dirty() && self.current_path() == Some(path.as_path()) {
             return Ok(false);
@@ -357,6 +475,13 @@ impl EditorTab {
         });
         Ok(true)
     }
+
+    fn finish_open(&mut self, doc: Document) {
+        self.clear_dirty_after_open = !doc.is_dirty();
+        self.doc = doc;
+        self.generation = self.generation.wrapping_add(1);
+        self.cursor = CursorPosition::default();
+    }
 }
 
 fn spawn_save_worker(
@@ -366,6 +491,22 @@ fn spawn_save_worker(
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let result = prepared.execute(written_bytes);
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+fn spawn_load_worker(
+    path: PathBuf,
+    total_bytes: u64,
+    loaded_bytes: Arc<AtomicU64>,
+) -> mpsc::Receiver<Result<Document, DocumentError>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = Document::open(path);
+        if result.is_ok() {
+            loaded_bytes.store(total_bytes, Ordering::Relaxed);
+        }
         let _ = tx.send(result);
     });
     rx
@@ -392,10 +533,11 @@ mod tests {
         assert!(tab.is_dirty());
         assert!(tab.save_async().unwrap());
         assert!(tab.is_saving());
+        assert!(tab.is_busy());
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(result) = tab.poll_save_job() {
+            if let Some(result) = tab.poll_background_job() {
                 result.unwrap();
                 break;
             }
@@ -432,6 +574,64 @@ mod tests {
         tab.update_cursor_char_index(4);
         assert_eq!(tab.cursor().line(), 2);
         assert_eq!(tab.cursor().column(), 2);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_file_async_completes_and_exposes_progress() {
+        let dir = std::env::temp_dir().join(format!("qem-editor-open-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("open.txt");
+        fs::write(&path, b"alpha\nbeta\n").unwrap();
+
+        let mut tab = EditorTab::new(7);
+        tab.set_cursor_line_col(9, 9);
+        tab.open_file_async(path.clone()).unwrap();
+
+        let progress = tab.loading_progress().expect("load progress should exist");
+        assert_eq!(progress.1, fs::metadata(&path).unwrap().len());
+        assert_eq!(progress.2, path);
+        assert!(tab.is_loading());
+        assert!(tab.is_busy());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(result) = tab.poll_background_job() {
+                result.unwrap();
+                break;
+            }
+            assert!(Instant::now() < deadline, "async load timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(!tab.is_loading());
+        assert_eq!(tab.cursor().line(), 1);
+        assert_eq!(tab.cursor().column(), 1);
+        assert_eq!(tab.current_path(), Some(path.as_path()));
+        assert_eq!(tab.document().line_count(), 3);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_clear_dirty_after_open_preserves_real_edit() {
+        let dir =
+            std::env::temp_dir().join(format!("qem-editor-dirty-open-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("dirty-open.txt");
+        fs::write(&path, b"alpha\n").unwrap();
+
+        let mut tab = EditorTab::new(3);
+        tab.open_file(path.clone()).unwrap();
+        let _ = tab.document_mut().try_insert_text_at(0, 0, "X").unwrap();
+        tab.cancel_clear_dirty_after_open();
+        tab.after_text_edit_frame();
+
+        assert!(tab.is_dirty());
+        assert!(tab.text().starts_with('X'));
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir_all(&dir);

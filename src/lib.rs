@@ -18,7 +18,7 @@ pub mod index;
 pub(crate) mod piece_tree;
 pub mod storage;
 
-pub use document::{Document, DocumentError, LineSlice};
+pub use document::{Document, DocumentError, LineEnding, LineSlice};
 #[cfg(feature = "editor")]
 pub use editor::{CursorPosition, EditorTab, SaveError};
 pub use storage::{FileStorage, StorageOpenError};

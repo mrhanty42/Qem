@@ -1,6 +1,7 @@
-use memchr::memchr2_iter;
+use memchr::{memchr2, memchr2_iter};
 use ropey::{Rope, RopeBuilder};
 use std::io::{self, Write};
+use std::iter::FusedIterator;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
@@ -16,6 +17,7 @@ use crate::piece_tree::{Piece, PieceSource, PieceTree, SessionMeta, editlog_path
 const FULL_INDEX_MAX_FILE_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 const MAX_INDEXED_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
 const MAX_LINE_OFFSETS_BYTES: usize = 128 * 1024 * 1024; // 128 MiB budget for line start offsets
+const INLINE_FULL_INDEX_MAX_FILE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 const INDEXER_YIELD_EVERY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const AVG_LINE_LEN_ESTIMATE: usize = 50;
 const AVG_LINE_LEN_SAMPLE_BYTES: usize = 256 * 1024; // 256 KiB windows
@@ -27,6 +29,7 @@ const PARTIAL_PIECE_TABLE_MAX_LINES: usize = LINE_LENGTHS_MAX_SYNC_LINES;
 const PARTIAL_PIECE_TABLE_SCAN_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 const APPROX_LINE_BACKTRACK_BYTES: usize = 64 * 1024;
 const APPROX_LINE_FORWARD_BYTES: usize = 256 * 1024;
+const TAIL_FAST_PATH_MAX_BACKSCAN_BYTES: usize = 1024 * 1024; // 1 MiB
 const SAVE_STREAM_CHUNK_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 const MAX_ROPE_EDIT_FILE_BYTES: usize = 128 * 1024 * 1024; // 128 MiB safety cap for full materialization
 const PIECE_TREE_TARGET_BYTES: usize = 64 * 1024;
@@ -35,8 +38,9 @@ const PIECE_TREE_DISK_MIN_BYTES: usize = PIECE_TABLE_MIN_BYTES;
 const PIECE_SESSION_FLUSH_DEBOUNCE: Duration = Duration::from_millis(250);
 const PIECE_SESSION_FORCE_AFTER_EDITS: usize = 32;
 
+/// Detected dominant line ending style for a document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) enum LineEnding {
+pub enum LineEnding {
     #[default]
     Lf,
     Crlf,
@@ -44,7 +48,8 @@ pub(crate) enum LineEnding {
 }
 
 impl LineEnding {
-    fn as_str(self) -> &'static str {
+    /// Returns the literal line break sequence for this style.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Lf => "\n",
             Self::Crlf => "\r\n",
@@ -54,20 +59,17 @@ impl LineEnding {
 }
 
 fn detect_line_ending(bytes: &[u8]) -> LineEnding {
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\n' => return LineEnding::Lf,
-            b'\r' => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                    return LineEnding::Crlf;
-                }
-                return LineEnding::Cr;
-            }
-            _ => i += 1,
-        }
+    let Some(pos) = memchr2(b'\n', b'\r', bytes) else {
+        return LineEnding::Lf;
+    };
+
+    match bytes[pos] {
+        b'\n' if pos > 0 && bytes[pos - 1] == b'\r' => LineEnding::Crlf,
+        b'\n' => LineEnding::Lf,
+        b'\r' if pos + 1 < bytes.len() && bytes[pos + 1] == b'\n' => LineEnding::Crlf,
+        b'\r' => LineEnding::Cr,
+        _ => LineEnding::Lf,
     }
-    LineEnding::Lf
 }
 
 fn normalize_insert_text(
@@ -369,6 +371,82 @@ impl LineOffsets {
             (file_len / AVG_LINE_LEN_ESTIMATE).saturating_add(2)
         };
         est_lines.min(max_offsets).max(1)
+    }
+}
+
+#[derive(Debug)]
+struct InlineOpenAnalysis {
+    line_offsets: LineOffsets,
+    line_ending: LineEnding,
+    avg_line_len: usize,
+}
+
+fn analyze_inline_open(bytes: &[u8]) -> InlineOpenAnalysis {
+    let file_len = bytes.len();
+    let avg_line_len = |line_breaks: usize| {
+        if file_len == 0 {
+            AVG_LINE_LEN_ESTIMATE
+        } else {
+            file_len.div_ceil(line_breaks.saturating_add(1)).max(1)
+        }
+    };
+
+    let mut detected_line_ending = None;
+
+    if file_len <= u32::MAX as usize {
+        let mut offsets = Vec::with_capacity(LineOffsets::capacity_for::<u32>(file_len));
+        offsets.push(0);
+        let mut line_breaks = 0usize;
+        for pos in memchr2_iter(b'\n', b'\r', bytes) {
+            match bytes[pos] {
+                b'\r' if pos + 1 < bytes.len() && bytes[pos + 1] == b'\n' => {
+                    detected_line_ending.get_or_insert(LineEnding::Crlf);
+                    continue;
+                }
+                b'\n' if pos > 0 && bytes[pos - 1] == b'\r' => {}
+                b'\n' => {
+                    detected_line_ending.get_or_insert(LineEnding::Lf);
+                }
+                b'\r' => {
+                    detected_line_ending.get_or_insert(LineEnding::Cr);
+                }
+                _ => continue,
+            }
+            offsets.push((pos + 1) as u32);
+            line_breaks += 1;
+        }
+        return InlineOpenAnalysis {
+            line_offsets: LineOffsets::U32(offsets),
+            line_ending: detected_line_ending.unwrap_or(LineEnding::Lf),
+            avg_line_len: avg_line_len(line_breaks),
+        };
+    }
+
+    let mut offsets = Vec::with_capacity(LineOffsets::capacity_for::<u64>(file_len));
+    offsets.push(0);
+    let mut line_breaks = 0usize;
+    for pos in memchr2_iter(b'\n', b'\r', bytes) {
+        match bytes[pos] {
+            b'\r' if pos + 1 < bytes.len() && bytes[pos + 1] == b'\n' => {
+                detected_line_ending.get_or_insert(LineEnding::Crlf);
+                continue;
+            }
+            b'\n' if pos > 0 && bytes[pos - 1] == b'\r' => {}
+            b'\n' => {
+                detected_line_ending.get_or_insert(LineEnding::Lf);
+            }
+            b'\r' => {
+                detected_line_ending.get_or_insert(LineEnding::Cr);
+            }
+            _ => continue,
+        }
+        offsets.push((pos + 1) as u64);
+        line_breaks += 1;
+    }
+    InlineOpenAnalysis {
+        line_offsets: LineOffsets::U64(offsets),
+        line_ending: detected_line_ending.unwrap_or(LineEnding::Lf),
+        avg_line_len: avg_line_len(line_breaks),
     }
 }
 
@@ -729,16 +807,18 @@ fn trailing_mmap_line_ranges(
     bytes: &[u8],
     file_len: usize,
     line_count: usize,
-) -> Vec<(usize, usize)> {
+    max_backscan_bytes: usize,
+) -> Option<Vec<(usize, usize)>> {
     if file_len == 0 || line_count == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     let mut starts = Vec::with_capacity(line_count.saturating_add(2));
     starts.push(file_len);
 
     let mut pos = file_len;
-    while starts.len() < line_count.saturating_add(1) && pos > 0 {
+    let scan_floor = file_len.saturating_sub(max_backscan_bytes);
+    while starts.len() < line_count.saturating_add(1) && pos > scan_floor {
         pos -= 1;
         match bytes[pos] {
             b'\n' => starts.push(pos + 1),
@@ -751,6 +831,10 @@ fn trailing_mmap_line_ranges(
         }
     }
 
+    if starts.len() < line_count.saturating_add(1) && scan_floor > 0 && pos == scan_floor {
+        return None;
+    }
+
     starts.push(0);
     starts.sort_unstable();
 
@@ -760,7 +844,7 @@ fn trailing_mmap_line_ranges(
     for i in from..starts.len().saturating_sub(1) {
         ranges.push((starts[i], starts[i + 1]));
     }
-    ranges
+    Some(ranges)
 }
 
 #[derive(Debug)]
@@ -802,6 +886,92 @@ pub(crate) struct PieceTable {
     pending_session_flush: bool,
     pending_session_edits: usize,
     last_session_flush: Option<Instant>,
+}
+
+struct PieceTableLineSliceCollector {
+    target_lines: usize,
+    start_col: usize,
+    max_cols: usize,
+    slices: Vec<LineSlice>,
+    line_buf: Vec<u8>,
+    line_col: usize,
+    visible_cols: usize,
+    pending_cr: bool,
+}
+
+impl PieceTableLineSliceCollector {
+    fn new(target_lines: usize, start_col: usize, max_cols: usize) -> Self {
+        Self {
+            target_lines,
+            start_col,
+            max_cols,
+            slices: Vec::with_capacity(target_lines),
+            line_buf: Vec::with_capacity(max_cols.min(256).saturating_mul(4)),
+            line_col: 0,
+            visible_cols: 0,
+            pending_cr: false,
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.slices.len() >= self.target_lines
+    }
+
+    fn push_segment(&mut self, bytes: &[u8]) {
+        let mut i = 0usize;
+        while i < bytes.len() && !self.is_done() {
+            let b = bytes[i];
+            if self.pending_cr {
+                self.pending_cr = false;
+                if b == b'\n' {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            match b {
+                b'\n' => {
+                    self.finish_line();
+                    i += 1;
+                }
+                b'\r' => {
+                    self.finish_line();
+                    self.pending_cr = true;
+                    i += 1;
+                }
+                _ => {
+                    let step = utf8_step(bytes, i, bytes.len());
+                    if self.line_col >= self.start_col && self.visible_cols < self.max_cols {
+                        self.line_buf.extend_from_slice(&bytes[i..i + step]);
+                        self.visible_cols += 1;
+                    }
+                    self.line_col += 1;
+                    i += step;
+                }
+            }
+        }
+    }
+
+    fn finish_eof(&mut self) {
+        if !self.is_done() {
+            self.finish_line();
+        }
+    }
+
+    fn into_slices(self) -> Vec<LineSlice> {
+        self.slices
+    }
+
+    fn finish_line(&mut self) {
+        if self.is_done() {
+            return;
+        }
+        let text = String::from_utf8(std::mem::take(&mut self.line_buf))
+            .unwrap_or_else(|err| String::from_utf8_lossy(&err.into_bytes()).into_owned());
+        self.slices.push(LineSlice::new(text, true));
+        self.line_col = 0;
+        self.visible_cols = 0;
+    }
 }
 
 impl PieceTable {
@@ -993,6 +1163,52 @@ impl PieceTable {
             .unwrap_or_else(|err| String::from_utf8_lossy(&err.into_bytes()).into_owned())
     }
 
+    pub(crate) fn line_slices_exact(
+        &self,
+        first_line0: usize,
+        line_count: usize,
+        start_col: usize,
+        max_cols: usize,
+    ) -> Vec<LineSlice> {
+        if line_count == 0 {
+            return Vec::new();
+        }
+        if first_line0 >= self.line_count() {
+            return vec![LineSlice::new(String::new(), true); line_count];
+        }
+
+        let available = self
+            .line_count()
+            .saturating_sub(first_line0)
+            .min(line_count);
+        let Some(start) = self.line_start_byte(first_line0) else {
+            return vec![LineSlice::new(String::new(), true); line_count];
+        };
+        if start >= self.known_byte_len {
+            return vec![LineSlice::new(String::new(), true); line_count];
+        }
+
+        let mut collector = PieceTableLineSliceCollector::new(available, start_col, max_cols);
+        self.pieces.visit_range(
+            start,
+            self.known_byte_len,
+            |piece, local_start, local_end| {
+                if collector.is_done() {
+                    return;
+                }
+                let seg_start = piece.start + local_start;
+                let seg_end = piece.start + local_end;
+                let src = self.source_bytes(piece.src);
+                collector.push_segment(&src[seg_start..seg_end]);
+            },
+        );
+        collector.finish_eof();
+
+        let mut slices = collector.into_slices();
+        slices.resize(line_count, LineSlice::new(String::new(), true));
+        slices
+    }
+
     pub(crate) fn insert_text_at(
         &mut self,
         line_ending: LineEnding,
@@ -1171,6 +1387,61 @@ impl PieceTable {
                 }
             });
         offset.min(end)
+    }
+
+    fn advance_offset_by_text_units(&self, start: usize, text_units: usize) -> usize {
+        let start = start.min(self.total_len);
+        if text_units == 0 || start >= self.total_len {
+            return start;
+        }
+
+        let mut remaining = text_units;
+        let mut offset = start;
+        let mut pending_cr = false;
+        self.pieces
+            .visit_range(start, self.total_len, |piece, local_start, local_end| {
+                if remaining == 0 && !pending_cr {
+                    return;
+                }
+                let seg_start = piece.start + local_start;
+                let seg_end = piece.start + local_end;
+                let src = self.source_bytes(piece.src);
+                let mut i = seg_start;
+                while i < seg_end && (remaining > 0 || pending_cr) {
+                    if pending_cr {
+                        pending_cr = false;
+                        if src[i] == b'\n' {
+                            i += 1;
+                            offset = offset.saturating_add(1);
+                            continue;
+                        }
+                    }
+                    if remaining == 0 {
+                        break;
+                    }
+
+                    match src[i] {
+                        b'\r' => {
+                            remaining -= 1;
+                            i += 1;
+                            offset = offset.saturating_add(1);
+                            pending_cr = true;
+                        }
+                        b'\n' => {
+                            remaining -= 1;
+                            i += 1;
+                            offset = offset.saturating_add(1);
+                        }
+                        _ => {
+                            let step = utf8_step(src, i, seg_end);
+                            remaining -= 1;
+                            i += step;
+                            offset = offset.saturating_add(step);
+                        }
+                    }
+                }
+            });
+        offset.min(self.total_len)
     }
 
     fn insert_bytes(&mut self, pos: usize, bytes: &[u8]) -> io::Result<()> {
@@ -1692,6 +1963,33 @@ impl LineSlice {
     }
 }
 
+struct Lines<'a> {
+    doc: &'a Document,
+    next_line: usize,
+    total_lines: usize,
+}
+
+impl<'a> Iterator for Lines<'a> {
+    type Item = LineSlice;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_line >= self.total_lines {
+            return None;
+        }
+        let slice = self.doc.line_slice(self.next_line, 0, usize::MAX);
+        self.next_line += 1;
+        Some(slice)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.total_lines.saturating_sub(self.next_line);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for Lines<'_> {}
+impl FusedIterator for Lines<'_> {}
+
 /// File-system, mapping, and edit-capability errors produced by [`Document`].
 #[derive(Debug)]
 pub enum DocumentError {
@@ -1784,17 +2082,23 @@ impl Document {
 
     fn from_storage(path: PathBuf, storage: FileStorage) -> Self {
         let file_len = storage.len();
-        let line_ending = detect_line_ending(storage.bytes());
-        let line_offsets: Arc<RwLock<LineOffsets>> =
-            Arc::new(RwLock::new(LineOffsets::new_for_file_len(file_len)));
+        let inline_analysis = (file_len > 0 && file_len <= INLINE_FULL_INDEX_MAX_FILE_BYTES)
+            .then(|| analyze_inline_open(storage.bytes()));
+        let line_ending = inline_analysis
+            .as_ref()
+            .map(|analysis| analysis.line_ending)
+            .unwrap_or_else(|| detect_line_ending(storage.bytes()));
         let disk_index = DiskLineIndex::open_or_build(&path, &storage);
         let indexing = Arc::new(AtomicBool::new(true));
         let indexing_started = Instant::now();
         let indexed_bytes = Arc::new(AtomicUsize::new(0));
         let avg_line_len = Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE));
         let use_u32_offsets = file_len <= u32::MAX as usize;
+        let new_line_offsets = || Arc::new(RwLock::new(LineOffsets::new_for_file_len(file_len)));
 
-        if file_len > 0
+        // Persistent piece-table sessions are only created for large documents,
+        // so skipping this sidecar probe avoids useless I/O on small-file opens.
+        if file_len >= PIECE_TREE_DISK_MIN_BYTES
             && let Ok(Some((pieces, add, meta))) = PieceTree::try_open_disk_session(&path)
         {
             indexing.store(false, Ordering::Relaxed);
@@ -1802,7 +2106,7 @@ impl Document {
             return Self {
                 path: Some(path),
                 storage: Some(storage.clone()),
-                line_offsets,
+                line_offsets: new_line_offsets(),
                 disk_index,
                 indexing,
                 indexing_started: Some(indexing_started),
@@ -1823,7 +2127,7 @@ impl Document {
             return Self {
                 path: Some(path),
                 storage: Some(storage),
-                line_offsets,
+                line_offsets: new_line_offsets(),
                 disk_index,
                 indexing,
                 indexing_started: Some(indexing_started),
@@ -1837,8 +2141,30 @@ impl Document {
             };
         }
 
+        if let Some(inline_analysis) = inline_analysis {
+            indexing.store(false, Ordering::Relaxed);
+            indexed_bytes.store(file_len, Ordering::Relaxed);
+            avg_line_len.store(inline_analysis.avg_line_len, Ordering::Relaxed);
+            return Self {
+                path: Some(path),
+                storage: Some(storage),
+                line_offsets: Arc::new(RwLock::new(inline_analysis.line_offsets)),
+                disk_index,
+                indexing,
+                indexing_started: Some(indexing_started),
+                file_len,
+                indexed_bytes,
+                avg_line_len,
+                line_ending,
+                rope: None,
+                piece_table: None,
+                dirty: false,
+            };
+        }
+
         // Scanner thread: finds line break offsets, sends them without touching shared state.
         // Pusher thread: receives chunks and pushes to the shared vector under a write lock.
+        let line_offsets = new_line_offsets();
         let (tx, rx) = mpsc::channel::<OffsetsChunk>();
         let storage_scanner = storage.clone();
         let indexed_bytes_scanner = indexed_bytes.clone();
@@ -2149,6 +2475,14 @@ impl Document {
         self.indexed_bytes.load(Ordering::Relaxed)
     }
 
+    /// Returns `(indexed_bytes, total_bytes)` while background indexing is active.
+    pub fn indexing_progress(&self) -> Option<(usize, usize)> {
+        if !self.is_indexing() {
+            return None;
+        }
+        Some((self.indexed_bytes(), self.file_len()))
+    }
+
     /// Returns the current estimate of the average line length in bytes.
     pub fn avg_line_len(&self) -> usize {
         self.avg_line_len.load(Ordering::Relaxed).max(1)
@@ -2336,6 +2670,11 @@ impl Document {
         self.file_len
     }
 
+    /// Returns the currently detected line ending style for the document.
+    pub fn line_ending(&self) -> LineEnding {
+        self.line_ending
+    }
+
     /// Returns the full document text, applying lossy UTF-8 decoding when needed.
     pub fn text_lossy(&self) -> String {
         if let Some(rope) = &self.rope {
@@ -2345,6 +2684,18 @@ impl Document {
             return piece_table.to_string_lossy();
         }
         String::from_utf8_lossy(self.mmap_bytes()).to_string()
+    }
+
+    /// Returns a lazy iterator over the currently known document lines.
+    ///
+    /// While mmap indexing is still in progress this follows [`Document::line_count`],
+    /// which is a safe lower bound until indexing completes.
+    pub fn lines(&self) -> impl ExactSizeIterator<Item = LineSlice> + FusedIterator + '_ {
+        Lines {
+            doc: self,
+            next_line: 0,
+            total_lines: self.line_count(),
+        }
     }
 
     /// Returns the visible segment of a line for the requested line and column range.
@@ -2432,7 +2783,41 @@ impl Document {
             return vec![LineSlice::default(); line_count];
         }
 
-        if self.rope.is_some() || self.piece_table.is_some() {
+        if let Some(rope) = &self.rope {
+            return (0..line_count)
+                .map(|offset| {
+                    let line0 = first_line0.saturating_add(offset);
+                    if line0 >= rope.len_lines() {
+                        return LineSlice::new(String::new(), true);
+                    }
+
+                    let line = rope.line(line0);
+                    let mut len = line.len_chars();
+                    if len > 0 && line.char(len - 1) == '\n' {
+                        len = len.saturating_sub(1);
+                    }
+                    if start_col >= len {
+                        return LineSlice::new(String::new(), true);
+                    }
+
+                    let end_col = start_col.saturating_add(max_cols).min(len);
+                    let slice = line.slice(start_col..end_col);
+                    LineSlice::new(
+                        slice
+                            .as_str()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| slice.to_string()),
+                        true,
+                    )
+                })
+                .collect();
+        }
+
+        if let Some(piece_table) = &self.piece_table {
+            let requested_end = first_line0.saturating_add(line_count);
+            if piece_table.full_index() || requested_end <= piece_table.line_count() {
+                return piece_table.line_slices_exact(first_line0, line_count, start_col, max_cols);
+            }
             return (0..line_count)
                 .map(|offset| {
                     self.line_slice(first_line0.saturating_add(offset), start_col, max_cols)
@@ -2452,15 +2837,21 @@ impl Document {
             let requested_end = first_line0.saturating_add(line_count);
             let tail_trigger = estimated_total.saturating_sub(line_count.saturating_mul(2).max(32));
             if requested_end >= tail_trigger {
-                let mut slices: Vec<LineSlice> =
-                    trailing_mmap_line_ranges(bytes, file_len, line_count)
+                if let Some(ranges) = trailing_mmap_line_ranges(
+                    bytes,
+                    file_len,
+                    line_count,
+                    TAIL_FAST_PATH_MAX_BACKSCAN_BYTES,
+                ) {
+                    let mut slices: Vec<LineSlice> = ranges
                         .into_iter()
                         .map(|range| {
                             line_slice_from_bytes(bytes, Some(range), start_col, max_cols, false)
                         })
                         .collect();
-                slices.resize(line_count, LineSlice::default());
-                return slices;
+                    slices.resize(line_count, LineSlice::default());
+                    return slices;
+                }
             }
         }
 
@@ -2770,6 +3161,88 @@ impl Document {
     /// [`Document::try_insert_text_at`] for explicit error handling.
     pub fn insert_text_at(&mut self, line0: usize, col0: usize, text: &str) -> (usize, usize) {
         self.try_insert_text_at(line0, col0, text)
+            .unwrap_or((line0, col0))
+    }
+
+    fn try_delete_text_range_at_internal(
+        &mut self,
+        line0: usize,
+        col0: usize,
+        len_chars: usize,
+    ) -> Result<(usize, usize), DocumentError> {
+        if len_chars == 0 {
+            return Ok((line0, col0));
+        }
+
+        self.ensure_edit_buffer_for_line(line0)?;
+        let piece_table_supports_line = self
+            .piece_table
+            .as_ref()
+            .map(|piece_table| piece_table.full_index() || piece_table.has_line(line0))
+            .unwrap_or(false);
+        if self.piece_table.is_some() && !piece_table_supports_line {
+            self.promote_piece_table_to_rope()?;
+        }
+
+        let doc_path = self.path.clone();
+        if let Some(piece_table) = self.piece_table.as_mut() {
+            let actual_col0 = piece_table.line_len_chars(line0);
+            let start_col0 = col0.min(actual_col0);
+            let start = piece_table.byte_offset_for_col(line0, start_col0);
+            let end = piece_table.advance_offset_by_text_units(start, len_chars);
+            if end > start {
+                self.dirty = true;
+                let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
+                piece_table
+                    .delete_range(start, end - start)
+                    .map_err(|source| DocumentError::Write { path, source })?;
+            }
+            return Ok((line0, start_col0));
+        }
+
+        self.ensure_rope()?;
+        let rope = self
+            .rope
+            .as_mut()
+            .expect("rope must be present after ensure_rope");
+        let actual_col0 = Self::rope_line_len_chars_without_newline(rope, line0);
+        let start_col0 = col0.min(actual_col0);
+        let start = Self::line_col_to_char_index(rope, line0, start_col0);
+        let end = start.saturating_add(len_chars).min(rope.len_chars());
+        if end > start {
+            rope.remove(start..end);
+            self.dirty = true;
+        }
+        Ok((line0, start_col0))
+    }
+
+    /// Replaces `len_chars` text units starting at the given line/column.
+    ///
+    /// Newline sequences are treated as a single text unit for piece-table backed
+    /// documents, so replacing across CRLF text behaves like a normal editor
+    /// operation instead of deleting only half of the line break.
+    pub fn try_replace_range(
+        &mut self,
+        line0: usize,
+        col0: usize,
+        len_chars: usize,
+        text: &str,
+    ) -> Result<(usize, usize), DocumentError> {
+        let (line0, col0) = self.try_delete_text_range_at_internal(line0, col0, len_chars)?;
+        self.try_insert_text_at(line0, col0, text)
+    }
+
+    /// Compatibility wrapper for [`Document::try_replace_range`].
+    ///
+    /// On edit failure the original coordinates are returned unchanged.
+    pub fn replace_range(
+        &mut self,
+        line0: usize,
+        col0: usize,
+        len_chars: usize,
+        text: &str,
+    ) -> (usize, usize) {
+        self.try_replace_range(line0, col0, len_chars, text)
             .unwrap_or((line0, col0))
     }
 
@@ -3362,6 +3835,66 @@ mod tests {
     }
 
     #[test]
+    fn line_slices_use_exact_piece_table_fast_path_after_edit() {
+        let dir =
+            std::env::temp_dir().join(format!("qem-piece-table-slices-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("large.txt");
+        write_disk_backed_fixture(&path);
+
+        let mut doc = Document::open(path.clone()).unwrap();
+        let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
+
+        let slices = doc.line_slices(0, 2, 0, 16);
+        let texts: Vec<String> = slices.iter().map(|slice| slice.text().to_owned()).collect();
+
+        assert_eq!(texts, vec!["123abc", "def"]);
+        assert!(slices.iter().all(LineSlice::is_exact));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lines_iterator_yields_current_document_lines() {
+        let mut doc = Document::new();
+        let _ = doc.try_insert_text_at(0, 0, "zero\none\ntwo").unwrap();
+
+        let lines: Vec<String> = doc.lines().map(LineSlice::into_text).collect();
+
+        assert_eq!(lines, vec!["zero", "one", "two"]);
+    }
+
+    #[test]
+    fn replace_range_updates_rope_backed_documents() {
+        let mut doc = Document::new();
+        let _ = doc.try_insert_text_at(0, 0, "hello world").unwrap();
+
+        let cursor = doc.try_replace_range(0, 6, 5, "qem").unwrap();
+
+        assert_eq!(cursor, (0, 9));
+        assert_eq!(doc.text_lossy(), "hello qem");
+    }
+
+    #[test]
+    fn replace_range_updates_piece_table_backed_documents() {
+        let dir =
+            std::env::temp_dir().join(format!("qem-piece-table-replace-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("replace.txt");
+        write_disk_backed_fixture(&path);
+
+        let mut doc = Document::open(path.clone()).unwrap();
+        let cursor = doc.try_replace_range(0, 0, 3, "XYZ").unwrap();
+
+        assert_eq!(cursor, (0, 3));
+        assert!(doc.text_lossy().starts_with("XYZ\ndef\n"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn fully_indexed_short_line_mmap_uses_exact_line_count() {
         let dir =
             std::env::temp_dir().join(format!("qem-short-lines-exact-{}", std::process::id()));
@@ -3415,6 +3948,41 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trailing_tail_fast_path_bails_out_for_huge_final_line() {
+        let mut bytes = b"a\nb\n".to_vec();
+        bytes.resize(
+            TAIL_FAST_PATH_MAX_BACKSCAN_BYTES.saturating_add(bytes.len() + 1),
+            b'x',
+        );
+
+        let ranges =
+            trailing_mmap_line_ranges(&bytes, bytes.len(), 3, TAIL_FAST_PATH_MAX_BACKSCAN_BYTES);
+
+        assert!(ranges.is_none());
+    }
+
+    #[test]
+    fn indexing_progress_reports_inflight_state() {
+        let doc = Document {
+            path: None,
+            storage: None,
+            line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+            disk_index: None,
+            indexing: Arc::new(AtomicBool::new(true)),
+            indexing_started: None,
+            file_len: 128,
+            indexed_bytes: Arc::new(AtomicUsize::new(32)),
+            avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+            line_ending: LineEnding::Lf,
+            rope: None,
+            piece_table: None,
+            dirty: false,
+        };
+
+        assert_eq!(doc.indexing_progress(), Some((32, 128)));
     }
 
     #[test]
@@ -3638,6 +4206,45 @@ mod tests {
         assert!(matches!(err, Err(DocumentError::EditUnsupported { .. })));
         assert!(doc.rope.is_none());
         assert!(doc.piece_table.is_some());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn small_files_index_inline_and_become_precise_immediately() {
+        let dir = std::env::temp_dir().join(format!("qem-doc-inline-index-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("small.txt");
+        std::fs::write(&path, b"zero\none\ntwo\n").unwrap();
+
+        let doc = Document::open(&path).unwrap();
+
+        assert!(!doc.is_indexing());
+        assert!(doc.is_fully_indexed());
+        assert!(doc.has_precise_line_lengths());
+        assert_eq!(
+            doc.indexed_bytes(),
+            std::fs::metadata(&path).unwrap().len() as usize
+        );
+        assert_eq!(doc.line_count(), 4);
+        assert_eq!(doc.line_slice(2, 0, 16).text(), "two");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn document_exposes_detected_line_ending_style() {
+        let dir = std::env::temp_dir().join(format!("qem-doc-line-ending-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("crlf.txt");
+        std::fs::write(&path, b"alpha\r\nbeta\r\n").unwrap();
+
+        let doc = Document::open(&path).unwrap();
+
+        assert_eq!(doc.line_ending(), LineEnding::Crlf);
+        assert_eq!(doc.line_ending().as_str(), "\r\n");
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);

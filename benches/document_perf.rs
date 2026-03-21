@@ -2,6 +2,7 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use qem::Document;
+use ropey::Rope;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ use tempfile::TempDir;
 
 const VIEWPORT_LINES: usize = 120;
 const VIEWPORT_COLS: usize = 160;
+const SMALL_OPEN_LINE_COUNT: usize = 20_000;
 const OPEN_LINE_COUNT: usize = 1_000_000;
 const SCROLL_LINE_COUNT: usize = 400_000;
 const SAVE_LINE_COUNT: usize = 250_000;
@@ -24,6 +26,7 @@ struct Fixture {
     bytes: u64,
 }
 
+static SMALL_OPEN_FIXTURE: OnceLock<Fixture> = OnceLock::new();
 static OPEN_FIXTURE: OnceLock<Fixture> = OnceLock::new();
 static SCROLL_FIXTURE: OnceLock<Fixture> = OnceLock::new();
 static SAVE_FIXTURE: OnceLock<Fixture> = OnceLock::new();
@@ -55,6 +58,15 @@ fn numbered_fixture(
 
 fn open_fixture() -> &'static Fixture {
     numbered_fixture(&OPEN_FIXTURE, "open-large.log", OPEN_LINE_COUNT, 24)
+}
+
+fn small_open_fixture() -> &'static Fixture {
+    numbered_fixture(
+        &SMALL_OPEN_FIXTURE,
+        "open-small.log",
+        SMALL_OPEN_LINE_COUNT,
+        24,
+    )
 }
 
 fn scroll_fixture() -> &'static Fixture {
@@ -112,6 +124,35 @@ fn bench_open(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_small_open(c: &mut Criterion) {
+    let fixture = small_open_fixture();
+    let mut group = c.benchmark_group("small_document_open");
+    group.sample_size(20);
+    group.throughput(Throughput::Bytes(fixture.bytes));
+    group.bench_function(BenchmarkId::new("qem_inline_index", fixture.label), |b| {
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let doc = Document::open(&fixture.path).expect("open small qem document");
+                black_box(doc.line_count());
+            }
+            start.elapsed()
+        });
+    });
+    group.bench_function(BenchmarkId::new("ropey_from_reader", fixture.label), |b| {
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let file = File::open(&fixture.path).expect("open small ropey fixture");
+                let rope = Rope::from_reader(file).expect("load small ropey fixture");
+                black_box(rope.len_lines());
+            }
+            start.elapsed()
+        });
+    });
+    group.finish();
+}
+
 fn bench_scroll(c: &mut Criterion) {
     let fixture = scroll_fixture();
     let doc = open_and_wait(&fixture.path);
@@ -130,6 +171,25 @@ fn bench_scroll(c: &mut Criterion) {
         b.iter(|| {
             black_box(doc.line_slices(black_box(tail_line), VIEWPORT_LINES, 0, VIEWPORT_COLS))
         });
+    });
+    group.finish();
+}
+
+fn build_edited_viewport_doc(fixture: &Fixture) -> Document {
+    let mut doc = open_and_wait(&fixture.path);
+    let _ = doc
+        .try_insert_text_at(0, 0, "[qem-edited]\n")
+        .expect("seed edited viewport document");
+    doc
+}
+
+fn bench_edited_scroll(c: &mut Criterion) {
+    let fixture = scroll_fixture();
+    let doc = build_edited_viewport_doc(fixture);
+    let mut group = c.benchmark_group("edited_viewport_reads");
+    group.throughput(Throughput::Elements(VIEWPORT_LINES as u64));
+    group.bench_function(BenchmarkId::new("prefix", fixture.label), |b| {
+        b.iter(|| black_box(doc.line_slices(black_box(1024), VIEWPORT_LINES, 0, VIEWPORT_COLS)));
     });
     group.finish();
 }
@@ -179,6 +239,6 @@ criterion_group! {
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_secs(3))
         .sample_size(10);
-    targets = bench_open, bench_scroll, bench_save
+    targets = bench_small_open, bench_open, bench_scroll, bench_edited_scroll, bench_save
 }
 criterion_main!(benches);
