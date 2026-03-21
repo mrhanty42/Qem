@@ -7,8 +7,6 @@ Qem is built for editor-style workloads where opening huge files must stay
 responsive, scrolling should avoid full materialization, and saves should
 stream back to disk instead of rebuilding the entire document in memory.
 
-Release target: `0.2.0`
-
 Small files take a fast inline path: Qem fully indexes them during `open()` so
 line counts, viewport reads, and first edits are exact immediately without
 paying background-thread overhead.
@@ -105,20 +103,22 @@ The `editor_session` example now uses `EditorTab::open_file_async()`,
 `save_as_async()`, and `poll_background_job()` to show the non-blocking tab
 workflow end to end.
 
-## Example
+## API Example
 
 ```rust
 use qem::Document;
+use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut doc = Document::open("huge.log")?;
+    let path = Path::new("huge.log");
+    let mut doc = Document::open(path)?;
 
     let visible = doc.line_slice(10, 0, 160);
     println!("exact: {}", visible.is_exact());
     println!("{}", visible.text());
 
-    doc.insert_text_at(0, 0, "[Qem]\\n");
-    doc.save_to("huge.log")?;
+    doc.try_insert_text_at(0, 0, "[Qem]\n")?;
+    doc.save_to(path)?;
 
     Ok(())
 }
@@ -139,8 +139,7 @@ Run them with:
 cargo bench --bench document_perf
 ```
 
-## Release Process
+## Project Links
 
 - CI lives in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
-- Release notes are tracked in [`CHANGELOG.md`](CHANGELOG.md).
-- Publish gates and commands are listed in [`RELEASE.md`](RELEASE.md).
+- Repository: <https://github.com/MrHanty1488/Qem>
