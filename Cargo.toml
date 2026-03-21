@@ -1,0 +1,51 @@
+[package]
+name = "qem"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "High-performance cross-platform text engine for massive files."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/qem"
+keywords = ["text", "editor", "mmap", "rope", "piece-table"]
+categories = ["text-processing", "filesystem", "data-structures"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "LICENSE-APACHE",
+    "src/**/*",
+    "examples/**/*",
+    "benches/**/*",
+]
+
+[features]
+default = ["editor", "tmp-auto"]
+editor = []
+tmp-auto = []
+tmp-source-dir = []
+tmp-system-dir = []
+tmp-exe-dir = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+crc32fast = "1.4"
+encoding_rs = "0.8"
+memchr = "2.7"
+memmap2 = "0.9"
+ropey = "1.6"
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3.13"
+
+[[example]]
+name = "editor_session"
+required-features = ["editor"]
+
+[[bench]]
+name = "document_perf"
+harness = false
