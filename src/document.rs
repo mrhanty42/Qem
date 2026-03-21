@@ -30,6 +30,7 @@ const PARTIAL_PIECE_TABLE_SCAN_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 const APPROX_LINE_BACKTRACK_BYTES: usize = 64 * 1024;
 const APPROX_LINE_FORWARD_BYTES: usize = 256 * 1024;
 const TAIL_FAST_PATH_MAX_BACKSCAN_BYTES: usize = 1024 * 1024; // 1 MiB
+const FALLBACK_NEXT_LINE_SCAN_BYTES: usize = 1024 * 1024; // 1 MiB
 const SAVE_STREAM_CHUNK_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 const MAX_ROPE_EDIT_FILE_BYTES: usize = 128 * 1024 * 1024; // 128 MiB safety cap for full materialization
 const PIECE_TREE_TARGET_BYTES: usize = 64 * 1024;
@@ -782,13 +783,25 @@ fn line_slice_from_bytes(
     LineSlice::new(text, exact && line_range.is_some())
 }
 
-fn next_mmap_line_range(bytes: &[u8], file_len: usize, start0: usize) -> Option<(usize, usize)> {
+#[derive(Clone, Copy, Debug)]
+struct MmapLineScan {
+    range: (usize, usize),
+    complete: bool,
+}
+
+fn next_mmap_line_range(
+    bytes: &[u8],
+    file_len: usize,
+    start0: usize,
+    max_scan_bytes: usize,
+) -> Option<MmapLineScan> {
     let start0 = start0.min(file_len);
     if start0 >= file_len {
         return None;
     }
 
-    let slice = &bytes[start0..file_len];
+    let scan_end = start0.saturating_add(max_scan_bytes).min(file_len);
+    let slice = &bytes[start0..scan_end];
     let end0 = if let Some(rel) = memchr::memchr2(b'\n', b'\r', slice) {
         let idx = start0 + rel;
         if bytes[idx] == b'\r' && idx + 1 < file_len && bytes[idx + 1] == b'\n' {
@@ -797,10 +810,13 @@ fn next_mmap_line_range(bytes: &[u8], file_len: usize, start0: usize) -> Option<
             idx + 1
         }
     } else {
-        file_len
+        scan_end
     };
 
-    Some((start0, end0.max(start0)))
+    Some(MmapLineScan {
+        range: (start0, end0.max(start0)),
+        complete: end0 < scan_end || scan_end == file_len,
+    })
 }
 
 fn trailing_mmap_line_ranges(
@@ -2888,10 +2904,12 @@ impl Document {
             let Some(start0) = scan_start else {
                 break;
             };
-            let Some(range) = next_mmap_line_range(bytes, file_len, start0) else {
+            let Some(scanned) =
+                next_mmap_line_range(bytes, file_len, start0, FALLBACK_NEXT_LINE_SCAN_BYTES)
+            else {
                 break;
             };
-            scan_start = (range.1 > start0).then_some(range.1);
+            let range = scanned.range;
             slices.push(line_slice_from_bytes(
                 bytes,
                 Some(range),
@@ -2899,6 +2917,10 @@ impl Document {
                 max_cols,
                 false,
             ));
+            if !scanned.complete {
+                break;
+            }
+            scan_start = (range.1 > start0).then_some(range.1);
         }
 
         slices.resize(line_count, LineSlice::default());
@@ -3962,6 +3984,46 @@ mod tests {
             trailing_mmap_line_ranges(&bytes, bytes.len(), 3, TAIL_FAST_PATH_MAX_BACKSCAN_BYTES);
 
         assert!(ranges.is_none());
+    }
+
+    #[test]
+    fn line_slices_bail_out_when_next_line_scan_would_be_unbounded() {
+        let dir =
+            std::env::temp_dir().join(format!("qem-midline-fast-path-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("midline.txt");
+
+        let mut bytes = vec![b'a'; FALLBACK_NEXT_LINE_SCAN_BYTES + 1];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"tail\n");
+        std::fs::write(&path, &bytes).unwrap();
+        let storage = FileStorage::open(&path).unwrap();
+
+        let doc = Document {
+            path: Some(path.clone()),
+            storage: Some(storage),
+            line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+            disk_index: None,
+            indexing: Arc::new(AtomicBool::new(true)),
+            indexing_started: None,
+            file_len: bytes.len(),
+            indexed_bytes: Arc::new(AtomicUsize::new(0)),
+            avg_line_len: Arc::new(AtomicUsize::new(1)),
+            line_ending: LineEnding::Lf,
+            rope: None,
+            piece_table: None,
+            dirty: false,
+        };
+
+        let slices = doc.line_slices(0, 3, 0, 16);
+        let texts: Vec<String> = slices.into_iter().map(LineSlice::into_text).collect();
+
+        assert_eq!(texts[0], "aaaaaaaaaaaaaaaa");
+        assert_eq!(texts[1], "");
+        assert_eq!(texts[2], "");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
