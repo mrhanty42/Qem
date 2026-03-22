@@ -76,6 +76,28 @@ Runtime override is also available:
 - `Document`: background line indexing, fast line metrics, viewport reads, rope or piece-table editing, and persistent edit-session recovery.
 - `EditorTab`: lightweight document session wrapper with cursor, async open/save helpers, and progress polling.
 
+## Choosing an integration layer
+
+- Use `Document` when your application already owns tabs, background jobs, cursor state, and save orchestration.
+- Use `EditorTab` when you want a ready-made document session wrapper with cursor state, generation tracking, async open/save helpers, and progress polling.
+- A GUI typically renders visible rows through `Document::line_slices(...)` and keeps `EditorTab` only as a thin shell around tab/session state.
+
+## Frontend integration pattern
+
+Qem stays UI-agnostic on purpose, but the intended editor/frontend flow is:
+
+1. Open a file with `Document::open(...)` for a synchronous viewer or `EditorTab::open_file_async(...)` for a responsive tabbed app.
+2. Poll `poll_background_job()`, `loading_progress()`, `save_progress()`, and `indexing_progress()` from your event loop.
+3. Size scrollbars with `display_line_count()` while the line count is still estimated.
+4. Render only the visible rows with `line_slices(first_line0, line_count, start_col, max_cols)`.
+5. Apply edits through `Document` mutation methods and save with `save_to(...)`, `save_async()`, or `save_as_async(...)`.
+
+The new `frontend_session` example demonstrates that engine-facing lifecycle without pulling any GUI toolkit into the crate:
+
+```powershell
+cargo run --example frontend_session --features editor -- input.txt output.txt
+```
+
 ## Stability Notes
 
 - The Rust API is intended to be stable within the `0.2.x` release line except
@@ -102,6 +124,16 @@ cargo run --example editor_session --features editor -- input.txt output.txt
 The `editor_session` example now uses `EditorTab::open_file_async()`,
 `save_as_async()`, and `poll_background_job()` to show the non-blocking tab
 workflow end to end.
+
+Model the data flow that a GUI frontend would use:
+
+```powershell
+cargo run --example frontend_session --features editor -- input.txt output.txt
+```
+
+The `frontend_session` example shows how a frontend can poll load/save/index
+progress, compute a viewport, and render visible rows through
+`Document::line_slices(...)` while keeping UI concerns out of the engine.
 
 ## API Example
 

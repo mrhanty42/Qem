@@ -49,6 +49,10 @@ tempfile = "3.13"
 name = "editor_session"
 required-features = ["editor"]
 
+[[example]]
+name = "frontend_session"
+required-features = ["editor"]
+
 [[bench]]
 name = "document_perf"
 harness = false
