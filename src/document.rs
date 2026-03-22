@@ -784,6 +784,78 @@ fn line_slice_from_bytes(
     LineSlice::new(text, exact && line_range.is_some())
 }
 
+fn byte_offset_for_text_col_in_bytes(
+    bytes: &[u8],
+    line_range: (usize, usize),
+    col0: usize,
+) -> usize {
+    let (start, end) = line_range;
+    if col0 == 0 || start >= end {
+        return start.min(end);
+    }
+
+    let mut col = 0usize;
+    let mut offset = start;
+    let mut i = start;
+    while i < end && col < col0 {
+        let b = bytes[i];
+        if b == b'\n' || b == b'\r' {
+            break;
+        }
+        let step = utf8_step(bytes, i, end);
+        col += 1;
+        i += step;
+        offset += step;
+    }
+    offset.min(end)
+}
+
+fn advance_offset_by_text_units_in_bytes(
+    bytes: &[u8],
+    file_len: usize,
+    start: usize,
+    text_units: usize,
+) -> usize {
+    let start = start.min(file_len);
+    if text_units == 0 || start >= file_len {
+        return start;
+    }
+
+    let mut remaining = text_units;
+    let mut offset = start;
+    let mut pending_cr = false;
+    while offset < file_len && (remaining > 0 || pending_cr) {
+        if pending_cr {
+            pending_cr = false;
+            if bytes[offset] == b'\n' {
+                offset += 1;
+                continue;
+            }
+        }
+        if remaining == 0 {
+            break;
+        }
+
+        match bytes[offset] {
+            b'\r' => {
+                remaining -= 1;
+                offset += 1;
+                pending_cr = true;
+            }
+            b'\n' => {
+                remaining -= 1;
+                offset += 1;
+            }
+            _ => {
+                let step = utf8_step(bytes, offset, file_len);
+                remaining -= 1;
+                offset += step;
+            }
+        }
+    }
+    offset.min(file_len)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MmapLineScan {
     range: (usize, usize),
@@ -2069,6 +2141,405 @@ impl LineSlice {
     }
 }
 
+/// Text slice returned by typed range/selection reads.
+///
+/// The slice applies lossy UTF-8 decoding and tracks whether the underlying
+/// range was anchored by exact document indexes or a heuristic mmap guess.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextSlice {
+    text: String,
+    exact: bool,
+}
+
+impl TextSlice {
+    /// Creates a new text slice and marks whether it is exact.
+    pub fn new(text: String, exact: bool) -> Self {
+        Self { text, exact }
+    }
+
+    /// Returns the slice text.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Consumes the slice and returns the owned text.
+    pub fn into_text(self) -> String {
+        self.text
+    }
+
+    /// Returns `true` if the slice was produced from exact indexes rather than heuristics.
+    pub fn is_exact(&self) -> bool {
+        self.exact
+    }
+
+    /// Returns `true` if the slice is empty.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
+/// Zero-based document position used by frontend integrations.
+///
+/// Qem keeps positions in document coordinates instead of screen coordinates so
+/// applications remain free to implement their own cursor, scrollbar, and
+/// selection rendering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TextPosition {
+    line0: usize,
+    col0: usize,
+}
+
+impl TextPosition {
+    /// Creates a zero-based text position.
+    pub const fn new(line0: usize, col0: usize) -> Self {
+        Self { line0, col0 }
+    }
+
+    /// Returns the zero-based line index.
+    pub const fn line0(self) -> usize {
+        self.line0
+    }
+
+    /// Returns the zero-based column index.
+    pub const fn col0(self) -> usize {
+        self.col0
+    }
+}
+
+impl From<(usize, usize)> for TextPosition {
+    fn from(value: (usize, usize)) -> Self {
+        Self::new(value.0, value.1)
+    }
+}
+
+impl From<TextPosition> for (usize, usize) {
+    fn from(value: TextPosition) -> Self {
+        (value.line0, value.col0)
+    }
+}
+
+/// Typed text range used by edit operations.
+///
+/// The range is expressed as a starting position together with a text-unit
+/// length, matching the semantics of [`Document::try_replace_range`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct TextRange {
+    start: TextPosition,
+    len_chars: usize,
+}
+
+impl TextRange {
+    /// Creates a text range from a starting position and text-unit length.
+    pub const fn new(start: TextPosition, len_chars: usize) -> Self {
+        Self { start, len_chars }
+    }
+
+    /// Creates an empty text range at the given position.
+    pub const fn empty(start: TextPosition) -> Self {
+        Self::new(start, 0)
+    }
+
+    /// Returns the starting position of the range.
+    pub const fn start(self) -> TextPosition {
+        self.start
+    }
+
+    /// Returns the number of text units in the range.
+    pub const fn len_chars(self) -> usize {
+        self.len_chars
+    }
+
+    /// Returns `true` when the range is empty.
+    pub const fn is_empty(self) -> bool {
+        self.len_chars == 0
+    }
+}
+
+/// Anchor/head text selection used by frontend integrations.
+///
+/// Qem keeps this selection in document coordinates so applications remain
+/// free to own their own painting, cursor visuals, and interaction model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct TextSelection {
+    anchor: TextPosition,
+    head: TextPosition,
+}
+
+impl TextSelection {
+    /// Creates a selection from an anchor and active head position.
+    pub const fn new(anchor: TextPosition, head: TextPosition) -> Self {
+        Self { anchor, head }
+    }
+
+    /// Creates a caret selection at a single position.
+    pub const fn caret(position: TextPosition) -> Self {
+        Self::new(position, position)
+    }
+
+    /// Returns the anchor position.
+    pub const fn anchor(self) -> TextPosition {
+        self.anchor
+    }
+
+    /// Returns the active head position.
+    pub const fn head(self) -> TextPosition {
+        self.head
+    }
+
+    /// Returns `true` when the selection is only a caret.
+    pub fn is_caret(self) -> bool {
+        self.anchor == self.head
+    }
+}
+
+/// Viewport request used by frontend code to read only visible rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewportRequest {
+    first_line0: usize,
+    line_count: usize,
+    start_col: usize,
+    max_cols: usize,
+}
+
+impl Default for ViewportRequest {
+    fn default() -> Self {
+        Self::new(0, 0)
+    }
+}
+
+impl ViewportRequest {
+    /// Creates a viewport request for a contiguous line range.
+    ///
+    /// Columns default to the full visible width of the line.
+    pub const fn new(first_line0: usize, line_count: usize) -> Self {
+        Self {
+            first_line0,
+            line_count,
+            start_col: 0,
+            max_cols: usize::MAX,
+        }
+    }
+
+    /// Sets the horizontal slice within each requested row.
+    pub const fn with_columns(mut self, start_col: usize, max_cols: usize) -> Self {
+        self.start_col = start_col;
+        self.max_cols = max_cols;
+        self
+    }
+
+    /// Returns the first requested zero-based line index.
+    pub const fn first_line0(self) -> usize {
+        self.first_line0
+    }
+
+    /// Returns the requested number of lines.
+    pub const fn line_count(self) -> usize {
+        self.line_count
+    }
+
+    /// Returns the requested starting column.
+    pub const fn start_col(self) -> usize {
+        self.start_col
+    }
+
+    /// Returns the requested maximum number of columns.
+    pub const fn max_cols(self) -> usize {
+        self.max_cols
+    }
+}
+
+/// One row returned by a viewport read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewportRow {
+    line0: usize,
+    slice: LineSlice,
+}
+
+impl ViewportRow {
+    /// Creates a viewport row.
+    pub fn new(line0: usize, slice: LineSlice) -> Self {
+        Self { line0, slice }
+    }
+
+    /// Returns the zero-based line index for this row.
+    pub fn line0(&self) -> usize {
+        self.line0
+    }
+
+    /// Returns the 1-based line number for display.
+    pub fn line_number(&self) -> usize {
+        self.line0.saturating_add(1)
+    }
+
+    /// Returns the rendered line slice.
+    pub fn slice(&self) -> &LineSlice {
+        &self.slice
+    }
+
+    /// Consumes the row and returns the line slice.
+    pub fn into_slice(self) -> LineSlice {
+        self.slice
+    }
+
+    /// Returns the row text.
+    pub fn text(&self) -> &str {
+        self.slice.text()
+    }
+
+    /// Returns `true` when the row is backed by exact line indexes.
+    pub fn is_exact(&self) -> bool {
+        self.slice.is_exact()
+    }
+}
+
+/// Viewport read response returned by [`Document::read_viewport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Viewport {
+    request: ViewportRequest,
+    total_lines: LineCount,
+    rows: Vec<ViewportRow>,
+}
+
+impl Viewport {
+    /// Creates a viewport response.
+    pub fn new(request: ViewportRequest, total_lines: LineCount, rows: Vec<ViewportRow>) -> Self {
+        Self {
+            request,
+            total_lines,
+            rows,
+        }
+    }
+
+    /// Returns the request that produced this viewport.
+    pub fn request(&self) -> ViewportRequest {
+        self.request
+    }
+
+    /// Returns the current total document line count.
+    pub fn total_lines(&self) -> LineCount {
+        self.total_lines
+    }
+
+    /// Returns the visible rows.
+    pub fn rows(&self) -> &[ViewportRow] {
+        &self.rows
+    }
+
+    /// Consumes the viewport and returns the visible rows.
+    pub fn into_rows(self) -> Vec<ViewportRow> {
+        self.rows
+    }
+
+    /// Returns the number of visible rows.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Returns `true` when the viewport contains no rows.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+/// Result of an edit command together with the resulting cursor position.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EditResult {
+    changed: bool,
+    cursor: TextPosition,
+}
+
+impl EditResult {
+    /// Creates an edit result.
+    pub const fn new(changed: bool, cursor: TextPosition) -> Self {
+        Self { changed, cursor }
+    }
+
+    /// Returns `true` when the document changed.
+    pub const fn changed(self) -> bool {
+        self.changed
+    }
+
+    /// Returns the resulting cursor position.
+    pub const fn cursor(self) -> TextPosition {
+        self.cursor
+    }
+}
+
+/// Result of cutting a selection together with the resulting edit outcome.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CutResult {
+    text: String,
+    edit: EditResult,
+}
+
+impl CutResult {
+    /// Creates a cut result.
+    pub fn new(text: String, edit: EditResult) -> Self {
+        Self { text, edit }
+    }
+
+    /// Returns the cut text.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Consumes the result and returns the owned cut text.
+    pub fn into_text(self) -> String {
+        self.text
+    }
+
+    /// Returns the underlying edit result.
+    pub const fn edit(&self) -> EditResult {
+        self.edit
+    }
+
+    /// Returns `true` when the document changed.
+    pub const fn changed(&self) -> bool {
+        self.edit.changed()
+    }
+
+    /// Returns the resulting cursor position.
+    pub const fn cursor(&self) -> TextPosition {
+        self.edit.cursor()
+    }
+}
+
+/// Typed byte progress used by indexing and other document-local background work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ByteProgress {
+    completed_bytes: usize,
+    total_bytes: usize,
+}
+
+impl ByteProgress {
+    /// Creates a byte progress value.
+    pub const fn new(completed_bytes: usize, total_bytes: usize) -> Self {
+        Self {
+            completed_bytes,
+            total_bytes,
+        }
+    }
+
+    /// Returns the completed byte count.
+    pub const fn completed_bytes(self) -> usize {
+        self.completed_bytes
+    }
+
+    /// Returns the total byte count.
+    pub const fn total_bytes(self) -> usize {
+        self.total_bytes
+    }
+
+    /// Returns completion as a `0.0..=1.0` fraction.
+    pub fn fraction(self) -> f32 {
+        if self.total_bytes == 0 {
+            0.0
+        } else {
+            self.completed_bytes as f32 / self.total_bytes as f32
+        }
+    }
+}
+
 /// Total document line count, represented either as an exact value or as a
 /// scrolling estimate while background indexing is still incomplete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2097,6 +2568,182 @@ impl LineCount {
     /// Returns `true` when the total line count is exact.
     pub fn is_exact(self) -> bool {
         matches!(self, Self::Exact(_))
+    }
+}
+
+/// Current backing mode of the document text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DocumentBacking {
+    Mmap,
+    PieceTable,
+    Rope,
+}
+
+impl DocumentBacking {
+    /// Returns a short display label for the current backing mode.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mmap => "mmap",
+            Self::PieceTable => "piece-table",
+            Self::Rope => "rope",
+        }
+    }
+}
+
+/// Typed editability state for a document position or range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EditCapability {
+    Editable {
+        backing: DocumentBacking,
+    },
+    RequiresPromotion {
+        from: DocumentBacking,
+        to: DocumentBacking,
+    },
+    Unsupported {
+        backing: DocumentBacking,
+        reason: &'static str,
+    },
+}
+
+impl EditCapability {
+    /// Returns `true` when an edit can proceed, possibly after a backend promotion.
+    pub const fn is_editable(self) -> bool {
+        !matches!(self, Self::Unsupported { .. })
+    }
+
+    /// Returns `true` when the edit would require promoting to another backing.
+    pub const fn requires_promotion(self) -> bool {
+        matches!(self, Self::RequiresPromotion { .. })
+    }
+
+    /// Returns the current backing mode before any edit is attempted.
+    pub const fn current_backing(self) -> DocumentBacking {
+        match self {
+            Self::Editable { backing } | Self::Unsupported { backing, .. } => backing,
+            Self::RequiresPromotion { from, .. } => from,
+        }
+    }
+
+    /// Returns the resulting backing mode after promotion, if one is required.
+    pub const fn target_backing(self) -> Option<DocumentBacking> {
+        match self {
+            Self::RequiresPromotion { to, .. } => Some(to),
+            _ => None,
+        }
+    }
+
+    /// Returns an unsupported-edit reason when one is available.
+    pub const fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Unsupported { reason, .. } => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// Snapshot of the current document state for frontend polling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentStatus {
+    path: Option<PathBuf>,
+    dirty: bool,
+    file_len: usize,
+    line_count: LineCount,
+    line_ending: LineEnding,
+    indexing: Option<ByteProgress>,
+    backing: DocumentBacking,
+}
+
+impl DocumentStatus {
+    /// Creates a document status snapshot.
+    pub fn new(
+        path: Option<PathBuf>,
+        dirty: bool,
+        file_len: usize,
+        line_count: LineCount,
+        line_ending: LineEnding,
+        indexing: Option<ByteProgress>,
+        backing: DocumentBacking,
+    ) -> Self {
+        Self {
+            path,
+            dirty,
+            file_len,
+            line_count,
+            line_ending,
+            indexing,
+            backing,
+        }
+    }
+
+    /// Returns the current document path, if one is set.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Returns `true` when the document has unsaved changes.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Returns the current document length in bytes.
+    pub fn file_len(&self) -> usize {
+        self.file_len
+    }
+
+    /// Returns the current document line count.
+    pub fn line_count(&self) -> LineCount {
+        self.line_count
+    }
+
+    /// Returns the exact line count when it is known.
+    pub fn exact_line_count(&self) -> Option<usize> {
+        self.line_count.exact()
+    }
+
+    /// Returns the best-effort line count for viewport sizing and scrolling.
+    pub fn display_line_count(&self) -> usize {
+        self.line_count.display_rows()
+    }
+
+    /// Returns `true` when the current line count is exact.
+    pub fn is_line_count_exact(&self) -> bool {
+        self.line_count.is_exact()
+    }
+
+    /// Returns the currently detected line ending style.
+    pub fn line_ending(&self) -> LineEnding {
+        self.line_ending
+    }
+
+    /// Returns typed indexing progress while background indexing is active.
+    pub fn indexing_state(&self) -> Option<ByteProgress> {
+        self.indexing
+    }
+
+    /// Returns `true` when document-local indexing is still running.
+    pub fn is_indexing(&self) -> bool {
+        self.indexing.is_some()
+    }
+
+    /// Returns the current document backing mode.
+    pub fn backing(&self) -> DocumentBacking {
+        self.backing
+    }
+
+    /// Returns `true` when the document currently uses any edit buffer.
+    pub fn has_edit_buffer(&self) -> bool {
+        !matches!(self.backing, DocumentBacking::Mmap)
+    }
+
+    /// Returns `true` when the document is currently backed by a rope.
+    pub fn has_rope(&self) -> bool {
+        matches!(self.backing, DocumentBacking::Rope)
+    }
+
+    /// Returns `true` when the document is currently backed by a piece table.
+    pub fn has_piece_table(&self) -> bool {
+        matches!(self.backing, DocumentBacking::PieceTable)
     }
 }
 
@@ -2585,6 +3232,11 @@ impl Document {
         self.rope.is_some() || self.piece_table.is_some()
     }
 
+    /// Returns `true` if the document is currently backed by a piece table.
+    pub fn has_piece_table(&self) -> bool {
+        self.piece_table.is_some()
+    }
+
     /// Returns `true` if the engine knows the exact length of every line.
     pub fn has_precise_line_lengths(&self) -> bool {
         if self.rope.is_some() {
@@ -2621,11 +3273,26 @@ impl Document {
     }
 
     /// Returns `(indexed_bytes, total_bytes)` while background indexing is active.
+    ///
+    /// Prefer [`Document::indexing_state`] in new code when you want a typed
+    /// progress value instead of a raw tuple.
+    #[deprecated(
+        since = "0.3.0",
+        note = "use indexing_state() for typed progress instead"
+    )]
     pub fn indexing_progress(&self) -> Option<(usize, usize)> {
         if !self.is_indexing() {
             return None;
         }
         Some((self.indexed_bytes(), self.file_len()))
+    }
+
+    /// Returns typed indexing progress while background indexing is active.
+    pub fn indexing_state(&self) -> Option<ByteProgress> {
+        if !self.is_indexing() {
+            return None;
+        }
+        Some(ByteProgress::new(self.indexed_bytes(), self.file_len()))
     }
 
     /// Returns the current estimate of the average line length in bytes.
@@ -2840,6 +3507,30 @@ impl Document {
     /// Returns `true` when [`Document::line_count`] is already exact.
     pub fn is_line_count_exact(&self) -> bool {
         self.line_count().is_exact()
+    }
+
+    /// Returns the current document backing mode.
+    pub fn backing(&self) -> DocumentBacking {
+        if self.has_rope() {
+            DocumentBacking::Rope
+        } else if self.has_piece_table() {
+            DocumentBacking::PieceTable
+        } else {
+            DocumentBacking::Mmap
+        }
+    }
+
+    /// Returns a frontend-friendly snapshot of the current document state.
+    pub fn status(&self) -> DocumentStatus {
+        DocumentStatus::new(
+            self.path.clone(),
+            self.is_dirty(),
+            self.file_len(),
+            self.line_count(),
+            self.line_ending(),
+            self.indexing_state(),
+            self.backing(),
+        )
     }
 
     /// Returns the current document length in bytes.
@@ -3171,6 +3862,19 @@ impl Document {
         self.ensure_rope()
     }
 
+    fn prepare_edit_at(&mut self, line0: usize) -> Result<(), DocumentError> {
+        self.ensure_edit_buffer_for_line(line0)?;
+        let piece_table_supports_line = self
+            .piece_table
+            .as_ref()
+            .map(|piece_table| piece_table.full_index() || piece_table.has_line(line0))
+            .unwrap_or(false);
+        if self.piece_table.is_some() && !piece_table_supports_line {
+            self.promote_piece_table_to_rope()?;
+        }
+        Ok(())
+    }
+
     fn ensure_rope(&mut self) -> Result<(), DocumentError> {
         if self.rope.is_some() {
             return Ok(());
@@ -3263,6 +3967,261 @@ impl Document {
         count_text_columns(&bytes[start..end], MAX_LINE_SCAN_CHARS)
     }
 
+    /// Clamps a typed position into the currently known document bounds.
+    pub fn clamp_position(&self, position: TextPosition) -> TextPosition {
+        let total_lines = self.display_line_count().max(1);
+        let line0 = position.line0().min(total_lines.saturating_sub(1));
+        let col0 = position.col0().min(self.line_len_chars(line0));
+        TextPosition::new(line0, col0)
+    }
+
+    /// Returns the ordered pair of two clamped positions.
+    ///
+    /// This is useful for frontend code that keeps anchor/head selection state
+    /// and needs a stable document-ordered range before applying edits.
+    pub fn ordered_positions(
+        &self,
+        first: TextPosition,
+        second: TextPosition,
+    ) -> (TextPosition, TextPosition) {
+        let first = self.clamp_position(first);
+        let second = self.clamp_position(second);
+        if first <= second {
+            (first, second)
+        } else {
+            (second, first)
+        }
+    }
+
+    /// Clamps a selection into the currently known document bounds.
+    pub fn clamp_selection(&self, selection: TextSelection) -> TextSelection {
+        TextSelection::new(
+            self.clamp_position(selection.anchor()),
+            self.clamp_position(selection.head()),
+        )
+    }
+
+    /// Returns the typed document position for a full-text character index.
+    pub fn position_for_char_index(&self, char_index: usize) -> TextPosition {
+        let (line0, col0) = self.cursor_position_for_char_index(char_index);
+        TextPosition::new(line0, col0)
+    }
+
+    /// Returns the full-text character index for a typed document position.
+    ///
+    /// This uses the same text-unit semantics as [`Document::try_replace`]:
+    /// line breaks count as one text unit even when they are stored as CRLF.
+    pub fn char_index_for_position(&self, position: TextPosition) -> usize {
+        let position = self.clamp_position(position);
+        if let Some(rope) = &self.rope {
+            return Self::line_col_to_char_index(rope, position.line0(), position.col0());
+        }
+        self.text_units_between(TextPosition::new(0, 0), position)
+    }
+
+    /// Returns the number of edit text units between two typed positions.
+    ///
+    /// This follows the same newline semantics as [`Document::try_replace`]:
+    /// line breaks count as one text unit even when they are stored as CRLF.
+    pub fn text_units_between(&self, start: TextPosition, end: TextPosition) -> usize {
+        let (start, end) = self.ordered_positions(start, end);
+        if start == end {
+            return 0;
+        }
+
+        if let Some(rope) = &self.rope {
+            let start_idx = Self::line_col_to_char_index(rope, start.line0(), start.col0());
+            let end_idx = Self::line_col_to_char_index(rope, end.line0(), end.col0());
+            return end_idx.saturating_sub(start_idx);
+        }
+
+        if start.line0() == end.line0() {
+            return end.col0().saturating_sub(start.col0());
+        }
+
+        let mut units = self
+            .line_len_chars(start.line0())
+            .saturating_sub(start.col0());
+        for line0 in start.line0()..end.line0() {
+            units = units.saturating_add(1);
+            if line0 + 1 == end.line0() {
+                break;
+            }
+            units = units.saturating_add(self.line_len_chars(line0 + 1));
+        }
+        units.saturating_add(end.col0())
+    }
+
+    /// Builds a typed edit range between two positions.
+    ///
+    /// Frontends that keep anchor/head selection state can use this helper to
+    /// convert it directly into a [`TextRange`] for [`Document::try_replace`].
+    pub fn text_range_between(&self, start: TextPosition, end: TextPosition) -> TextRange {
+        let (start, end) = self.ordered_positions(start, end);
+        TextRange::new(start, self.text_units_between(start, end))
+    }
+
+    /// Builds a typed edit range from an anchor/head selection.
+    pub fn text_range_for_selection(&self, selection: TextSelection) -> TextRange {
+        self.text_range_between(selection.anchor(), selection.head())
+    }
+
+    /// Returns whether the requested position is currently editable.
+    ///
+    /// This lets frontends distinguish between positions that are already
+    /// editable, positions that would trigger a backend promotion, and positions
+    /// that would fail with [`DocumentError::EditUnsupported`].
+    pub fn edit_capability_at(&self, position: TextPosition) -> EditCapability {
+        let position = self.clamp_position(position);
+        let backing = self.backing();
+
+        if self.rope.is_some() {
+            return EditCapability::Editable { backing };
+        }
+
+        if let Some(piece_table) = &self.piece_table {
+            if piece_table.full_index() || piece_table.has_line(position.line0()) {
+                return EditCapability::Editable { backing };
+            }
+
+            return if self.can_materialize_rope(piece_table.total_len()) {
+                EditCapability::RequiresPromotion {
+                    from: DocumentBacking::PieceTable,
+                    to: DocumentBacking::Rope,
+                }
+            } else {
+                EditCapability::Unsupported {
+                    backing: DocumentBacking::PieceTable,
+                    reason: "document is too large to widen partial piece-table editing beyond the indexed prefix",
+                }
+            };
+        }
+
+        let use_piece_table = self.storage.is_some() && self.file_len >= PIECE_TABLE_MIN_BYTES;
+        if use_piece_table
+            && self
+                .piece_table_line_lengths_for_edit(position.line0())
+                .is_some()
+        {
+            return EditCapability::RequiresPromotion {
+                from: DocumentBacking::Mmap,
+                to: DocumentBacking::PieceTable,
+            };
+        }
+
+        if self.can_materialize_rope(self.file_len) {
+            return EditCapability::RequiresPromotion {
+                from: backing,
+                to: DocumentBacking::Rope,
+            };
+        }
+
+        EditCapability::Unsupported {
+            backing,
+            reason:
+                "document is too large to materialize into a rope; editing this region is disabled",
+        }
+    }
+
+    /// Returns the editability for a typed edit range.
+    pub fn edit_capability_for_range(&self, range: TextRange) -> EditCapability {
+        self.edit_capability_at(range.start())
+    }
+
+    /// Returns the editability for an anchor/head selection.
+    pub fn edit_capability_for_selection(&self, selection: TextSelection) -> EditCapability {
+        let range = self.text_range_for_selection(selection);
+        self.edit_capability_for_range(range)
+    }
+
+    /// Reads a typed text range with lossy UTF-8 decoding.
+    ///
+    /// The returned slice follows the current backing representation:
+    /// mmap/piece-table reads preserve stored line endings, while rope-backed
+    /// documents expose their in-memory `\n` newlines until save time.
+    ///
+    /// When a clean mmap-backed document has not indexed the requested start
+    /// line yet, Qem may fall back to a heuristic start range and mark the
+    /// returned slice as inexact.
+    pub fn read_text(&self, range: TextRange) -> TextSlice {
+        let start = self.clamp_position(range.start());
+        if range.is_empty() {
+            return TextSlice::new(String::new(), true);
+        }
+
+        if let Some(rope) = &self.rope {
+            let start_idx = Self::line_col_to_char_index(rope, start.line0(), start.col0());
+            let end_idx = start_idx
+                .saturating_add(range.len_chars())
+                .min(rope.len_chars());
+            let slice = rope.slice(start_idx..end_idx);
+            let text = slice
+                .as_str()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| slice.to_string());
+            return TextSlice::new(text, true);
+        }
+
+        if let Some(piece_table) = &self.piece_table {
+            let start_col0 = start.col0().min(piece_table.line_len_chars(start.line0()));
+            let start_offset = piece_table.byte_offset_for_col(start.line0(), start_col0);
+            let end_offset =
+                piece_table.advance_offset_by_text_units(start_offset, range.len_chars());
+            let bytes = piece_table.read_range(start_offset, end_offset);
+            return TextSlice::new(String::from_utf8_lossy(&bytes).into_owned(), true);
+        }
+
+        let bytes = self.mmap_bytes();
+        let file_len = self.file_len.min(bytes.len());
+        if file_len == 0 {
+            return TextSlice::new(String::new(), true);
+        }
+
+        let indexing_complete = self.is_fully_indexed();
+        let offsets_guard = self.line_offsets.try_read().ok();
+        let offsets: Option<&LineOffsets> = offsets_guard.as_deref();
+        let (line_range, exact) = if let Some(line_range) =
+            mmap_line_byte_range(offsets, file_len, start.line0(), indexing_complete)
+        {
+            (line_range, true)
+        } else if let Some(line_range) = self.estimated_mmap_line_byte_range(start.line0()) {
+            (line_range, false)
+        } else {
+            return TextSlice::new(String::new(), false);
+        };
+
+        let start_offset = byte_offset_for_text_col_in_bytes(bytes, line_range, start.col0());
+        let end_offset =
+            advance_offset_by_text_units_in_bytes(bytes, file_len, start_offset, range.len_chars());
+        let text =
+            String::from_utf8_lossy(&bytes[start_offset.min(file_len)..end_offset]).into_owned();
+        TextSlice::new(text, exact)
+    }
+
+    /// Reads the current selection as a typed text slice.
+    pub fn read_selection(&self, selection: TextSelection) -> TextSlice {
+        self.read_text(self.text_range_for_selection(selection))
+    }
+
+    /// Reads a viewport using a typed request/response model.
+    ///
+    /// This is the intended frontend-facing API for scrollable viewers and
+    /// editors that want to own their own cursor and scrollbar rendering.
+    pub fn read_viewport(&self, request: ViewportRequest) -> Viewport {
+        let rows = self
+            .line_slices(
+                request.first_line0(),
+                request.line_count(),
+                request.start_col(),
+                request.max_cols(),
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(offset, slice)| ViewportRow::new(request.first_line0() + offset, slice))
+            .collect();
+        Viewport::new(request, self.line_count(), rows)
+    }
+
     pub(crate) fn cursor_position_for_char_index(&self, char_index: usize) -> (usize, usize) {
         if let Some(rope) = &self.rope {
             let char_index = char_index.min(rope.len_chars());
@@ -3328,15 +4287,7 @@ impl Document {
             return Ok((line0, col0));
         }
 
-        self.ensure_edit_buffer_for_line(line0)?;
-        let piece_table_supports_line = self
-            .piece_table
-            .as_ref()
-            .map(|piece_table| piece_table.full_index() || piece_table.has_line(line0))
-            .unwrap_or(false);
-        if self.piece_table.is_some() && !piece_table_supports_line {
-            self.promote_piece_table_to_rope()?;
-        }
+        self.prepare_edit_at(line0)?;
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
             let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
@@ -3382,11 +4333,32 @@ impl Document {
         }
     }
 
+    /// Attempts to insert text at a typed position and returns the resulting cursor.
+    pub fn try_insert(
+        &mut self,
+        position: TextPosition,
+        text: &str,
+    ) -> Result<TextPosition, DocumentError> {
+        let position = self.clamp_position(position);
+        self.try_insert_text_at(position.line0(), position.col0(), text)
+            .map(|(line0, col0)| TextPosition::new(line0, col0))
+    }
+
+    /// Deprecated compatibility wrapper for [`Document::try_insert`].
+    #[deprecated(since = "0.3.0", note = "use try_insert() for explicit error handling")]
+    pub fn insert(&mut self, position: TextPosition, text: &str) -> TextPosition {
+        self.try_insert(position, text).unwrap_or(position)
+    }
+
     /// Inserts text at the given position and returns the new cursor coordinates.
     ///
     /// On edit failure, this compatibility helper preserves the previous
     /// behavior and returns the original coordinates unchanged. Use
     /// [`Document::try_insert_text_at`] for explicit error handling.
+    #[deprecated(
+        since = "0.3.0",
+        note = "use try_insert_text_at() for explicit error handling"
+    )]
     pub fn insert_text_at(&mut self, line0: usize, col0: usize, text: &str) -> (usize, usize) {
         self.try_insert_text_at(line0, col0, text)
             .unwrap_or((line0, col0))
@@ -3402,15 +4374,7 @@ impl Document {
             return Ok((line0, col0));
         }
 
-        self.ensure_edit_buffer_for_line(line0)?;
-        let piece_table_supports_line = self
-            .piece_table
-            .as_ref()
-            .map(|piece_table| piece_table.full_index() || piece_table.has_line(line0))
-            .unwrap_or(false);
-        if self.piece_table.is_some() && !piece_table_supports_line {
-            self.promote_piece_table_to_rope()?;
-        }
+        self.prepare_edit_at(line0)?;
 
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
@@ -3462,15 +4426,7 @@ impl Document {
             return Ok((line0, col0));
         }
 
-        self.ensure_edit_buffer_for_line(line0)?;
-        let piece_table_supports_line = self
-            .piece_table
-            .as_ref()
-            .map(|piece_table| piece_table.full_index() || piece_table.has_line(line0))
-            .unwrap_or(false);
-        if self.piece_table.is_some() && !piece_table_supports_line {
-            self.promote_piece_table_to_rope()?;
-        }
+        self.prepare_edit_at(line0)?;
 
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
@@ -3495,9 +4451,43 @@ impl Document {
         self.try_insert_text_at(line0, col0, text)
     }
 
-    /// Compatibility wrapper for [`Document::try_replace_range`].
+    /// Attempts to replace a typed text range and returns the resulting cursor.
+    pub fn try_replace(
+        &mut self,
+        range: TextRange,
+        text: &str,
+    ) -> Result<TextPosition, DocumentError> {
+        let start = self.clamp_position(range.start());
+        self.try_replace_range(start.line0(), start.col0(), range.len_chars(), text)
+            .map(|(line0, col0)| TextPosition::new(line0, col0))
+    }
+
+    /// Replaces the current selection and returns the resulting caret position.
+    pub fn try_replace_selection(
+        &mut self,
+        selection: TextSelection,
+        text: &str,
+    ) -> Result<TextPosition, DocumentError> {
+        self.try_replace(self.text_range_for_selection(selection), text)
+    }
+
+    /// Deprecated compatibility wrapper for [`Document::try_replace`].
+    #[deprecated(
+        since = "0.3.0",
+        note = "use try_replace() for explicit error handling"
+    )]
+    pub fn replace(&mut self, range: TextRange, text: &str) -> TextPosition {
+        let fallback = self.clamp_position(range.start());
+        self.try_replace(range, text).unwrap_or(fallback)
+    }
+
+    /// Deprecated compatibility wrapper for [`Document::try_replace_range`].
     ///
     /// On edit failure the original coordinates are returned unchanged.
+    #[deprecated(
+        since = "0.3.0",
+        note = "use try_replace_range() for explicit error handling"
+    )]
     pub fn replace_range(
         &mut self,
         line0: usize,
@@ -3520,15 +4510,7 @@ impl Document {
         line0: usize,
         col0: usize,
     ) -> Result<(bool, usize, usize), DocumentError> {
-        self.ensure_edit_buffer_for_line(line0)?;
-        let piece_table_supports_line = self
-            .piece_table
-            .as_ref()
-            .map(|piece_table| piece_table.full_index() || piece_table.has_line(line0))
-            .unwrap_or(false);
-        if self.piece_table.is_some() && !piece_table_supports_line {
-            self.promote_piece_table_to_rope()?;
-        }
+        self.prepare_edit_at(line0)?;
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
             let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
@@ -3573,14 +4555,193 @@ impl Document {
         }
     }
 
+    /// Attempts to delete the text unit before a typed cursor position.
+    pub fn try_backspace(&mut self, position: TextPosition) -> Result<EditResult, DocumentError> {
+        let position = self.clamp_position(position);
+        self.try_backspace_at(position.line0(), position.col0())
+            .map(|(changed, line0, col0)| EditResult::new(changed, TextPosition::new(line0, col0)))
+    }
+
+    /// Applies a backspace command to an anchor/head selection.
+    ///
+    /// When the selection is a caret, this behaves like [`Document::try_backspace`].
+    /// When the selection is non-empty, it deletes the selected range instead.
+    pub fn try_backspace_selection(
+        &mut self,
+        selection: TextSelection,
+    ) -> Result<EditResult, DocumentError> {
+        let selection = self.clamp_selection(selection);
+        if selection.is_caret() {
+            self.try_backspace(selection.head())
+        } else {
+            self.try_delete_selection(selection)
+        }
+    }
+
+    /// Attempts to delete the text unit at the cursor and returns the edit
+    /// result together with the resulting position.
+    ///
+    /// The cursor stays anchored at the same typed document position when the
+    /// deletion succeeds.
+    ///
+    /// # Errors
+    /// Returns [`DocumentError::EditUnsupported`] if editing would require
+    /// fully materializing an excessively large file in memory.
+    pub fn try_delete_forward_at(
+        &mut self,
+        line0: usize,
+        col0: usize,
+    ) -> Result<(bool, usize, usize), DocumentError> {
+        let position = self.clamp_position(TextPosition::new(line0, col0));
+        let line0 = position.line0();
+        let col0 = position.col0();
+
+        self.prepare_edit_at(line0)?;
+
+        let doc_path = self.path.clone();
+        if let Some(piece_table) = self.piece_table.as_mut() {
+            let actual_col0 = piece_table.line_len_chars(line0);
+            let start_col0 = col0.min(actual_col0);
+            let start = piece_table.byte_offset_for_col(line0, start_col0);
+            let end = piece_table.advance_offset_by_text_units(start, 1);
+            if end > start {
+                self.dirty = true;
+                let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
+                piece_table
+                    .delete_range(start, end - start)
+                    .map_err(|source| DocumentError::Write { path, source })?;
+                return Ok((true, line0, start_col0));
+            }
+            return Ok((false, line0, start_col0));
+        }
+
+        self.ensure_rope()?;
+        let rope = self
+            .rope
+            .as_mut()
+            .expect("rope must be present after ensure_rope");
+        let actual_col0 = Self::rope_line_len_chars_without_newline(rope, line0);
+        let start_col0 = col0.min(actual_col0);
+        let start = Self::line_col_to_char_index(rope, line0, start_col0);
+        if start >= rope.len_chars() {
+            return Ok((false, line0, start_col0));
+        }
+        rope.remove(start..(start + 1));
+        self.dirty = true;
+        Ok((true, line0, start_col0))
+    }
+
+    /// Attempts to delete the text unit at a typed cursor position.
+    pub fn try_delete_forward(
+        &mut self,
+        position: TextPosition,
+    ) -> Result<EditResult, DocumentError> {
+        let position = self.clamp_position(position);
+        self.try_delete_forward_at(position.line0(), position.col0())
+            .map(|(changed, line0, col0)| EditResult::new(changed, TextPosition::new(line0, col0)))
+    }
+
+    /// Applies a forward-delete command to an anchor/head selection.
+    ///
+    /// When the selection is a caret, this behaves like
+    /// [`Document::try_delete_forward`]. When the selection is non-empty, it
+    /// deletes the selected range instead.
+    pub fn try_delete_forward_selection(
+        &mut self,
+        selection: TextSelection,
+    ) -> Result<EditResult, DocumentError> {
+        let selection = self.clamp_selection(selection);
+        if selection.is_caret() {
+            self.try_delete_forward(selection.head())
+        } else {
+            self.try_delete_selection(selection)
+        }
+    }
+
+    /// Deletes the current selection and returns the resulting caret position.
+    ///
+    /// Empty caret selections are a no-op.
+    pub fn try_delete_selection(
+        &mut self,
+        selection: TextSelection,
+    ) -> Result<EditResult, DocumentError> {
+        let selection = self.clamp_selection(selection);
+        if selection.is_caret() {
+            return Ok(EditResult::new(false, selection.head()));
+        }
+        let cursor = self.try_replace_selection(selection, "")?;
+        Ok(EditResult::new(true, cursor))
+    }
+
+    /// Cuts the current selection, returning the removed text and resulting edit outcome.
+    ///
+    /// Empty caret selections are a no-op and return an empty string.
+    pub fn try_cut_selection(
+        &mut self,
+        selection: TextSelection,
+    ) -> Result<CutResult, DocumentError> {
+        let selection = self.clamp_selection(selection);
+        if selection.is_caret() {
+            return Ok(CutResult::new(
+                String::new(),
+                EditResult::new(false, selection.head()),
+            ));
+        }
+
+        let range = self.text_range_for_selection(selection);
+        self.prepare_edit_at(range.start().line0())?;
+        let text = self.read_text(range).into_text();
+        let edit = self.try_delete_selection(selection)?;
+        Ok(CutResult::new(text, edit))
+    }
+
+    /// Deprecated compatibility wrapper for [`Document::try_backspace`].
+    #[deprecated(
+        since = "0.3.0",
+        note = "use try_backspace() for explicit error handling"
+    )]
+    pub fn backspace(&mut self, position: TextPosition) -> EditResult {
+        self.try_backspace(position)
+            .unwrap_or_else(|_| EditResult::new(false, self.clamp_position(position)))
+    }
+
     /// Deletes the character before the cursor and returns the edit result and
     /// new position.
     ///
     /// On edit failure, this compatibility helper preserves the previous
     /// behavior and reports no change. Use [`Document::try_backspace_at`] for
     /// explicit error handling.
+    #[deprecated(
+        since = "0.3.0",
+        note = "use try_backspace_at() for explicit error handling"
+    )]
     pub fn backspace_at(&mut self, line0: usize, col0: usize) -> (bool, usize, usize) {
         self.try_backspace_at(line0, col0)
+            .unwrap_or((false, line0, col0))
+    }
+
+    /// Deprecated compatibility wrapper for [`Document::try_delete_forward`].
+    #[deprecated(
+        since = "0.3.0",
+        note = "use try_delete_forward() for explicit error handling"
+    )]
+    pub fn delete_forward(&mut self, position: TextPosition) -> EditResult {
+        self.try_delete_forward(position)
+            .unwrap_or_else(|_| EditResult::new(false, self.clamp_position(position)))
+    }
+
+    /// Deletes the text unit at the cursor and returns the edit result and
+    /// resulting position.
+    ///
+    /// On edit failure, this compatibility helper preserves the previous
+    /// behavior and reports no change. Use [`Document::try_delete_forward_at`]
+    /// for explicit error handling.
+    #[deprecated(
+        since = "0.3.0",
+        note = "use try_delete_forward_at() for explicit error handling"
+    )]
+    pub fn delete_forward_at(&mut self, line0: usize, col0: usize) -> (bool, usize, usize) {
+        self.try_delete_forward_at(line0, col0)
             .unwrap_or((false, line0, col0))
     }
 
@@ -3869,8 +5030,13 @@ mod tests {
 
     fn assert_doc_matches_model(doc: &Document, expected: &str) {
         let expected_lines = model_lines(expected);
+        let expected_text = if doc.has_edit_buffer() {
+            expected.to_owned()
+        } else {
+            render_with_line_ending(expected, doc.line_ending())
+        };
 
-        assert_eq!(doc.text_lossy(), expected);
+        assert_eq!(doc.text_lossy(), expected_text);
         assert_eq!(doc.exact_line_count(), Some(expected_lines.len()));
         assert_eq!(doc.line_count(), LineCount::Exact(expected_lines.len()));
         assert!(doc.has_precise_line_lengths());
@@ -4822,7 +5988,12 @@ mod tests {
             dirty: false,
         };
 
-        assert_eq!(doc.indexing_progress(), Some((32, 128)));
+        let progress = doc
+            .indexing_state()
+            .expect("typed indexing progress should exist");
+        assert_eq!(progress.completed_bytes(), 32);
+        assert_eq!(progress.total_bytes(), 128);
+        assert_eq!(doc.indexing_state(), Some(ByteProgress::new(32, 128)));
     }
 
     #[test]
@@ -5105,6 +6276,357 @@ mod tests {
         assert_eq!(doc.line_count(), LineCount::Exact(2));
     }
 
+    #[test]
+    fn typed_viewport_api_returns_rows_with_metadata() {
+        let mut doc = Document::new();
+        let _ = doc
+            .try_insert(TextPosition::new(0, 0), "zero\none\ntwo\n")
+            .unwrap();
+
+        let viewport = doc.read_viewport(ViewportRequest::new(1, 2).with_columns(0, 16));
+
+        assert_eq!(viewport.total_lines(), LineCount::Exact(4));
+        assert_eq!(viewport.len(), 2);
+        assert_eq!(viewport.rows()[0].line0(), 1);
+        assert_eq!(viewport.rows()[0].line_number(), 2);
+        assert_eq!(viewport.rows()[0].text(), "one");
+        assert!(viewport.rows()[0].is_exact());
+        assert_eq!(viewport.rows()[1].text(), "two");
+    }
+
+    #[test]
+    fn typed_edit_helpers_wrap_existing_edit_semantics() {
+        let mut doc = Document::new();
+        let cursor = doc
+            .try_insert(TextPosition::new(0, 0), "alpha\nbeta")
+            .unwrap();
+
+        assert_eq!(cursor, TextPosition::new(1, 4));
+
+        let cursor = doc
+            .try_replace(TextRange::new(TextPosition::new(1, 0), 4), "BETA")
+            .unwrap();
+        assert_eq!(cursor, TextPosition::new(1, 4));
+
+        let result = doc.try_backspace(TextPosition::new(1, 4)).unwrap();
+        assert!(result.changed());
+        assert_eq!(result.cursor(), TextPosition::new(1, 3));
+        assert_eq!(doc.text_lossy(), "alpha\nBET");
+    }
+
+    #[test]
+    fn typed_delete_forward_wraps_existing_edit_semantics() {
+        let mut doc = Document::new();
+        let _ = doc
+            .try_insert(TextPosition::new(0, 0), "alpha\nbeta")
+            .unwrap();
+
+        let result = doc.try_delete_forward(TextPosition::new(0, 5)).unwrap();
+        assert!(result.changed());
+        assert_eq!(result.cursor(), TextPosition::new(0, 5));
+        assert_eq!(doc.text_lossy(), "alphabeta");
+
+        let at_end = doc.try_delete_forward(TextPosition::new(0, 9)).unwrap();
+        assert!(!at_end.changed());
+        assert_eq!(at_end.cursor(), TextPosition::new(0, 9));
+    }
+
+    #[test]
+    fn typed_selection_helpers_build_ordered_ranges() {
+        let mut doc = Document::new();
+        let _ = doc
+            .try_insert(TextPosition::new(0, 0), "alpha\nbeta\ngamma")
+            .unwrap();
+
+        let (start, end) = doc.ordered_positions(TextPosition::new(2, 3), TextPosition::new(0, 2));
+        assert_eq!(start, TextPosition::new(0, 2));
+        assert_eq!(end, TextPosition::new(2, 3));
+
+        let range = doc.text_range_between(TextPosition::new(2, 3), TextPosition::new(0, 2));
+        assert_eq!(range.start(), TextPosition::new(0, 2));
+        assert_eq!(range.len_chars(), 12);
+    }
+
+    #[test]
+    fn typed_selection_helpers_treat_crlf_as_single_text_unit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("crlf-range.txt");
+        std::fs::write(&path, b"a\r\nb\r\n").unwrap();
+
+        let doc = Document::open(&path).unwrap();
+
+        let range = doc.text_range_between(TextPosition::new(0, 1), TextPosition::new(1, 1));
+        assert_eq!(range.start(), TextPosition::new(0, 1));
+        assert_eq!(doc.char_index_for_position(TextPosition::new(1, 0)), 2);
+        assert_eq!(doc.char_index_for_position(TextPosition::new(1, 1)), 3);
+        assert_eq!(doc.position_for_char_index(2), TextPosition::new(1, 0));
+        assert_eq!(
+            doc.text_units_between(TextPosition::new(0, 1), TextPosition::new(1, 1)),
+            2
+        );
+        assert_eq!(range.len_chars(), 2);
+    }
+
+    #[test]
+    fn typed_text_reads_cover_ranges_and_selections() {
+        let mut doc = Document::new();
+        let _ = doc
+            .try_insert(TextPosition::new(0, 0), "alpha\nbeta\ngamma")
+            .unwrap();
+
+        let range = doc.text_range_between(TextPosition::new(0, 2), TextPosition::new(1, 2));
+        let slice = doc.read_text(range);
+        assert!(slice.is_exact());
+        assert_eq!(slice.text(), "pha\nbe");
+
+        let selection = TextSelection::new(TextPosition::new(2, 2), TextPosition::new(1, 1));
+        let selected = doc.read_selection(selection);
+        assert!(selected.is_exact());
+        assert_eq!(selected.text(), "eta\nga");
+    }
+
+    #[test]
+    fn typed_text_reads_preserve_crlf_in_clean_mmap_documents() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("crlf-selection.txt");
+        std::fs::write(&path, b"alpha\r\nbeta\r\n").unwrap();
+
+        let doc = Document::open(&path).unwrap();
+        let selection = TextSelection::new(TextPosition::new(0, 3), TextPosition::new(1, 2));
+        let slice = doc.read_selection(selection);
+
+        assert!(slice.is_exact());
+        assert_eq!(slice.text(), "ha\r\nbe");
+    }
+
+    #[test]
+    fn typed_delete_forward_treats_crlf_as_single_text_unit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("crlf-delete-forward.txt");
+        std::fs::write(&path, b"alpha\r\nbeta\r\n").unwrap();
+
+        let mut doc = Document::open(&path).unwrap();
+        let result = doc.try_delete_forward(TextPosition::new(0, 5)).unwrap();
+
+        assert!(result.changed());
+        assert_eq!(result.cursor(), TextPosition::new(0, 5));
+        assert_eq!(doc.text_lossy(), "alphabeta\n");
+    }
+
+    #[test]
+    fn typed_selection_delete_and_replace_helpers_work() {
+        let mut doc = Document::new();
+        let _ = doc
+            .try_insert(TextPosition::new(0, 0), "alpha\nbeta")
+            .unwrap();
+
+        let selection = TextSelection::new(TextPosition::new(1, 2), TextPosition::new(0, 4));
+        let range = doc.text_range_for_selection(selection);
+        assert_eq!(range.start(), TextPosition::new(0, 4));
+        assert_eq!(range.len_chars(), 4);
+
+        let cursor = doc.try_replace_selection(selection, "Z").unwrap();
+        assert_eq!(cursor, TextPosition::new(0, 5));
+        assert_eq!(doc.text_lossy(), "alphZta");
+
+        let caret = TextSelection::caret(TextPosition::new(0, 3));
+        let delete = doc.try_delete_selection(caret).unwrap();
+        assert!(!delete.changed());
+        assert_eq!(delete.cursor(), TextPosition::new(0, 3));
+    }
+
+    #[test]
+    fn typed_selection_delete_commands_handle_caret_and_range() {
+        let mut doc = Document::new();
+        let _ = doc
+            .try_insert(TextPosition::new(0, 0), "alpha\nbeta")
+            .unwrap();
+
+        let range_selection = TextSelection::new(TextPosition::new(0, 3), TextPosition::new(1, 2));
+        let deleted = doc.try_delete_forward_selection(range_selection).unwrap();
+        assert!(deleted.changed());
+        assert_eq!(deleted.cursor(), TextPosition::new(0, 3));
+        assert_eq!(doc.text_lossy(), "alpta");
+
+        let backspace = doc
+            .try_backspace_selection(TextSelection::caret(TextPosition::new(0, 2)))
+            .unwrap();
+        assert!(backspace.changed());
+        assert_eq!(backspace.cursor(), TextPosition::new(0, 1));
+        assert_eq!(doc.text_lossy(), "apta");
+
+        let forward = doc
+            .try_delete_forward_selection(TextSelection::caret(TextPosition::new(0, 1)))
+            .unwrap();
+        assert!(forward.changed());
+        assert_eq!(forward.cursor(), TextPosition::new(0, 1));
+        assert_eq!(doc.text_lossy(), "ata");
+    }
+
+    #[test]
+    fn typed_cut_selection_returns_removed_text_and_cursor() {
+        let mut doc = Document::new();
+        let _ = doc
+            .try_insert(TextPosition::new(0, 0), "alpha\nbeta")
+            .unwrap();
+
+        let selection = TextSelection::new(TextPosition::new(0, 3), TextPosition::new(1, 2));
+        let cut = doc.try_cut_selection(selection).unwrap();
+
+        assert!(cut.changed());
+        assert_eq!(cut.text(), "ha\nbe");
+        assert_eq!(cut.cursor(), TextPosition::new(0, 3));
+        assert_eq!(doc.text_lossy(), "alpta");
+
+        let caret = doc
+            .try_cut_selection(TextSelection::caret(TextPosition::new(0, 1)))
+            .unwrap();
+        assert!(!caret.changed());
+        assert!(caret.text().is_empty());
+        assert_eq!(caret.cursor(), TextPosition::new(0, 1));
+    }
+
+    #[test]
+    fn document_status_reports_frontend_snapshot() {
+        let mut doc = Document::new();
+        let _ = doc
+            .try_insert(TextPosition::new(0, 0), "alpha\nbeta")
+            .unwrap();
+
+        let status = doc.status();
+
+        assert!(status.is_dirty());
+        assert_eq!(doc.backing(), DocumentBacking::Rope);
+        assert_eq!(status.backing(), DocumentBacking::Rope);
+        assert_eq!(status.backing().as_str(), "rope");
+        assert_eq!(status.line_count(), LineCount::Exact(2));
+        assert_eq!(status.exact_line_count(), Some(2));
+        assert_eq!(status.display_line_count(), 2);
+        assert!(status.is_line_count_exact());
+        assert_eq!(status.line_ending(), LineEnding::Lf);
+        assert!(status.has_edit_buffer());
+        assert!(status.has_rope());
+        assert!(!status.has_piece_table());
+        assert!(!status.is_indexing());
+    }
+
+    #[test]
+    fn edit_capability_reports_promotions_and_current_backing() {
+        let doc = Document::new();
+        assert_eq!(
+            doc.edit_capability_at(TextPosition::new(0, 0)),
+            EditCapability::RequiresPromotion {
+                from: DocumentBacking::Mmap,
+                to: DocumentBacking::Rope,
+            }
+        );
+
+        let mut edited = Document::new();
+        let _ = edited.try_insert(TextPosition::new(0, 0), "alpha").unwrap();
+        assert_eq!(
+            edited.edit_capability_at(TextPosition::new(0, 2)),
+            EditCapability::Editable {
+                backing: DocumentBacking::Rope,
+            }
+        );
+    }
+
+    #[test]
+    fn edit_capability_reports_large_mmap_positions_as_unsupported() {
+        let dir =
+            std::env::temp_dir().join(format!("qem-doc-edit-capability-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("huge.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_ROPE_EDIT_FILE_BYTES + 1) as u64).unwrap();
+        drop(file);
+
+        let doc = Document::open(path.clone()).unwrap();
+        let capability =
+            doc.edit_capability_at(TextPosition::new(PARTIAL_PIECE_TABLE_MAX_LINES + 1, 0));
+
+        assert_eq!(
+            capability,
+            EditCapability::Unsupported {
+                backing: DocumentBacking::Mmap,
+                reason: "document is too large to materialize into a rope; editing this region is disabled",
+            }
+        );
+        assert!(!capability.is_editable());
+        assert_eq!(
+            capability.reason(),
+            Some(
+                "document is too large to materialize into a rope; editing this region is disabled"
+            )
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_capability_reports_partial_piece_table_promotion_limits() {
+        let dir = std::env::temp_dir().join(format!(
+            "qem-doc-edit-capability-piece-table-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("small.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let storage = FileStorage::open(&path).unwrap();
+
+        let doc = Document {
+            path: Some(path.clone()),
+            storage: Some(storage.clone()),
+            line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+            disk_index: None,
+            indexing: Arc::new(AtomicBool::new(false)),
+            indexing_started: None,
+            file_len: MAX_ROPE_EDIT_FILE_BYTES + 1,
+            indexed_bytes: Arc::new(AtomicUsize::new(0)),
+            avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+            line_ending: LineEnding::Lf,
+            rope: None,
+            piece_table: Some(PieceTable {
+                original: storage,
+                add: Vec::new(),
+                pieces: PieceTree::from_pieces(vec![Piece {
+                    src: PieceSource::Original,
+                    start: 0,
+                    len: 1,
+                    line_breaks: 0,
+                }]),
+                known_line_count: 1,
+                known_byte_len: 1,
+                total_len: MAX_ROPE_EDIT_FILE_BYTES + 1,
+                full_index: false,
+                pending_session_flush: false,
+                pending_session_edits: 0,
+                last_session_flush: None,
+                edit_batch_depth: 0,
+                edit_batch_dirty: false,
+            }),
+            dirty: true,
+        };
+
+        assert_eq!(
+            doc.edit_capability_at(TextPosition::new(0, 0)),
+            EditCapability::Editable {
+                backing: DocumentBacking::PieceTable,
+            }
+        );
+        assert_eq!(
+            doc.edit_capability_at(TextPosition::new(1, 0)),
+            EditCapability::Unsupported {
+                backing: DocumentBacking::PieceTable,
+                reason: "document is too large to widen partial piece-table editing beyond the indexed prefix",
+            }
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -5155,10 +6677,15 @@ mod tests {
             doc.save_to(&saved).unwrap();
             let reopened = Document::open(&saved).unwrap();
             let rendered = render_with_line_ending(&expected, persisted_line_ending);
+            let live_text = if doc.has_edit_buffer() {
+                expected.clone()
+            } else {
+                rendered.clone()
+            };
 
             prop_assert_eq!(reopened.line_ending(), detect_line_ending(rendered.as_bytes()));
             prop_assert_eq!(reopened.text_lossy(), rendered);
-            prop_assert_eq!(doc.text_lossy(), expected);
+            prop_assert_eq!(doc.text_lossy(), live_text);
         }
     }
 

@@ -1,7 +1,7 @@
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
-use qem::Document;
+use qem::{Document, ViewportRequest};
 use ropey::Rope;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -164,12 +164,22 @@ fn bench_scroll(c: &mut Criterion) {
     group.throughput(Throughput::Elements(VIEWPORT_LINES as u64));
     group.bench_function(BenchmarkId::new("middle", fixture.label), |b| {
         b.iter(|| {
-            black_box(doc.line_slices(black_box(middle_line), VIEWPORT_LINES, 0, VIEWPORT_COLS))
+            black_box(
+                doc.read_viewport(
+                    ViewportRequest::new(black_box(middle_line), VIEWPORT_LINES)
+                        .with_columns(0, VIEWPORT_COLS),
+                ),
+            )
         });
     });
     group.bench_function(BenchmarkId::new("tail", fixture.label), |b| {
         b.iter(|| {
-            black_box(doc.line_slices(black_box(tail_line), VIEWPORT_LINES, 0, VIEWPORT_COLS))
+            black_box(
+                doc.read_viewport(
+                    ViewportRequest::new(black_box(tail_line), VIEWPORT_LINES)
+                        .with_columns(0, VIEWPORT_COLS),
+                ),
+            )
         });
     });
     group.finish();
@@ -189,7 +199,14 @@ fn bench_edited_scroll(c: &mut Criterion) {
     let mut group = c.benchmark_group("edited_viewport_reads");
     group.throughput(Throughput::Elements(VIEWPORT_LINES as u64));
     group.bench_function(BenchmarkId::new("prefix", fixture.label), |b| {
-        b.iter(|| black_box(doc.line_slices(black_box(1024), VIEWPORT_LINES, 0, VIEWPORT_COLS)));
+        b.iter(|| {
+            black_box(
+                doc.read_viewport(
+                    ViewportRequest::new(black_box(1024), VIEWPORT_LINES)
+                        .with_columns(0, VIEWPORT_COLS),
+                ),
+            )
+        });
     });
     group.finish();
 }

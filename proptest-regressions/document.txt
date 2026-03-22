@@ -8,3 +8,4 @@ cc d3562e2bd7f7ce4347f5ad77bec80394477b1af0322f7fe4d0403629debea496 # shrinks to
 cc 66f2d22f23e0866468e1f8eff2333226f2afa602f5ae5781e7fe6f6619605baa # shrinks to ops = [Replace { line_hint: 0, col0: 3, len_chars: 1, text: "\n" }]
 cc 2ceba020f5af560e8e51a9a18c0436b4bd7ac1030d66a3665ddf702e89db3f94 # shrinks to initial = "", ops = [Insert { line_hint: 0, col0: 0, text: "" }, Insert { line_hint: 0, col0: 1, text: "" }]
 cc 8d6e07b62f87402392fb7c60edb7558a2599cb9e650c12adac33c63028deef9d # shrinks to initial = "", use_crlf = false, ops = [Insert { line_hint: 0, col0: 0, text: "" }, Insert { line_hint: 0, col0: 1, text: "" }]
+cc dc2544d91518069cfef84d9588481a4294eb368723d9fb8fa9b98d512730e5f0 # shrinks to initial = "\n", use_crlf = true, ops = [Insert { line_hint: 0, col0: 0, text: "" }]

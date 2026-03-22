@@ -1,4 +1,4 @@
-use qem::Document;
+use qem::{Document, ViewportRequest};
 use std::env;
 use std::path::PathBuf;
 use std::thread;
@@ -26,6 +26,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("path: {}", path.display());
+    println!("bytes: {}", doc.status().file_len());
+    println!("backing: {}", doc.status().backing().as_str());
     println!(
         "lines: {} ({})",
         doc.display_line_count(),
@@ -36,16 +38,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
-    for (offset, slice) in doc
-        .line_slices(start_line0, line_count, 0, 160)
-        .into_iter()
-        .enumerate()
-    {
+    let viewport =
+        doc.read_viewport(ViewportRequest::new(start_line0, line_count).with_columns(0, 160));
+    for row in viewport.rows() {
         println!(
             "{:>8}: [{}] {}",
-            start_line0 + offset + 1,
-            if slice.is_exact() { "=" } else { "~" },
-            slice.text()
+            row.line_number(),
+            if row.is_exact() { "=" } else { "~" },
+            row.text()
         );
     }
 
