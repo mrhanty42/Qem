@@ -5051,4 +5051,72 @@ mod tests {
             assert!(!recovered.redo());
         }
     }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(8))]
+
+        #[test]
+        fn randomized_piece_table_save_to_clears_sessions_and_reopens_clean(
+            ops in prop::collection::vec(file_backed_edit_op_strategy(), 1..12),
+        ) {
+            let dir = tempdir().unwrap();
+            let source = dir.path().join("source.txt");
+            let saved = dir.path().join("saved.txt");
+            write_disk_backed_fixture(&source);
+
+            let original = std::fs::read_to_string(&source).unwrap();
+            let mut expected = original.clone();
+
+            {
+                let mut doc = Document::open(source.clone()).unwrap();
+                for op in &ops {
+                    apply_op_to_doc_text_only(&mut doc, &mut expected, op);
+                    assert!(
+                        doc.piece_table.is_some(),
+                        "large file edits should stay on the piece-table path"
+                    );
+                    assert!(
+                        !doc.has_rope(),
+                        "save path test should stay on the piece-table path"
+                    );
+                }
+
+                doc.flush_session().unwrap();
+                assert!(
+                    editlog_path(&source).exists(),
+                    "flush_session should materialize a recoverable sidecar before save"
+                );
+
+                doc.save_to(&saved).unwrap();
+
+                assert_eq!(doc.path(), Some(saved.as_path()));
+                assert!(!doc.is_dirty());
+                assert!(doc.has_edit_buffer());
+                assert_eq!(doc.text_lossy(), expected);
+                assert_eq!(std::fs::read_to_string(&saved).unwrap(), expected);
+                assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+                assert!(
+                    !editlog_path(&source).exists(),
+                    "save_to should clear the old recoverable sidecar"
+                );
+                assert!(
+                    !editlog_path(&saved).exists(),
+                    "save_to should not leave a recoverable sidecar at the destination"
+                );
+            }
+
+            let reopened = Document::open(saved.clone()).unwrap();
+            assert_eq!(reopened.text_lossy(), expected);
+            assert!(!reopened.is_dirty());
+            assert!(!reopened.has_edit_buffer());
+            assert!(
+                !editlog_path(&source).exists(),
+                "reopening the saved file must not revive the old sidecar"
+            );
+            assert!(
+                !editlog_path(&saved).exists(),
+                "clean reopened save must not create a recoverable sidecar"
+            );
+        }
+    }
 }
