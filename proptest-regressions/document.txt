@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d3562e2bd7f7ce4347f5ad77bec80394477b1af0322f7fe4d0403629debea496 # shrinks to initial = "", use_crlf = true, ops = [Insert { line_hint: 0, col0: 0, text: "" }]

@@ -3494,7 +3494,334 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::io::Write;
+    use tempfile::tempdir;
+
+    #[derive(Clone, Debug)]
+    enum EditOp {
+        Insert {
+            line_hint: usize,
+            col0: usize,
+            text: String,
+        },
+        Replace {
+            line_hint: usize,
+            col0: usize,
+            len_chars: usize,
+            text: String,
+        },
+        Backspace {
+            line_hint: usize,
+            col0: usize,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct ModelLine {
+        start: usize,
+        end: usize,
+        len_chars: usize,
+    }
+
+    fn model_lines(text: &str) -> Vec<ModelLine> {
+        let mut lines = Vec::new();
+        let mut start = 0usize;
+        let mut len_chars = 0usize;
+
+        for (idx, ch) in text.char_indices() {
+            if ch == '\n' {
+                lines.push(ModelLine {
+                    start,
+                    end: idx,
+                    len_chars,
+                });
+                start = idx + ch.len_utf8();
+                len_chars = 0;
+            } else {
+                len_chars = len_chars.saturating_add(1);
+            }
+        }
+
+        lines.push(ModelLine {
+            start,
+            end: text.len(),
+            len_chars,
+        });
+        lines
+    }
+
+    fn clamp_model_line(text: &str, line_hint: usize) -> usize {
+        let lines = model_lines(text);
+        line_hint.min(lines.len().saturating_sub(1))
+    }
+
+    fn byte_offset_for_col(text: &str, line: ModelLine, col0: usize) -> usize {
+        let clamped = col0.min(line.len_chars);
+        if clamped == line.len_chars {
+            return line.end;
+        }
+
+        let mut chars_seen = 0usize;
+        for (offset, _) in text[line.start..line.end].char_indices() {
+            if chars_seen == clamped {
+                return line.start + offset;
+            }
+            chars_seen = chars_seen.saturating_add(1);
+        }
+
+        line.end
+    }
+
+    fn advance_byte_offset_by_chars(text: &str, start: usize, len_chars: usize) -> usize {
+        if len_chars == 0 || start >= text.len() {
+            return start.min(text.len());
+        }
+
+        let mut chars_seen = 0usize;
+        for (offset, _) in text[start..].char_indices() {
+            if chars_seen == len_chars {
+                return start + offset;
+            }
+            chars_seen = chars_seen.saturating_add(1);
+        }
+
+        text.len()
+    }
+
+    fn visible_segment_for_model_line(
+        text: &str,
+        line0: usize,
+        start_col: usize,
+        max_cols: usize,
+    ) -> String {
+        if max_cols == 0 {
+            return String::new();
+        }
+
+        let lines = model_lines(text);
+        let Some(line) = lines.get(line0).copied() else {
+            return String::new();
+        };
+        if start_col >= line.len_chars {
+            return String::new();
+        }
+
+        let start = byte_offset_for_col(text, line, start_col);
+        let end = byte_offset_for_col(text, line, start_col.saturating_add(max_cols));
+        text[start..end].to_string()
+    }
+
+    fn model_insert(
+        text: &mut String,
+        line_hint: usize,
+        col0: usize,
+        insert: &str,
+    ) -> (usize, usize) {
+        let lines = model_lines(text);
+        let line0 = line_hint.min(lines.len().saturating_sub(1));
+        let line = lines[line0];
+        let insert_at = byte_offset_for_col(text, line, col0);
+        let virtual_padding_cols = col0.saturating_sub(line.len_chars);
+        let (normalized, added_lines, last_col) =
+            normalize_insert_text(insert, virtual_padding_cols, LineEnding::Lf);
+        text.insert_str(insert_at, &normalized);
+
+        if added_lines == 0 {
+            (line0, col0.saturating_add(last_col))
+        } else {
+            (line0.saturating_add(added_lines), last_col)
+        }
+    }
+
+    fn model_delete(
+        text: &mut String,
+        line_hint: usize,
+        col0: usize,
+        len_chars: usize,
+    ) -> (usize, usize) {
+        if len_chars == 0 {
+            return (clamp_model_line(text, line_hint), col0);
+        }
+
+        let lines = model_lines(text);
+        let line0 = line_hint.min(lines.len().saturating_sub(1));
+        let line = lines[line0];
+        let start_col0 = col0.min(line.len_chars);
+        let start = byte_offset_for_col(text, line, start_col0);
+        let end = advance_byte_offset_by_chars(text, start, len_chars);
+        if end > start {
+            text.replace_range(start..end, "");
+        }
+        (line0, start_col0)
+    }
+
+    fn model_replace(
+        text: &mut String,
+        line_hint: usize,
+        col0: usize,
+        len_chars: usize,
+        replacement: &str,
+    ) -> (usize, usize) {
+        let (line0, col0) = model_delete(text, line_hint, col0, len_chars);
+        model_insert(text, line0, col0, replacement)
+    }
+
+    fn model_backspace(text: &mut String, line_hint: usize, col0: usize) -> (bool, usize, usize) {
+        if text.is_empty() {
+            return (false, 0, col0);
+        }
+
+        let lines = model_lines(text);
+        let line0 = line_hint.min(lines.len().saturating_sub(1));
+        let line = lines[line0];
+        if col0 > line.len_chars {
+            return (false, line0, col0.saturating_sub(1));
+        }
+
+        let cur = byte_offset_for_col(text, line, col0);
+        if cur == 0 {
+            return (false, line0, col0);
+        }
+
+        let (prev_start, prev_ch) = text[..cur]
+            .char_indices()
+            .last()
+            .expect("non-empty prefix must contain a character");
+        text.replace_range(prev_start..cur, "");
+
+        if prev_ch == '\n' {
+            let new_line0 = line0.saturating_sub(1);
+            let new_col0 = model_lines(text)[new_line0].len_chars;
+            (true, new_line0, new_col0)
+        } else {
+            (true, line0, col0.saturating_sub(1))
+        }
+    }
+
+    fn assert_doc_matches_model(doc: &Document, expected: &str) {
+        let expected_lines = model_lines(expected);
+
+        assert_eq!(doc.text_lossy(), expected);
+        assert_eq!(doc.exact_line_count(), Some(expected_lines.len()));
+        assert_eq!(doc.line_count(), LineCount::Exact(expected_lines.len()));
+        assert!(doc.has_precise_line_lengths());
+
+        for (line0, line) in expected_lines.iter().copied().enumerate() {
+            assert_eq!(
+                doc.line_len_chars(line0),
+                line.len_chars,
+                "line_len_chars mismatch at line {line0}"
+            );
+            let visible = doc.line_slice(line0, 0, line.len_chars.saturating_add(4));
+            assert!(
+                visible.is_exact(),
+                "line_slice should be exact at line {line0}"
+            );
+            assert_eq!(
+                visible.text(),
+                &expected[line.start..line.end],
+                "line_slice text mismatch at line {line0}"
+            );
+
+            let offset_col = line.len_chars / 2;
+            let partial = doc.line_slice(line0, offset_col, 3);
+            assert_eq!(
+                partial.text(),
+                visible_segment_for_model_line(expected, line0, offset_col, 3),
+                "partial line_slice mismatch at line {line0}"
+            );
+        }
+    }
+
+    fn apply_op_to_doc(doc: &mut Document, expected: &mut String, op: &EditOp) {
+        match op {
+            EditOp::Insert {
+                line_hint,
+                col0,
+                text,
+            } => {
+                let line0 = clamp_model_line(expected, *line_hint);
+                let expected_cursor = model_insert(expected, line0, *col0, text);
+                let actual_cursor = doc.try_insert_text_at(line0, *col0, text).unwrap();
+                assert_eq!(actual_cursor, expected_cursor);
+            }
+            EditOp::Replace {
+                line_hint,
+                col0,
+                len_chars,
+                text,
+            } => {
+                let line0 = clamp_model_line(expected, *line_hint);
+                let expected_cursor = model_replace(expected, line0, *col0, *len_chars, text);
+                let actual_cursor = doc
+                    .try_replace_range(line0, *col0, *len_chars, text)
+                    .unwrap();
+                assert_eq!(actual_cursor, expected_cursor);
+            }
+            EditOp::Backspace { line_hint, col0 } => {
+                let line0 = clamp_model_line(expected, *line_hint);
+                let expected_cursor = model_backspace(expected, line0, *col0);
+                let actual_cursor = doc.try_backspace_at(line0, *col0).unwrap();
+                assert_eq!(actual_cursor, expected_cursor);
+            }
+        }
+
+        assert_doc_matches_model(doc, expected);
+    }
+
+    fn op_text_strategy() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                Just('a'),
+                Just('b'),
+                Just('c'),
+                Just('x'),
+                Just('y'),
+                Just('z'),
+                Just(' '),
+                Just('\n'),
+                Just('\r'),
+                Just('é'),
+                Just('中'),
+                Just('🙂'),
+            ],
+            0..8,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn edit_op_strategy() -> impl Strategy<Value = EditOp> {
+        prop_oneof![
+            (0usize..12, 0usize..24, op_text_strategy()).prop_map(|(line_hint, col0, text)| {
+                EditOp::Insert {
+                    line_hint,
+                    col0,
+                    text,
+                }
+            }),
+            (0usize..12, 0usize..24, 0usize..12, op_text_strategy()).prop_map(
+                |(line_hint, col0, len_chars, text)| {
+                    EditOp::Replace {
+                        line_hint,
+                        col0,
+                        len_chars,
+                        text,
+                    }
+                },
+            ),
+            (0usize..12, 0usize..24)
+                .prop_map(|(line_hint, col0)| EditOp::Backspace { line_hint, col0 }),
+        ]
+    }
+
+    fn render_with_line_ending(text: &str, line_ending: LineEnding) -> String {
+        match line_ending {
+            LineEnding::Lf => text.to_owned(),
+            LineEnding::Crlf => text.replace('\n', "\r\n"),
+            LineEnding::Cr => text.replace('\n', "\r"),
+        }
+    }
 
     fn write_disk_backed_fixture(path: &Path) {
         let mut file = std::fs::File::create(path).unwrap();
@@ -4429,5 +4756,62 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn randomized_in_memory_edits_match_string_model(
+            initial in op_text_strategy(),
+            ops in prop::collection::vec(edit_op_strategy(), 1..48),
+        ) {
+            let mut doc = Document::new();
+            let mut expected = String::new();
+
+            let initial_cursor = model_insert(&mut expected, 0, 0, &initial);
+            let doc_cursor = doc.try_insert_text_at(0, 0, &initial).unwrap();
+            prop_assert_eq!(doc_cursor, initial_cursor);
+            assert_doc_matches_model(&doc, &expected);
+
+            for op in &ops {
+                apply_op_to_doc(&mut doc, &mut expected, op);
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn randomized_small_file_roundtrip_matches_model(
+            initial in op_text_strategy(),
+            use_crlf in any::<bool>(),
+            ops in prop::collection::vec(edit_op_strategy(), 1..24),
+        ) {
+            let dir = tempdir().unwrap();
+            let source = dir.path().join("input.txt");
+            let saved = dir.path().join("output.txt");
+            let requested_line_ending = if use_crlf { LineEnding::Crlf } else { LineEnding::Lf };
+
+            let mut expected = String::new();
+            let _ = model_insert(&mut expected, 0, 0, &initial);
+            let source_text = render_with_line_ending(&expected, requested_line_ending);
+            let persisted_line_ending = detect_line_ending(source_text.as_bytes());
+            std::fs::write(&source, source_text).unwrap();
+
+            let mut doc = Document::open(&source).unwrap();
+            for op in &ops {
+                apply_op_to_doc(&mut doc, &mut expected, op);
+            }
+
+            doc.save_to(&saved).unwrap();
+            let reopened = Document::open(&saved).unwrap();
+            let rendered = render_with_line_ending(&expected, persisted_line_ending);
+
+            prop_assert_eq!(reopened.line_ending(), detect_line_ending(rendered.as_bytes()));
+            prop_assert_eq!(reopened.text_lossy(), rendered);
+            prop_assert_eq!(doc.text_lossy(), expected);
+        }
     }
 }
