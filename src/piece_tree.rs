@@ -747,10 +747,10 @@ impl DiskPageStore {
         if let Some(page) = self.resident_pages.get(&page_id) {
             return Some(Arc::clone(page));
         }
-        if let Ok(mut cache) = self.cache.lock()
-            && let Some(page) = cache.get(page_id)
-        {
-            return Some(page);
+        if let Ok(mut cache) = self.cache.lock() {
+            if let Some(page) = cache.get(page_id) {
+                return Some(page);
+            }
         }
 
         let mut file = OpenOptions::new().read(true).open(&self.path).ok()?;
@@ -1473,13 +1473,12 @@ fn coalesce_adjacent(pieces: &mut Vec<Piece>) {
     }
     let mut out: Vec<Piece> = Vec::with_capacity(pieces.len());
     for piece in pieces.drain(..) {
-        if let Some(last) = out.last_mut()
-            && last.src == piece.src
-            && last.start + last.len == piece.start
-        {
-            last.len = last.len.saturating_add(piece.len);
-            last.line_breaks = last.line_breaks.saturating_add(piece.line_breaks);
-            continue;
+        if let Some(last) = out.last_mut() {
+            if last.src == piece.src && last.start + last.len == piece.start {
+                last.len = last.len.saturating_add(piece.len);
+                last.line_breaks = last.line_breaks.saturating_add(piece.line_breaks);
+                continue;
+            }
         }
         out.push(piece);
     }

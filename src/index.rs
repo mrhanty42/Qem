@@ -207,10 +207,10 @@ impl ReadyDiskLineIndex {
     }
 
     fn read_page(&self, page_id: u64) -> io::Result<Arc<Page>> {
-        if let Ok(mut cache) = self.cache.lock()
-            && let Some(page) = cache.get(page_id)
-        {
-            return Ok(page);
+        if let Ok(mut cache) = self.cache.lock() {
+            if let Some(page) = cache.get(page_id) {
+                return Ok(page);
+            }
         }
 
         let mut file = File::open(&self.path)?;

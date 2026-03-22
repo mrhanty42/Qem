@@ -130,27 +130,28 @@ fn build_rope_from_bytes(bytes: &[u8]) -> Rope {
     loop {
         let last = input.is_empty();
         let (result, read, written, _) = decoder.decode_to_utf8(input, &mut out, last);
-        if written > 0
-            && let Ok(s) = std::str::from_utf8(&out[..written])
-            && !s.is_empty()
-        {
-            let mut normalized = String::with_capacity(s.len());
-            for ch in s.chars() {
-                if prev_was_cr {
-                    prev_was_cr = false;
-                    if ch == '\n' {
-                        continue;
+        if written > 0 {
+            if let Ok(s) = std::str::from_utf8(&out[..written]) {
+                if !s.is_empty() {
+                    let mut normalized = String::with_capacity(s.len());
+                    for ch in s.chars() {
+                        if prev_was_cr {
+                            prev_was_cr = false;
+                            if ch == '\n' {
+                                continue;
+                            }
+                        }
+                        if ch == '\r' {
+                            normalized.push('\n');
+                            prev_was_cr = true;
+                        } else {
+                            normalized.push(ch);
+                        }
+                    }
+                    if !normalized.is_empty() {
+                        builder.append(&normalized);
                     }
                 }
-                if ch == '\r' {
-                    normalized.push('\n');
-                    prev_was_cr = true;
-                } else {
-                    normalized.push(ch);
-                }
-            }
-            if !normalized.is_empty() {
-                builder.append(&normalized);
             }
         }
         input = &input[read..];
@@ -2145,28 +2146,28 @@ impl Document {
 
         // Persistent piece-table sessions are only created for large documents,
         // so skipping this sidecar probe avoids useless I/O on small-file opens.
-        if file_len >= PIECE_TREE_DISK_MIN_BYTES
-            && let Ok(Some((pieces, add, meta))) = PieceTree::try_open_disk_session(&path)
-        {
-            indexing.store(false, Ordering::Relaxed);
-            indexed_bytes.store(file_len, Ordering::Relaxed);
-            return Self {
-                path: Some(path),
-                storage: Some(storage.clone()),
-                line_offsets: new_line_offsets(),
-                disk_index,
-                indexing,
-                indexing_started: Some(indexing_started),
-                file_len,
-                indexed_bytes,
-                avg_line_len,
-                line_ending,
-                rope: None,
-                piece_table: Some(PieceTable::from_recovered_session(
-                    storage, add, pieces, meta,
-                )),
-                dirty: true,
-            };
+        if file_len >= PIECE_TREE_DISK_MIN_BYTES {
+            if let Ok(Some((pieces, add, meta))) = PieceTree::try_open_disk_session(&path) {
+                indexing.store(false, Ordering::Relaxed);
+                indexed_bytes.store(file_len, Ordering::Relaxed);
+                return Self {
+                    path: Some(path),
+                    storage: Some(storage.clone()),
+                    line_offsets: new_line_offsets(),
+                    disk_index,
+                    indexing,
+                    indexing_started: Some(indexing_started),
+                    file_len,
+                    indexed_bytes,
+                    avg_line_len,
+                    line_ending,
+                    rope: None,
+                    piece_table: Some(PieceTable::from_recovered_session(
+                        storage, add, pieces, meta,
+                    )),
+                    dirty: true,
+                };
+            }
         }
 
         if file_len == 0 {
@@ -2575,10 +2576,10 @@ impl Document {
         if bytes.is_empty() || file_len == 0 {
             return None;
         }
-        if let Some(total_lines) = self.disk_index_total_lines()
-            && line0 >= total_lines
-        {
-            return None;
+        if let Some(total_lines) = self.disk_index_total_lines() {
+            if line0 >= total_lines {
+                return None;
+            }
         }
 
         let avg_line_len = self.avg_line_len();
@@ -2710,10 +2711,10 @@ impl Document {
     }
 
     fn exact_line_count_value(&self) -> Option<usize> {
-        if let Some(piece_table) = &self.piece_table
-            && piece_table.full_index()
-        {
-            return Some(piece_table.line_count().max(1));
+        if let Some(piece_table) = &self.piece_table {
+            if piece_table.full_index() {
+                return Some(piece_table.line_count().max(1));
+            }
         }
         if let Some(rope) = &self.rope {
             return Some(rope.len_lines().max(1));
@@ -2822,13 +2823,13 @@ impl Document {
             );
         }
 
-        if let Some(piece_table) = &self.piece_table
-            && (piece_table.full_index() || line0 < piece_table.line_count())
-        {
-            return LineSlice::new(
-                piece_table.line_visible_segment(line0, start_col, max_cols),
-                true,
-            );
+        if let Some(piece_table) = &self.piece_table {
+            if piece_table.full_index() || line0 < piece_table.line_count() {
+                return LineSlice::new(
+                    piece_table.line_visible_segment(line0, start_col, max_cols),
+                    true,
+                );
+            }
         }
 
         let bytes = self.mmap_bytes();
@@ -3016,12 +3017,12 @@ impl Document {
         }
 
         let storage = self.storage.as_ref()?;
-        if !indexed_complete
-            && self.file_len <= FULL_SYNC_PIECE_TABLE_MAX_FILE_BYTES
-            && let Some(line_lengths) =
+        if !indexed_complete && self.file_len <= FULL_SYNC_PIECE_TABLE_MAX_FILE_BYTES {
+            if let Some(line_lengths) =
                 line_lengths_from_bytes(storage.bytes(), LINE_LENGTHS_MAX_SYNC_LINES)
-        {
-            return Some((line_lengths, true));
+            {
+                return Some((line_lengths, true));
+            }
         }
         let required_lines = line0
             .saturating_add(1)
@@ -3058,12 +3059,13 @@ impl Document {
         // Editing should stay responsive: stop the background indexer once we switch to a mutable buffer.
         self.indexing.store(false, Ordering::Relaxed);
         let use_piece_table = self.storage.is_some() && self.file_len >= PIECE_TABLE_MIN_BYTES;
-        if use_piece_table
-            && let Some((line_lengths, full_index)) = self.piece_table_line_lengths_for_edit(line0)
-        {
-            let storage = self.storage.as_ref().expect("storage required").clone();
-            self.piece_table = Some(PieceTable::new(storage, line_lengths, full_index));
-            return Ok(());
+        if use_piece_table {
+            if let Some((line_lengths, full_index)) = self.piece_table_line_lengths_for_edit(line0)
+            {
+                let storage = self.storage.as_ref().expect("storage required").clone();
+                self.piece_table = Some(PieceTable::new(storage, line_lengths, full_index));
+                return Ok(());
+            }
         }
 
         // On huge mmap-backed files we must never fall back to a full Rope materialization.
@@ -3124,10 +3126,10 @@ impl Document {
 
     /// Returns the line length in characters, excluding any trailing line ending.
     pub fn line_len_chars(&self, line0: usize) -> usize {
-        if let Some(piece_table) = &self.piece_table
-            && (piece_table.full_index() || piece_table.has_line(line0))
-        {
-            return piece_table.line_len_chars(line0);
+        if let Some(piece_table) = &self.piece_table {
+            if piece_table.full_index() || piece_table.has_line(line0) {
+                return piece_table.line_len_chars(line0);
+            }
         }
         if let Some(rope) = &self.rope {
             return Self::rope_line_len_chars_without_newline(rope, line0);
