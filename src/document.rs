@@ -907,6 +907,18 @@ pub(crate) struct PieceTable {
     edit_batch_dirty: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EditOutcome {
+    edited: bool,
+    cursor: (usize, usize),
+}
+
+impl EditOutcome {
+    const fn new(edited: bool, cursor: (usize, usize)) -> Self {
+        Self { edited, cursor }
+    }
+}
+
 struct PieceTableLineSliceCollector {
     target_lines: usize,
     start_col: usize,
@@ -1261,7 +1273,7 @@ impl PieceTable {
         line0: usize,
         col0: usize,
         text: &str,
-    ) -> io::Result<(usize, usize)> {
+    ) -> io::Result<EditOutcome> {
         let actual_col0 = self.line_len_chars(line0);
         let insert_col0 = col0.min(actual_col0);
         let virtual_padding_cols = col0.saturating_sub(actual_col0);
@@ -1278,11 +1290,12 @@ impl PieceTable {
             self.refresh_known_line_count();
         }
 
-        if added_lines == 0 {
-            Ok((line0, col0.saturating_add(last_col)))
+        let cursor = if added_lines == 0 {
+            (line0, col0.saturating_add(last_col))
         } else {
-            Ok((line0.saturating_add(added_lines), last_col))
-        }
+            (line0.saturating_add(added_lines), last_col)
+        };
+        Ok(EditOutcome::new(!bytes.is_empty(), cursor))
     }
 
     pub(crate) fn replace_range_at(
@@ -1292,7 +1305,7 @@ impl PieceTable {
         col0: usize,
         len_chars: usize,
         text: &str,
-    ) -> io::Result<(usize, usize)> {
+    ) -> io::Result<EditOutcome> {
         if len_chars == 0 {
             return self.insert_text_at(line_ending, line0, col0, text);
         }
@@ -1307,25 +1320,29 @@ impl PieceTable {
         } else {
             Vec::new()
         };
+        let cursor = if added_lines == 0 {
+            (line0, start_col0.saturating_add(last_col))
+        } else {
+            (line0.saturating_add(added_lines), last_col)
+        };
         if existing == normalized.as_bytes() {
-            return if added_lines == 0 {
-                Ok((line0, start_col0.saturating_add(last_col)))
-            } else {
-                Ok((line0.saturating_add(added_lines), last_col))
-            };
+            return Ok(EditOutcome::new(false, cursor));
         }
 
         self.begin_edit_batch();
-        let result = (|| {
+        let result = (|| -> io::Result<EditOutcome> {
+            let mut edited = false;
             if end > start {
                 self.delete_range(start, end - start)?;
+                edited = true;
             }
-            self.insert_text_at(line_ending, line0, start_col0, text)
+            let outcome = self.insert_text_at(line_ending, line0, start_col0, text)?;
+            Ok(EditOutcome::new(edited || outcome.edited, outcome.cursor))
         })();
         let end_batch = self.end_edit_batch();
-        let cursor = result?;
+        let outcome = result?;
         end_batch?;
-        Ok(cursor)
+        Ok(EditOutcome::new(true, outcome.cursor))
     }
 
     pub(crate) fn backspace_at(
@@ -3272,7 +3289,31 @@ impl Document {
         line_start + col0.min(line_len)
     }
 
+    fn rope_replace_noop_cursor(
+        rope: &Rope,
+        line0: usize,
+        col0: usize,
+        len_chars: usize,
+        text: &str,
+    ) -> Option<(usize, usize)> {
+        let actual_col0 = Self::rope_line_len_chars_without_newline(rope, line0);
+        let start_col0 = col0.min(actual_col0);
+        let start = Self::line_col_to_char_index(rope, line0, start_col0);
+        let end = start.saturating_add(len_chars).min(rope.len_chars());
+        let (normalized, added_lines, last_col) = normalize_insert_text(text, 0, LineEnding::Lf);
+        let cursor = if added_lines == 0 {
+            (line0, start_col0.saturating_add(last_col))
+        } else {
+            (line0.saturating_add(added_lines), last_col)
+        };
+
+        let existing = rope.slice(start..end).to_string();
+        (existing == normalized).then_some(cursor)
+    }
+
     /// Attempts to insert text at the given position and returns the new cursor coordinates.
+    ///
+    /// Passing an empty string is a no-op and keeps the document clean.
     ///
     /// # Errors
     /// Returns [`DocumentError::EditUnsupported`] if editing would require
@@ -3283,6 +3324,10 @@ impl Document {
         col0: usize,
         text: &str,
     ) -> Result<(usize, usize), DocumentError> {
+        if text.is_empty() {
+            return Ok((line0, col0));
+        }
+
         self.ensure_edit_buffer_for_line(line0)?;
         let piece_table_supports_line = self
             .piece_table
@@ -3294,11 +3339,14 @@ impl Document {
         }
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
-            self.dirty = true;
             let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
-            return piece_table
+            let outcome = piece_table
                 .insert_text_at(self.line_ending, line0, col0, text)
-                .map_err(|source| DocumentError::Write { path, source });
+                .map_err(|source| DocumentError::Write { path, source })?;
+            if outcome.edited {
+                self.dirty = true;
+            }
+            return Ok(outcome.cursor);
         }
 
         let rope = self.rope_mut()?;
@@ -3400,7 +3448,9 @@ impl Document {
     ///
     /// Newline sequences are treated as a single text unit for piece-table backed
     /// documents, so replacing across CRLF text behaves like a normal editor
-    /// operation instead of deleting only half of the line break.
+    /// operation instead of deleting only half of the line break. Replacing a
+    /// range with text that normalizes to the current contents is a no-op and
+    /// keeps the document clean.
     pub fn try_replace_range(
         &mut self,
         line0: usize,
@@ -3408,6 +3458,10 @@ impl Document {
         len_chars: usize,
         text: &str,
     ) -> Result<(usize, usize), DocumentError> {
+        if len_chars == 0 && text.is_empty() {
+            return Ok((line0, col0));
+        }
+
         self.ensure_edit_buffer_for_line(line0)?;
         let piece_table_supports_line = self
             .piece_table
@@ -3420,11 +3474,21 @@ impl Document {
 
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
-            self.dirty = true;
             let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
-            return piece_table
+            let outcome = piece_table
                 .replace_range_at(self.line_ending, line0, col0, len_chars, text)
-                .map_err(|source| DocumentError::Write { path, source });
+                .map_err(|source| DocumentError::Write { path, source })?;
+            if outcome.edited {
+                self.dirty = true;
+            }
+            return Ok(outcome.cursor);
+        }
+
+        if let Some(rope) = self.rope.as_ref() {
+            if let Some(cursor) = Self::rope_replace_noop_cursor(rope, line0, col0, len_chars, text)
+            {
+                return Ok(cursor);
+            }
         }
 
         let (line0, col0) = self.try_delete_text_range_at_internal(line0, col0, len_chars)?;
@@ -3721,6 +3785,9 @@ mod tests {
     ) -> (usize, usize) {
         let lines = model_lines(text);
         let line0 = line_hint.min(lines.len().saturating_sub(1));
+        if insert.is_empty() {
+            return (line0, col0);
+        }
         let line = lines[line0];
         let insert_at = byte_offset_for_col(text, line, col0);
         let virtual_padding_cols = col0.saturating_sub(line.len_chars);
@@ -4144,10 +4211,12 @@ mod tests {
         let storage = FileStorage::open(&path).unwrap();
         let mut piece_table = PieceTable::new(storage, vec![4, 0], true);
 
-        let (line0, col0) = piece_table
+        let outcome = piece_table
             .insert_text_at(LineEnding::Lf, 0, 6, "Z")
             .unwrap();
+        let (line0, col0) = outcome.cursor;
 
+        assert!(outcome.edited);
         assert_eq!((line0, col0), (0, 7));
         assert_eq!(piece_table.to_string_lossy(), "abc   Z\n");
 
@@ -4352,10 +4421,12 @@ mod tests {
         let storage = FileStorage::open(&path).unwrap();
         let mut piece_table = PieceTable::new(storage, vec![3], true);
 
-        let (line0, col0) = piece_table
+        let outcome = piece_table
             .insert_text_at(LineEnding::Lf, 0, 3, "Z")
             .unwrap();
+        let (line0, col0) = outcome.cursor;
 
+        assert!(outcome.edited);
         assert_eq!((line0, col0), (0, 4));
         assert_eq!(piece_table.to_string_lossy(), "abcZ");
         assert!(piece_table
@@ -4541,6 +4612,83 @@ mod tests {
 
         assert_eq!(cursor, (0, 3));
         assert!(doc.text_lossy().starts_with("XYZ\ndef\n"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_insert_keeps_mmap_document_clean_and_unmaterialized() {
+        let dir =
+            std::env::temp_dir().join(format!("qem-empty-insert-noop-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("noop.txt");
+        write_disk_backed_fixture(&path);
+
+        let mut doc = Document::open(path.clone()).unwrap();
+        let cursor = doc.try_insert_text_at(0, 0, "").unwrap();
+
+        assert_eq!(cursor, (0, 0));
+        assert!(!doc.is_dirty());
+        assert!(!doc.has_edit_buffer());
+        assert!(doc.text_lossy().starts_with("abc\ndef\n"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_replace_keeps_mmap_document_clean_and_unmaterialized() {
+        let dir =
+            std::env::temp_dir().join(format!("qem-empty-replace-noop-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("noop.txt");
+        write_disk_backed_fixture(&path);
+
+        let mut doc = Document::open(path.clone()).unwrap();
+        let cursor = doc.try_replace_range(0, 0, 0, "").unwrap();
+
+        assert_eq!(cursor, (0, 0));
+        assert!(!doc.is_dirty());
+        assert!(!doc.has_edit_buffer());
+        assert!(doc.text_lossy().starts_with("abc\ndef\n"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_same_text_keeps_clean_rope_document_clean() {
+        let mut doc = Document::new();
+        let _ = doc.try_insert_text_at(0, 0, "hello world").unwrap();
+        doc.mark_clean();
+
+        let cursor = doc.try_replace_range(0, 6, 5, "world").unwrap();
+
+        assert_eq!(cursor, (0, 11));
+        assert_eq!(doc.text_lossy(), "hello world");
+        assert!(!doc.is_dirty());
+    }
+
+    #[test]
+    fn replace_same_text_keeps_clean_piece_table_document_clean() {
+        let dir = std::env::temp_dir().join(format!(
+            "qem-piece-table-noop-replace-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("replace.txt");
+        write_disk_backed_fixture(&path);
+
+        let mut doc = Document::open(path.clone()).unwrap();
+        let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
+        doc.mark_clean();
+
+        let cursor = doc.try_replace_range(0, 0, 3, "123").unwrap();
+
+        assert_eq!(cursor, (0, 3));
+        assert!(doc.text_lossy().starts_with("123abc\ndef\n"));
+        assert!(!doc.is_dirty());
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
