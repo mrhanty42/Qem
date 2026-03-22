@@ -150,6 +150,8 @@ pub(crate) struct PieceTree {
     root: Option<ChildRef>,
     history: Vec<RootEntry>,
     history_index: usize,
+    history_batch_depth: usize,
+    history_batch_dirty: bool,
 }
 
 impl PieceTree {
@@ -159,6 +161,8 @@ impl PieceTree {
             root: None,
             history: vec![RootEntry { root: None }],
             history_index: 0,
+            history_batch_depth: 0,
+            history_batch_dirty: false,
         }
     }
 
@@ -176,6 +180,8 @@ impl PieceTree {
             root: None,
             history: Vec::new(),
             history_index: 0,
+            history_batch_depth: 0,
+            history_batch_dirty: false,
         };
         this.root = this.build_tree_from_pieces(filter_zero_len(pieces));
         this.history = vec![RootEntry { root: this.root }];
@@ -202,6 +208,8 @@ impl PieceTree {
                 root,
                 history,
                 history_index,
+                history_batch_depth: 0,
+                history_batch_dirty: false,
             },
             add,
             meta,
@@ -286,12 +294,12 @@ impl PieceTree {
         let offset = offset.min(self.total_len());
         let Some(root) = self.root.take() else {
             self.root = self.build_tree_from_pieces(vec![piece]);
-            self.push_history_root();
+            self.record_history_root();
             return;
         };
         let children = self.insert_at(root, offset, piece, split_piece);
         self.root = self.build_tree_from_child_refs(children);
-        self.push_history_root();
+        self.record_history_root();
     }
 
     pub(crate) fn delete_range<F>(&mut self, start: usize, len: usize, trim_piece: &mut F)
@@ -313,7 +321,7 @@ impl PieceTree {
         }
         let children = self.delete_at(root, start, end, trim_piece);
         self.root = self.build_tree_from_child_refs(children);
-        self.push_history_root();
+        self.record_history_root();
     }
 
     pub(crate) fn flush_session(&mut self, add_bytes: &[u8], meta: SessionMeta) -> io::Result<()> {
@@ -346,6 +354,29 @@ impl PieceTree {
         self.history_index += 1;
         self.root = self.history[self.history_index].root;
         true
+    }
+
+    pub(crate) fn begin_batch_edit(&mut self) {
+        self.history_batch_depth = self.history_batch_depth.saturating_add(1);
+    }
+
+    pub(crate) fn end_batch_edit(&mut self) {
+        if self.history_batch_depth == 0 {
+            return;
+        }
+        self.history_batch_depth -= 1;
+        if self.history_batch_depth == 0 && self.history_batch_dirty {
+            self.history_batch_dirty = false;
+            self.push_history_root();
+        }
+    }
+
+    fn record_history_root(&mut self) {
+        if self.history_batch_depth > 0 {
+            self.history_batch_dirty = true;
+            return;
+        }
+        self.push_history_root();
     }
 
     fn push_history_root(&mut self) {

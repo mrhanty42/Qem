@@ -903,6 +903,8 @@ pub(crate) struct PieceTable {
     pending_session_flush: bool,
     pending_session_edits: usize,
     last_session_flush: Option<Instant>,
+    edit_batch_depth: usize,
+    edit_batch_dirty: bool,
 }
 
 struct PieceTableLineSliceCollector {
@@ -1013,6 +1015,8 @@ impl PieceTable {
             pending_session_flush: false,
             pending_session_edits: 0,
             last_session_flush: None,
+            edit_batch_depth: 0,
+            edit_batch_dirty: false,
         }
     }
 
@@ -1037,6 +1041,8 @@ impl PieceTable {
             pending_session_flush: false,
             pending_session_edits: 0,
             last_session_flush: None,
+            edit_batch_depth: 0,
+            edit_batch_dirty: false,
         }
     }
 
@@ -1066,6 +1072,10 @@ impl PieceTable {
     fn schedule_session_flush(&mut self) -> io::Result<()> {
         self.pending_session_flush = true;
         self.pending_session_edits = self.pending_session_edits.saturating_add(1);
+        if self.edit_batch_depth > 0 {
+            self.edit_batch_dirty = true;
+            return Ok(());
+        }
         self.flush_session_inner(false)
     }
 
@@ -1098,6 +1108,25 @@ impl PieceTable {
                 Err(err)
             }
         }
+    }
+
+    fn begin_edit_batch(&mut self) {
+        self.edit_batch_depth = self.edit_batch_depth.saturating_add(1);
+        self.pieces.begin_batch_edit();
+    }
+
+    fn end_edit_batch(&mut self) -> io::Result<()> {
+        if self.edit_batch_depth == 0 {
+            return Ok(());
+        }
+
+        self.edit_batch_depth -= 1;
+        self.pieces.end_batch_edit();
+        if self.edit_batch_depth == 0 && self.edit_batch_dirty {
+            self.edit_batch_dirty = false;
+            self.flush_session_inner(false)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn has_line(&self, line0: usize) -> bool {
@@ -1254,6 +1283,49 @@ impl PieceTable {
         } else {
             Ok((line0.saturating_add(added_lines), last_col))
         }
+    }
+
+    pub(crate) fn replace_range_at(
+        &mut self,
+        line_ending: LineEnding,
+        line0: usize,
+        col0: usize,
+        len_chars: usize,
+        text: &str,
+    ) -> io::Result<(usize, usize)> {
+        if len_chars == 0 {
+            return self.insert_text_at(line_ending, line0, col0, text);
+        }
+
+        let actual_col0 = self.line_len_chars(line0);
+        let start_col0 = col0.min(actual_col0);
+        let start = self.byte_offset_for_col(line0, start_col0);
+        let end = self.advance_offset_by_text_units(start, len_chars);
+        let (normalized, added_lines, last_col) = normalize_insert_text(text, 0, line_ending);
+        let existing = if end > start {
+            self.read_range(start, end)
+        } else {
+            Vec::new()
+        };
+        if existing == normalized.as_bytes() {
+            return if added_lines == 0 {
+                Ok((line0, start_col0.saturating_add(last_col)))
+            } else {
+                Ok((line0.saturating_add(added_lines), last_col))
+            };
+        }
+
+        self.begin_edit_batch();
+        let result = (|| {
+            if end > start {
+                self.delete_range(start, end - start)?;
+            }
+            self.insert_text_at(line_ending, line0, start_col0, text)
+        })();
+        let end_batch = self.end_edit_batch();
+        let cursor = result?;
+        end_batch?;
+        Ok(cursor)
     }
 
     pub(crate) fn backspace_at(
@@ -3326,6 +3398,25 @@ impl Document {
         len_chars: usize,
         text: &str,
     ) -> Result<(usize, usize), DocumentError> {
+        self.ensure_edit_buffer_for_line(line0)?;
+        let piece_table_supports_line = self
+            .piece_table
+            .as_ref()
+            .map(|piece_table| piece_table.full_index() || piece_table.has_line(line0))
+            .unwrap_or(false);
+        if self.piece_table.is_some() && !piece_table_supports_line {
+            self.promote_piece_table_to_rope()?;
+        }
+
+        let doc_path = self.path.clone();
+        if let Some(piece_table) = self.piece_table.as_mut() {
+            self.dirty = true;
+            let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
+            return piece_table
+                .replace_range_at(self.line_ending, line0, col0, len_chars, text)
+                .map_err(|source| DocumentError::Write { path, source });
+        }
+
         let (line0, col0) = self.try_delete_text_range_at_internal(line0, col0, len_chars)?;
         self.try_insert_text_at(line0, col0, text)
     }
@@ -3770,6 +3861,42 @@ mod tests {
         assert_doc_matches_model(doc, expected);
     }
 
+    fn apply_op_to_doc_text_only(doc: &mut Document, expected: &mut String, op: &EditOp) {
+        match op {
+            EditOp::Insert {
+                line_hint,
+                col0,
+                text,
+            } => {
+                let line0 = clamp_model_line(expected, *line_hint);
+                let expected_cursor = model_insert(expected, line0, *col0, text);
+                let actual_cursor = doc.try_insert_text_at(line0, *col0, text).unwrap();
+                assert_eq!(actual_cursor, expected_cursor);
+            }
+            EditOp::Replace {
+                line_hint,
+                col0,
+                len_chars,
+                text,
+            } => {
+                let line0 = clamp_model_line(expected, *line_hint);
+                let expected_cursor = model_replace(expected, line0, *col0, *len_chars, text);
+                let actual_cursor = doc
+                    .try_replace_range(line0, *col0, *len_chars, text)
+                    .unwrap();
+                assert_eq!(actual_cursor, expected_cursor);
+            }
+            EditOp::Backspace { line_hint, col0 } => {
+                let line0 = clamp_model_line(expected, *line_hint);
+                let expected_cursor = model_backspace(expected, line0, *col0);
+                let actual_cursor = doc.try_backspace_at(line0, *col0).unwrap();
+                assert_eq!(actual_cursor, expected_cursor);
+            }
+        }
+
+        assert_eq!(doc.text_lossy(), *expected);
+    }
+
     fn op_text_strategy() -> impl Strategy<Value = String> {
         prop::collection::vec(
             prop_oneof![
@@ -3787,6 +3914,27 @@ mod tests {
                 Just('🙂'),
             ],
             0..8,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn non_empty_op_text_strategy() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                Just('a'),
+                Just('b'),
+                Just('c'),
+                Just('x'),
+                Just('y'),
+                Just('z'),
+                Just(' '),
+                Just('\n'),
+                Just('\r'),
+                Just('\u{00E9}'),
+                Just('\u{4E2D}'),
+                Just('\u{1F642}'),
+            ],
+            1..6,
         )
         .prop_map(|chars| chars.into_iter().collect())
     }
@@ -3811,6 +3959,32 @@ mod tests {
                 },
             ),
             (0usize..12, 0usize..24)
+                .prop_map(|(line_hint, col0)| EditOp::Backspace { line_hint, col0 }),
+        ]
+    }
+
+    fn file_backed_edit_op_strategy() -> impl Strategy<Value = EditOp> {
+        prop_oneof![
+            (0usize..64, 0usize..12, non_empty_op_text_strategy()).prop_map(
+                |(line_hint, col0, text)| EditOp::Insert {
+                    line_hint,
+                    col0,
+                    text,
+                },
+            ),
+            (
+                0usize..64,
+                0usize..12,
+                0usize..8,
+                non_empty_op_text_strategy(),
+            )
+                .prop_map(|(line_hint, col0, len_chars, text)| EditOp::Replace {
+                    line_hint,
+                    col0,
+                    len_chars,
+                    text,
+                }),
+            (0usize..64, 0usize..12)
                 .prop_map(|(line_hint, col0)| EditOp::Backspace { line_hint, col0 }),
         ]
     }
@@ -4705,6 +4879,8 @@ mod tests {
                 pending_session_flush: false,
                 pending_session_edits: 0,
                 last_session_flush: None,
+                edit_batch_depth: 0,
+                edit_batch_dirty: false,
             }),
             dirty: true,
         };
@@ -4812,6 +4988,67 @@ mod tests {
             prop_assert_eq!(reopened.line_ending(), detect_line_ending(rendered.as_bytes()));
             prop_assert_eq!(reopened.text_lossy(), rendered);
             prop_assert_eq!(doc.text_lossy(), expected);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10))]
+
+        #[test]
+        fn randomized_piece_table_recovery_and_history_roundtrip(
+            ops in prop::collection::vec(file_backed_edit_op_strategy(), 1..12),
+        ) {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("piece-table.txt");
+            write_disk_backed_fixture(&path);
+
+            let mut expected = std::fs::read_to_string(&path).unwrap();
+            let mut states = vec![expected.clone()];
+
+            {
+                let mut doc = Document::open(path.clone()).unwrap();
+                for op in &ops {
+                    let before = expected.clone();
+                    apply_op_to_doc_text_only(&mut doc, &mut expected, op);
+                    assert!(
+                        doc.piece_table.is_some(),
+                        "large file edits should stay on the piece-table path"
+                    );
+                    assert!(
+                        !doc.has_rope(),
+                        "low-line edits should not require rope promotion"
+                    );
+                    if expected != before {
+                        states.push(expected.clone());
+                    }
+                }
+
+                doc.flush_session().unwrap();
+            }
+
+            let mut recovered = Document::open(path.clone()).unwrap();
+            assert!(recovered.is_dirty());
+            assert!(
+                recovered.piece_table.is_some(),
+                "recovered document should restore piece-table session"
+            );
+            assert!(
+                !recovered.has_rope(),
+                "recovered document should keep the piece-table session"
+            );
+            assert_eq!(recovered.text_lossy(), expected);
+
+            for state in states[..states.len().saturating_sub(1)].iter().rev() {
+                assert!(recovered.undo());
+                assert_eq!(recovered.text_lossy(), *state);
+            }
+            assert!(!recovered.undo());
+
+            for state in states.iter().skip(1) {
+                assert!(recovered.redo());
+                assert_eq!(recovered.text_lossy(), *state);
+            }
+            assert!(!recovered.redo());
         }
     }
 }
