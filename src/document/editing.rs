@@ -1,5 +1,22 @@
 use super::*;
 
+#[derive(Debug)]
+enum EditBufferPlan {
+    KeepCurrent,
+    CreatePieceTable {
+        storage: FileStorage,
+        line_lengths: Vec<usize>,
+        full_index: bool,
+    },
+    CreateRope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveEditPlan {
+    Ready,
+    PromotePieceTableToRope,
+}
+
 impl Document {
     pub(super) fn precise_piece_table_line_lengths(
         &self,
@@ -64,38 +81,69 @@ impl Document {
         Some((line_lengths, false))
     }
 
-    pub(super) fn ensure_edit_buffer_for_line(
-        &mut self,
-        line0: usize,
-    ) -> Result<(), DocumentError> {
+    fn edit_buffer_plan_for_line(&self, line0: usize) -> EditBufferPlan {
         if self.rope.is_some() || self.piece_table.is_some() {
-            return Ok(());
+            return EditBufferPlan::KeepCurrent;
         }
-        // Editing should stay responsive: stop the background indexer once we switch to a mutable buffer.
-        self.indexing.store(false, Ordering::Relaxed);
+
         let use_piece_table = self.storage.is_some() && self.file_len >= PIECE_TABLE_MIN_BYTES;
         if use_piece_table {
             if let Some((line_lengths, full_index)) = self.piece_table_line_lengths_for_edit(line0)
             {
                 if let Some(storage) = self.storage.as_ref().cloned() {
-                    self.piece_table = Some(PieceTable::new(storage, line_lengths, full_index));
-                    return Ok(());
+                    return EditBufferPlan::CreatePieceTable {
+                        storage,
+                        line_lengths,
+                        full_index,
+                    };
                 }
             }
         }
 
-        // On huge mmap-backed files we must never fall back to a full Rope materialization.
-        self.ensure_rope()
+        EditBufferPlan::CreateRope
     }
 
-    pub(super) fn prepare_edit_at(&mut self, line0: usize) -> Result<(), DocumentError> {
-        self.ensure_edit_buffer_for_line(line0)?;
+    fn active_edit_plan_for_line(&self, line0: usize) -> ActiveEditPlan {
         let piece_table_supports_line = self
             .piece_table
             .as_ref()
             .map(|piece_table| piece_table.full_index() || piece_table.has_line(line0))
             .unwrap_or(false);
         if self.piece_table.is_some() && !piece_table_supports_line {
+            return ActiveEditPlan::PromotePieceTableToRope;
+        }
+        ActiveEditPlan::Ready
+    }
+
+    pub(super) fn ensure_edit_buffer_for_line(
+        &mut self,
+        line0: usize,
+    ) -> Result<(), DocumentError> {
+        match self.edit_buffer_plan_for_line(line0) {
+            EditBufferPlan::KeepCurrent => Ok(()),
+            EditBufferPlan::CreatePieceTable {
+                storage,
+                line_lengths,
+                full_index,
+            } => {
+                // Editing should stay responsive: stop the background indexer once
+                // we switch to a mutable buffer.
+                self.indexing.store(false, Ordering::Relaxed);
+                self.piece_table = Some(PieceTable::new(storage, line_lengths, full_index));
+                Ok(())
+            }
+            EditBufferPlan::CreateRope => {
+                // On huge mmap-backed files we must never fall back to a full Rope
+                // materialization unless policy explicitly allows it.
+                self.indexing.store(false, Ordering::Relaxed);
+                self.ensure_rope()
+            }
+        }
+    }
+
+    pub(super) fn prepare_edit_at(&mut self, line0: usize) -> Result<(), DocumentError> {
+        self.ensure_edit_buffer_for_line(line0)?;
+        if self.active_edit_plan_for_line(line0) == ActiveEditPlan::PromotePieceTableToRope {
             self.promote_piece_table_to_rope()?;
         }
         Ok(())

@@ -102,12 +102,21 @@ the selected temp policy.
 - A GUI typically renders visible rows through `Document::read_viewport(...)` or `DocumentSession::read_viewport(...)`.
 - Older compatibility helpers that silently swallow edit errors or expose raw tuple progress are still present for migration only, but they are deprecated and hidden from the main rustdoc surface in favor of the typed/session-first API.
 
+## Recommended path for most applications
+
+- Start with `DocumentSession` for a frontend/backend integration unless you already own your own tab lifecycle and background-job orchestration.
+- Use `ViewportRequest`, `TextSelection`, `TextRange`, and `SearchMatch` as the main typed values that move between your UI state and Qem.
+- Prefer bounded reads like `read_viewport(...)`, `read_text(...)`, and `read_selection(...)` over `text_lossy()` / `text()` in normal UI flows.
+- Prefer typed session helpers such as `loading_state()`, `loading_phase()`, `save_state()`, `background_issue()`, `take_background_issue()`, `close_pending()`, and the `try_*` edit methods.
+- Treat `document_mut()`, `set_path()`, unconditional `compact_piece_table()`, and full-document `text_lossy()` / `text()` as advanced surface for callers that intentionally manage those trade-offs themselves.
+- Reach for raw `Document` only when your application is deliberately building its own session/job layer on top of the lower-level engine.
+
 ## Current Support Matrix
 
 - UTF-8 / ASCII text is the primary stable path: open, viewport reads, edits, undo/redo, and saves are supported.
 - Non-UTF8 or invalid UTF-8 bytes can still be opened and inspected, but text-facing APIs expose lossy UTF-8 views. Encoding-preserving edit/save behavior for arbitrary legacy encodings is not yet a stable contract.
 - Huge files are supported for mmap-backed reads, viewport rendering, line-count estimation, and background indexing without full materialization. Editing may be rejected when it would require unsafe rope promotion beyond the built-in size limits.
-- `.qem.lineidx` and `.qem.editlog` are internal cache/session sidecars. Qem invalidates them when file length, modification time, or sampled content fingerprint no longer match, and it may rebuild them across releases.
+- `.qem.lineidx` and `.qem.editlog` are internal cache/session sidecars. Qem invalidates them when file length, modification time, or sampled content fingerprint no longer match. Their on-disk formats are internal implementation details rather than stable interchange formats, so Qem may rebuild, discard, or version-bump them across releases.
 - Typed progress/state APIs such as `indexing_state()`, `loading_state()`, `loading_phase()`, `save_state()`, `background_issue()`, `take_background_issue()`, and `close_pending()` are the supported session-facing surface.
 - Literal search is available through `find_next(...)`, `find_prev(...)`, and `find_all(...)` on `Document`, `DocumentSession`, and `EditorTab`. For repeated searches with the same needle, `LiteralSearchQuery` lets you reuse a compiled literal query instead of rebuilding search state every time, including iterator paths through `find_all_query(...)` and the bounded `find_all_query_*` helpers. Bounded variants search only within a typed `TextRange` and reject matches that would cross the range boundary. This is a typed, case-sensitive literal search surface rather than a full regex/search subsystem.
 - `DocumentSession` and `EditorTab` typed edit helpers are idle-only: while a background open/save is active they return `EditUnsupported` instead of mutating a document that may soon be replaced or saved from an older snapshot. Raw `document_mut()` and `set_path()` remain escape hatches, but using either while busy invalidates the in-flight worker result so the next poll returns an error instead of applying stale state. If a close was deferred at the time, that new state change also cancels the deferred close.

@@ -6,6 +6,11 @@ use crate::{
 
 /// Backend-first document session wrapper with async open/save helpers and no
 /// GUI-level cursor or widget assumptions.
+///
+/// This is the recommended entry point for most frontend integrations. It
+/// keeps the engine-side session lifecycle, progress polling, and typed
+/// document helpers together while leaving cursor movement and visual widget
+/// behavior to the caller.
 #[derive(Debug)]
 pub struct DocumentSession {
     core: SessionCore,
@@ -19,6 +24,9 @@ impl Default for DocumentSession {
 
 impl DocumentSession {
     /// Creates a new empty document session.
+    ///
+    /// Most applications should start here rather than building directly on
+    /// the lower-level [`Document`] API.
     pub fn new() -> Self {
         Self {
             core: SessionCore::new(),
@@ -133,8 +141,10 @@ impl DocumentSession {
     /// Returns the full document text as a `String`.
     ///
     /// This materializes the entire current document through
-    /// [`Document::text_lossy`]. Prefer `read_viewport(...)` or `read_text(...)`
-    /// when a frontend only needs a visible window or a bounded selection.
+    /// [`Document::text_lossy`]. This is an advanced convenience helper rather
+    /// than the recommended UI path. Prefer `read_viewport(...)` or
+    /// `read_text(...)` when a frontend only needs a visible window or a
+    /// bounded selection.
     pub fn text(&self) -> String {
         self.core.document().text_lossy()
     }

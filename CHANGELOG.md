@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.1
+
+### Changed
+
+- Refactored `reads.rs` so exact and estimated mmap read paths are separated more explicitly, with clearer internal helpers for mmap, piece-table, and rope-backed reads.
+- Refactored edit-buffer promotion policy around explicit internal planning types so `mmap -> piece_table -> rope` transitions are easier to reason about and maintain.
+- Reworked `SessionCore` async lifecycle bookkeeping around named internal states instead of scattered boolean flags, making stale-result handling and deferred-close flow easier to follow.
+- Expanded rustdoc and README guidance around the recommended frontend entry path, advanced escape hatches, and lower-level `Document` usage.
+
+### Fixed
+
+- Restored exact empty-document line semantics in the mmap read path after the internal read-layer split.
+- Preserved a proptest regression seed for the empty-edit edge case so future runs replay it before novel cases.
+
 ## 0.5.0
 
 ### Added

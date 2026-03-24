@@ -10,6 +10,9 @@ use std::thread;
 use std::time::UNIX_EPOCH;
 
 const INDEX_MAGIC: &[u8; 8] = b"QEMIDX1\0";
+// `.qem.lineidx` is an internal cache sidecar rather than a stable external
+// format. Qem may bump this version across releases and rebuild the cache
+// instead of preserving compatibility with older index files.
 const INDEX_VERSION: u32 = 2;
 const INDEX_PAGE_SIZE: usize = 4096;
 const INDEX_HEADER_BYTES: usize = 72;

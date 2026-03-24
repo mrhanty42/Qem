@@ -375,8 +375,9 @@ impl Document {
     /// Returns the full document text, applying lossy UTF-8 decoding when needed.
     ///
     /// This materializes the entire current document into a fresh `String`.
-    /// Prefer viewport or typed range reads for large-file frontends that only
-    /// need a visible window or a bounded selection.
+    /// It is an advanced convenience helper rather than the recommended
+    /// frontend path. Prefer viewport or typed range reads for large-file
+    /// frontends that only need a visible window or a bounded selection.
     pub fn text_lossy(&self) -> String {
         if let Some(rope) = &self.rope {
             return rope.to_string();

@@ -807,6 +807,10 @@ enum OffsetsChunk {
 
 /// Text document with mmap-backed reads, background line indexing, and lazy
 /// promotion to a mutable editing buffer.
+///
+/// This is the lower-level engine surface. Use [`crate::DocumentSession`] for
+/// most frontend integrations unless your application deliberately owns its own
+/// tab/session lifecycle, background jobs, and save orchestration.
 #[derive(Debug)]
 pub struct Document {
     path: Option<PathBuf>,

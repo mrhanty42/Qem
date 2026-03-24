@@ -187,6 +187,12 @@ impl Document {
     /// For mmap- or rope-backed documents without a piece-tree session, this is
     /// a no-op.
     ///
+    /// The `.qem.editlog` sidecar is an internal durability/recovery format:
+    /// Qem writes append-only pages first and then rewrites the fixed header as
+    /// the authoritative commit record for the latest session snapshot. Older
+    /// pages may remain in the sidecar after newer flushes, but they become
+    /// unreachable once the header advances.
+    ///
     /// # Errors
     /// Returns [`DocumentError`] if `.qem.editlog` cannot be committed.
     pub fn flush_session(&mut self) -> Result<(), DocumentError> {

@@ -5,6 +5,9 @@ use crate::{
 };
 
 /// Lightweight editor-tab state with a document, cursor, and async save tracking.
+///
+/// Prefer this over [`DocumentSession`] only when you want the same
+/// engine-facing session wrapper plus built-in cursor convenience.
 #[derive(Debug)]
 pub struct EditorTab {
     id: u64,
@@ -15,6 +18,9 @@ pub struct EditorTab {
 
 impl EditorTab {
     /// Creates a new empty tab with the provided identifier.
+    ///
+    /// Frontends that already own cursor state can usually start with
+    /// [`DocumentSession`] instead.
     pub fn new(id: u64) -> Self {
         Self {
             id,
@@ -139,8 +145,10 @@ impl EditorTab {
     /// Returns the full document text as a `String`.
     ///
     /// This materializes the entire current document through
-    /// [`Document::text_lossy`]. Prefer `read_viewport(...)` or `read_text(...)`
-    /// when a frontend only needs a visible window or a bounded selection.
+    /// [`Document::text_lossy`]. This is an advanced convenience helper rather
+    /// than the recommended UI path. Prefer `read_viewport(...)` or
+    /// `read_text(...)` when a frontend only needs a visible window or a
+    /// bounded selection.
     pub fn text(&self) -> String {
         self.core.document().text_lossy()
     }

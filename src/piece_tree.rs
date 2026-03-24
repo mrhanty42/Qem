@@ -11,6 +11,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_LEAF_PIECES: usize = 64;
 const MAX_INTERNAL_CHILDREN: usize = 64;
+// `.qem.editlog` is an internal append-only sidecar format. The header at
+// offset 0 is the authoritative commit record for the latest durable session
+// snapshot. Older pages may remain in the file after later flushes, but they
+// become unreachable once the header points at newer history/add page chains.
+//
+// Compatibility policy:
+// - source identity must match `(len, mtime_ns, sampled fingerprint)` or the
+//   sidecar is treated as stale and ignored
+// - version or page-size mismatches are rejected as unsupported format changes
+// - the format is internal and may change across Qem releases; callers should
+//   treat `.qem.editlog` as rebuildable implementation detail rather than a
+//   stable interchange format
 const EDITLOG_MAGIC: &[u8; 8] = b"QEMEDT1\0";
 const EDITLOG_VERSION: u32 = 2;
 const EDITLOG_PAGE_SIZE: usize = 4096;
@@ -21,6 +33,7 @@ const LEAF_ENTRY_BYTES: usize = 32;
 const INTERNAL_ENTRY_BYTES: usize = 24;
 const HISTORY_ENTRY_BYTES: usize = 32;
 const DEFAULT_FRAGMENTATION_SMALL_PIECE_BYTES: usize = 1024;
+const EDITLOG_FLAG_FULL_INDEX: u64 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PieceSource {
@@ -117,6 +130,13 @@ struct ChildRef {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+// Session metadata persisted alongside the piece-tree root history.
+//
+// These fields are recovery hints for reopened sessions:
+// - `known_byte_len` is the logical document length represented by the current
+//   committed root
+// - `full_index` tells recovery whether the piece-table snapshot already had a
+//   complete line index when it was flushed
 pub(crate) struct SessionMeta {
     pub(crate) known_byte_len: usize,
     pub(crate) full_index: bool,
@@ -191,6 +211,16 @@ enum PageKind {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+// Authoritative commit record for one durable `.qem.editlog` snapshot.
+//
+// Invariants:
+// - `page_count` is the number of append-only pages that exist after the latest
+//   committed flush
+// - `history_*` describes the durable undo/redo root history chain
+// - `add_*` describes the durable add-buffer bytes referenced by current pieces
+// - `source_*` must match the source file identity at reopen time or recovery is
+//   rejected as stale
+// - `flags` is an append-only bitfield for recovery hints
 struct EditLogHeader {
     page_count: u64,
     source_len: u64,
@@ -1027,7 +1057,7 @@ impl DiskPageStore {
         )?;
         let meta = SessionMeta {
             known_byte_len: header.known_byte_len as usize,
-            full_index: (header.flags & 1) != 0,
+            full_index: (header.flags & EDITLOG_FLAG_FULL_INDEX) != 0,
         };
 
         Ok(Some((
@@ -1150,8 +1180,18 @@ impl DiskPageStore {
             add_page_count: add_page_count as u64,
             add_len: add_bytes.len() as u64,
             known_byte_len: meta.known_byte_len as u64,
-            flags: u64::from(meta.full_index),
+            flags: if meta.full_index {
+                EDITLOG_FLAG_FULL_INDEX
+            } else {
+                0
+            },
         };
+        // Durability protocol:
+        // 1. append all newly reachable pages first
+        // 2. flush/sync those pages
+        // 3. rewrite the fixed header as the authoritative commit record
+        // 4. flush/sync again so reopen either sees the previous committed
+        //    header or the fully updated one
         let result = (|| -> io::Result<()> {
             file.flush()?;
             file.sync_all()?;

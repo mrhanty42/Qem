@@ -23,6 +23,29 @@
 //!   deprecated and hidden from the main rustdoc surface in favor of the
 //!   typed/session-first APIs.
 //!
+//! # Recommended Entry Path
+//!
+//! For most frontend integrations, start with [`DocumentSession`].
+//!
+//! - Use [`ViewportRequest`], [`TextSelection`], [`TextRange`], and
+//!   [`SearchMatch`] as the main typed values passed between your app state and
+//!   Qem.
+//! - Prefer bounded reads such as [`Document::read_viewport`],
+//!   [`Document::read_text`], and [`Document::read_selection`] over
+//!   full-document materialization through [`Document::text_lossy`],
+//!   [`DocumentSession::text`], or [`EditorTab::text`] in normal UI loops.
+//! - Prefer the typed session-facing surface:
+//!   [`DocumentSession::loading_state`], [`DocumentSession::loading_phase`],
+//!   [`DocumentSession::save_state`], [`DocumentSession::background_issue`],
+//!   [`DocumentSession::take_background_issue`], [`DocumentSession::close_pending`],
+//!   and the typed `try_*` edit helpers.
+//! - Treat [`DocumentSession::document_mut`], [`DocumentSession::set_path`],
+//!   unconditional [`Document::compact_piece_table`], and the full-text helpers
+//!   as advanced escape hatches for callers that intentionally manage those
+//!   trade-offs themselves.
+//! - Reach for raw [`Document`] when your application deliberately owns tab
+//!   state, background-job orchestration, and save lifecycle itself.
+//!
 //! # Frontend Integration Recipe
 //!
 //! A typical GUI or TUI loop looks like this:
@@ -164,7 +187,9 @@
 //!   text unit between lines.
 //! - Internal `.qem.lineidx` and `.qem.editlog` sidecars are validated against
 //!   source file length, modification time, and a sampled content fingerprint.
-//!   Qem may rebuild them across releases.
+//!   Their formats are internal cache/durability details rather than stable
+//!   interchange formats, so Qem may rebuild, discard, or version-bump them
+//!   across releases.
 //! - Session-facing async-open state is reported through byte progress plus an
 //!   explicit [`LoadPhase`] so frontends can distinguish "open is still being
 //!   prepared" from "the document is ready but background indexing continues".

@@ -63,6 +63,10 @@ impl Default for Document {
 
 impl Document {
     /// Creates an empty in-memory document with no backing file.
+    ///
+    /// This is the lower-level entry point. Most frontends should start with
+    /// [`crate::DocumentSession::new`] unless they intentionally manage their
+    /// own session and background-job lifecycle.
     pub fn new() -> Self {
         Self {
             path: None,
@@ -82,6 +86,10 @@ impl Document {
     }
 
     /// Opens a file and constructs a memory-mapped document.
+    ///
+    /// This is the synchronous lower-level open path. Most responsive
+    /// frontends should prefer [`crate::DocumentSession::open_file_async`] so
+    /// open progress and session lifecycle stay explicit.
     ///
     /// # Errors
     /// Returns [`DocumentError`] if the file cannot be opened or mapped.

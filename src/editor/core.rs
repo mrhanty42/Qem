@@ -1,5 +1,105 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultDisposition {
+    Apply,
+    Discard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseRequest {
+    None,
+    AfterCurrentJob,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsyncJobKind {
+    Load,
+    Save,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AsyncLifecycleState {
+    close_request: CloseRequest,
+    load_result: ResultDisposition,
+    save_result: ResultDisposition,
+    clear_dirty_after_open: bool,
+}
+
+impl AsyncLifecycleState {
+    fn new() -> Self {
+        Self {
+            close_request: CloseRequest::None,
+            load_result: ResultDisposition::Apply,
+            save_result: ResultDisposition::Apply,
+            clear_dirty_after_open: false,
+        }
+    }
+
+    fn close_pending(self) -> bool {
+        self.close_request == CloseRequest::AfterCurrentJob
+    }
+
+    fn request_close_after_current_job(&mut self) {
+        self.close_request = CloseRequest::AfterCurrentJob;
+    }
+
+    fn take_close_request(&mut self) -> CloseRequest {
+        let request = self.close_request;
+        self.close_request = CloseRequest::None;
+        request
+    }
+
+    fn cancel_deferred_close(&mut self) {
+        self.close_request = CloseRequest::None;
+    }
+
+    fn mark_result_stale(&mut self, job: AsyncJobKind) {
+        match job {
+            AsyncJobKind::Load => self.load_result = ResultDisposition::Discard,
+            AsyncJobKind::Save => self.save_result = ResultDisposition::Discard,
+        }
+    }
+
+    fn take_result_disposition(&mut self, job: AsyncJobKind) -> ResultDisposition {
+        match job {
+            AsyncJobKind::Load => {
+                let disposition = self.load_result;
+                self.load_result = ResultDisposition::Apply;
+                disposition
+            }
+            AsyncJobKind::Save => {
+                let disposition = self.save_result;
+                self.save_result = ResultDisposition::Apply;
+                disposition
+            }
+        }
+    }
+
+    fn reset_for_new_job(&mut self, job: AsyncJobKind) {
+        match job {
+            AsyncJobKind::Load => self.load_result = ResultDisposition::Apply,
+            AsyncJobKind::Save => self.save_result = ResultDisposition::Apply,
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::new();
+    }
+
+    fn clear_dirty_after_open_pending(self) -> bool {
+        self.clear_dirty_after_open
+    }
+
+    fn schedule_clean_mark_after_open(&mut self, should_clear: bool) {
+        self.clear_dirty_after_open = should_clear;
+    }
+
+    fn clear_clean_mark_after_open(&mut self) {
+        self.clear_dirty_after_open = false;
+    }
+}
+
 #[derive(Debug)]
 struct SaveJob {
     path: Arc<PathBuf>,
@@ -23,10 +123,7 @@ pub(crate) struct SessionCore {
     generation: u64,
     load_job: Option<LoadJob>,
     save_job: Option<SaveJob>,
-    clear_dirty_after_open: bool,
-    close_after_job: bool,
-    discard_load_result: bool,
-    discard_save_result: bool,
+    async_state: AsyncLifecycleState,
     last_background_issue: Option<BackgroundIssue>,
 }
 
@@ -37,10 +134,7 @@ impl SessionCore {
             generation: 0,
             load_job: None,
             save_job: None,
-            clear_dirty_after_open: false,
-            close_after_job: false,
-            discard_load_result: false,
-            discard_save_result: false,
+            async_state: AsyncLifecycleState::new(),
             last_background_issue: None,
         }
     }
@@ -57,8 +151,18 @@ impl SessionCore {
         self.load_job.is_some()
     }
 
+    fn active_job_kind(&self) -> Option<AsyncJobKind> {
+        if self.is_loading() {
+            Some(AsyncJobKind::Load)
+        } else if self.is_saving() {
+            Some(AsyncJobKind::Save)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn is_busy(&self) -> bool {
-        self.is_loading() || self.is_saving()
+        self.active_job_kind().is_some()
     }
 
     pub(super) fn indexing_progress(&self) -> Option<(usize, usize)> {
@@ -134,13 +238,11 @@ impl SessionCore {
             ));
             return Some(Err(err));
         };
-        let close_after_job = self.close_after_job;
-        self.close_after_job = false;
-        let discard_load_result = self.discard_load_result;
-        self.discard_load_result = false;
+        let close_request = self.async_state.take_close_request();
+        let disposition = self.async_state.take_result_disposition(AsyncJobKind::Load);
         Some(match state {
             Ok(doc) => {
-                if discard_load_result {
+                if disposition == ResultDisposition::Discard {
                     let err = DocumentError::Open {
                         path: Arc::unwrap_or_clone(job.path),
                         source: io::Error::other(
@@ -152,7 +254,7 @@ impl SessionCore {
                         &err,
                     ));
                     Err(err)
-                } else if close_after_job {
+                } else if close_request == CloseRequest::AfterCurrentJob {
                     self.last_background_issue = None;
                     self.finish_close();
                     Ok(())
@@ -167,7 +269,9 @@ impl SessionCore {
                     BackgroundIssueKind::LoadFailed,
                     &err,
                 ));
-                if close_after_job && !discard_load_result {
+                if close_request == CloseRequest::AfterCurrentJob
+                    && disposition != ResultDisposition::Discard
+                {
                     self.finish_close();
                 }
                 Err(err)
@@ -201,17 +305,9 @@ impl SessionCore {
     }
 
     fn note_session_state_change(&mut self) {
-        let mut changed_while_busy = false;
-        if self.is_loading() {
-            self.discard_load_result = true;
-            changed_while_busy = true;
-        }
-        if self.is_saving() {
-            self.discard_save_result = true;
-            changed_while_busy = true;
-        }
-        if changed_while_busy {
-            self.close_after_job = false;
+        if let Some(job) = self.active_job_kind() {
+            self.async_state.mark_result_stale(job);
+            self.async_state.cancel_deferred_close();
         }
     }
 
@@ -297,15 +393,16 @@ impl SessionCore {
             phase,
             rx,
         });
-        self.clear_dirty_after_open = false;
+        self.async_state.reset_for_new_job(AsyncJobKind::Load);
+        self.async_state.clear_clean_mark_after_open();
         self.last_background_issue = None;
         Ok(())
     }
 
     pub(super) fn close_file(&mut self) -> bool {
-        self.clear_dirty_after_open = false;
+        self.async_state.clear_clean_mark_after_open();
         if self.is_busy() {
-            self.close_after_job = true;
+            self.async_state.request_close_after_current_job();
             return false;
         }
         self.finish_close();
@@ -313,7 +410,7 @@ impl SessionCore {
     }
 
     pub(super) fn close_pending(&self) -> bool {
-        self.close_after_job
+        self.async_state.close_pending()
     }
 
     pub(super) fn is_empty_document(&self) -> bool {
@@ -323,25 +420,22 @@ impl SessionCore {
     fn finish_close(&mut self) {
         self.load_job = None;
         self.save_job = None;
-        self.close_after_job = false;
-        self.discard_load_result = false;
-        self.discard_save_result = false;
+        self.async_state.clear();
         self.last_background_issue = None;
         self.doc = Document::new();
         self.generation = self.generation.wrapping_add(1);
-        self.clear_dirty_after_open = false;
     }
 
     pub(super) fn after_document_frame(&mut self) {
-        if !self.clear_dirty_after_open {
+        if !self.async_state.clear_dirty_after_open_pending() {
             return;
         }
         self.doc.mark_clean();
-        self.clear_dirty_after_open = false;
+        self.async_state.clear_clean_mark_after_open();
     }
 
     pub(super) fn cancel_clear_dirty_after_open(&mut self) {
-        self.clear_dirty_after_open = false;
+        self.async_state.clear_clean_mark_after_open();
     }
 
     pub(super) fn save(&mut self) -> Result<(), SaveError> {
@@ -432,13 +526,11 @@ impl SessionCore {
         };
 
         self.save_job = None;
-        let close_after_job = self.close_after_job;
-        self.close_after_job = false;
-        let discard_save_result = self.discard_save_result;
-        self.discard_save_result = false;
+        let close_request = self.async_state.take_close_request();
+        let disposition = self.async_state.take_result_disposition(AsyncJobKind::Save);
         Some(match state {
             Ok(completion) => {
-                if discard_save_result {
+                if disposition == ResultDisposition::Discard {
                     let err = DocumentError::Write {
                         path: completion.path,
                         source: io::Error::other(
@@ -457,7 +549,7 @@ impl SessionCore {
                     {
                         Ok(()) => {
                             self.last_background_issue = None;
-                            if close_after_job {
+                            if close_request == CloseRequest::AfterCurrentJob {
                                 self.finish_close();
                             } else {
                                 self.generation = self.generation.wrapping_add(1);
@@ -535,6 +627,7 @@ impl SessionCore {
             written_bytes,
             rx,
         });
+        self.async_state.reset_for_new_job(AsyncJobKind::Save);
         self.last_background_issue = None;
         Ok(true)
     }
@@ -564,7 +657,8 @@ impl SessionCore {
     }
 
     fn finish_open(&mut self, doc: Document) {
-        self.clear_dirty_after_open = !doc.is_dirty();
+        self.async_state
+            .schedule_clean_mark_after_open(!doc.is_dirty());
         self.doc = doc;
         self.generation = self.generation.wrapping_add(1);
     }
