@@ -1,4 +1,4 @@
-use qem::{DocumentSession, TextPosition, ViewportRequest};
+use qem::{DocumentSession, LoadPhase, TextPosition, ViewportRequest};
 use std::env;
 use std::path::PathBuf;
 use std::thread;
@@ -74,13 +74,18 @@ fn wait_for_load(
     loop {
         let status = session.status();
         if let Some(progress) = status.loading_state() {
-            let progress_key = (progress.completed_bytes(), progress.total_bytes());
+            let progress_key = (
+                progress.completed_bytes(),
+                progress.total_bytes(),
+                status.loading_phase(),
+            );
             if last_progress != Some(progress_key) {
                 println!(
-                    "loading: {}/{} bytes from {}",
+                    "loading: {}/{} bytes from {}, phase: {:?}",
                     progress.completed_bytes(),
                     progress.total_bytes(),
-                    progress.path().display()
+                    progress.path().display(),
+                    status.loading_phase().unwrap_or(LoadPhase::Opening)
                 );
                 last_progress = Some(progress_key);
             }

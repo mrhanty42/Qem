@@ -1,3 +1,4 @@
+use crate::source_identity::sampled_content_fingerprint;
 use crate::storage::FileStorage;
 use memchr::memchr2_iter;
 use std::collections::{HashMap, VecDeque};
@@ -9,9 +10,9 @@ use std::thread;
 use std::time::UNIX_EPOCH;
 
 const INDEX_MAGIC: &[u8; 8] = b"QEMIDX1\0";
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
 const INDEX_PAGE_SIZE: usize = 4096;
-const INDEX_HEADER_BYTES: usize = 64;
+const INDEX_HEADER_BYTES: usize = 72;
 const INDEX_PAGE_HEADER_BYTES: usize = 16;
 const INDEX_ENTRY_BYTES: usize = 24;
 const INDEX_CACHE_PAGES: usize = 32;
@@ -90,6 +91,7 @@ struct Page {
 struct IndexMetadata {
     source_len: u64,
     source_mtime_ns: u64,
+    source_fingerprint: u64,
 }
 
 impl DiskLineIndex {
@@ -98,7 +100,7 @@ impl DiskLineIndex {
             return None;
         }
 
-        let metadata = source_metadata(path).ok()?;
+        let metadata = source_metadata(path, storage.bytes()).ok()?;
         let sidecar = sidecar_path(path);
         let state = if let Ok(ready) = ReadyDiskLineIndex::open_existing(&sidecar, metadata) {
             DiskLineIndexState::Ready(Arc::new(ready))
@@ -162,22 +164,17 @@ impl ReadyDiskLineIndex {
     fn open_existing(path: &Path, metadata: IndexMetadata) -> io::Result<Self> {
         let mut file = File::open(path)?;
         let header = read_header(&mut file)?;
-        if header.source_len != metadata.source_len
-            || header.source_mtime_ns != metadata.source_mtime_ns
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "stale line index metadata",
-            ));
-        }
+        validate_header(header, metadata)?;
 
-        Ok(Self {
+        let ready = Self {
             path: path.to_path_buf(),
             total_lines: header.total_lines,
             root_page: header.root_page,
             page_count: header.page_count,
             cache: Mutex::new(PageCache::default()),
-        })
+        };
+        ready.validate_root_page()?;
+        Ok(ready)
     }
 
     fn checkpoint_for_line(&self, line0: u64) -> io::Result<PageEntry> {
@@ -227,6 +224,14 @@ impl ReadyDiskLineIndex {
 
         Ok(page)
     }
+
+    fn validate_root_page(&self) -> io::Result<()> {
+        if self.page_count == 0 {
+            return Ok(());
+        }
+        let _ = self.read_page(self.root_page)?;
+        Ok(())
+    }
 }
 
 impl PageCache {
@@ -262,6 +267,42 @@ struct FileHeader {
     total_bytes: u64,
     source_len: u64,
     source_mtime_ns: u64,
+    source_fingerprint: u64,
+}
+
+fn validate_header(header: FileHeader, metadata: IndexMetadata) -> io::Result<()> {
+    if header.source_len != metadata.source_len
+        || header.source_mtime_ns != metadata.source_mtime_ns
+        || header.source_fingerprint != metadata.source_fingerprint
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stale line index metadata",
+        ));
+    }
+
+    if header.total_bytes != metadata.source_len || header.total_lines == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid qem line index header",
+        ));
+    }
+
+    if header.page_count == 0 {
+        if header.root_page != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid qem line index root page",
+            ));
+        }
+    } else if header.root_page == 0 || header.root_page > header.page_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid qem line index root page",
+        ));
+    }
+
+    Ok(())
 }
 
 fn build_or_open_index(
@@ -348,6 +389,7 @@ fn build_index_file(path: &Path, storage: &FileStorage, metadata: IndexMetadata)
             total_bytes: bytes.len() as u64,
             source_len: metadata.source_len,
             source_mtime_ns: metadata.source_mtime_ns,
+            source_fingerprint: metadata.source_fingerprint,
         };
         file.seek(SeekFrom::Start(0))?;
         write_header(file, header)
@@ -418,6 +460,7 @@ fn write_header(file: &mut File, header: FileHeader) -> io::Result<()> {
     buf[40..48].copy_from_slice(&header.total_bytes.to_le_bytes());
     buf[48..56].copy_from_slice(&header.source_len.to_le_bytes());
     buf[56..64].copy_from_slice(&header.source_mtime_ns.to_le_bytes());
+    buf[64..72].copy_from_slice(&header.source_fingerprint.to_le_bytes());
     file.write_all(&buf)
 }
 
@@ -448,6 +491,7 @@ fn read_header(file: &mut File) -> io::Result<FileHeader> {
         total_bytes: u64::from_le_bytes(buf[40..48].try_into().unwrap_or([0; 8])),
         source_len: u64::from_le_bytes(buf[48..56].try_into().unwrap_or([0; 8])),
         source_mtime_ns: u64::from_le_bytes(buf[56..64].try_into().unwrap_or([0; 8])),
+        source_fingerprint: u64::from_le_bytes(buf[64..72].try_into().unwrap_or([0; 8])),
     })
 }
 
@@ -502,7 +546,7 @@ fn sidecar_path(source_path: &Path) -> PathBuf {
     parent.join(format!(".{file_name}.qem.lineidx"))
 }
 
-fn source_metadata(path: &Path) -> io::Result<IndexMetadata> {
+fn source_metadata(path: &Path, bytes: &[u8]) -> io::Result<IndexMetadata> {
     let metadata = std::fs::metadata(path)?;
     let source_len = metadata.len();
     let source_mtime_ns = metadata
@@ -514,14 +558,19 @@ fn source_metadata(path: &Path) -> io::Result<IndexMetadata> {
     Ok(IndexMetadata {
         source_len,
         source_mtime_ns,
+        source_fingerprint: sampled_content_fingerprint(bytes),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_index_file, sidecar_path, source_metadata, FileHeader, ReadyDiskLineIndex};
+    use super::{
+        build_index_file, build_or_open_index, sidecar_path, source_metadata, FileHeader,
+        ReadyDiskLineIndex,
+    };
     use crate::storage::FileStorage;
     use std::fs;
+    use std::io::{Seek, SeekFrom, Write};
 
     #[test]
     fn disk_line_index_builds_and_resolves_checkpoints() {
@@ -532,7 +581,7 @@ mod tests {
         fs::write(&path, text).unwrap();
 
         let storage = FileStorage::open(&path).unwrap();
-        let metadata = source_metadata(&path).unwrap();
+        let metadata = source_metadata(&path, storage.bytes()).unwrap();
         let sidecar = sidecar_path(&path);
         build_index_file(&sidecar, &storage, metadata).unwrap();
         let ready = ReadyDiskLineIndex::open_existing(&sidecar, metadata).unwrap();
@@ -558,6 +607,7 @@ mod tests {
             total_bytes: 456,
             source_len: 456,
             source_mtime_ns: 789,
+            source_fingerprint: 987,
         };
         let dir = std::env::temp_dir().join(format!("qem-index-header-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
@@ -574,7 +624,76 @@ mod tests {
         assert_eq!(parsed.total_bytes, header.total_bytes);
         assert_eq!(parsed.source_len, header.source_len);
         assert_eq!(parsed.source_mtime_ns, header.source_mtime_ns);
+        assert_eq!(parsed.source_fingerprint, header.source_fingerprint);
 
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn line_index_rejects_stale_content_fingerprint_even_with_matching_file_metadata() {
+        let dir = std::env::temp_dir().join(format!(
+            "qem-index-stale-fingerprint-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("sample.txt");
+        let text = "aa\n".repeat(10_000);
+        fs::write(&path, text).unwrap();
+
+        let storage = FileStorage::open(&path).unwrap();
+        let metadata = source_metadata(&path, storage.bytes()).unwrap();
+        let sidecar = sidecar_path(&path);
+        build_index_file(&sidecar, &storage, metadata).unwrap();
+
+        let stale = super::IndexMetadata {
+            source_len: metadata.source_len,
+            source_mtime_ns: metadata.source_mtime_ns,
+            source_fingerprint: metadata.source_fingerprint ^ 1,
+        };
+        let err = ReadyDiskLineIndex::open_existing(&sidecar, stale).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn line_index_rebuilds_when_root_page_is_corrupt() {
+        let dir =
+            std::env::temp_dir().join(format!("qem-index-corrupt-root-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("sample.txt");
+        let text = "aa\n".repeat(40_000);
+        fs::write(&path, text).unwrap();
+
+        let storage = FileStorage::open(&path).unwrap();
+        let metadata = source_metadata(&path, storage.bytes()).unwrap();
+        let sidecar = sidecar_path(&path);
+        build_index_file(&sidecar, &storage, metadata).unwrap();
+
+        {
+            let mut file = fs::OpenOptions::new().write(true).open(&sidecar).unwrap();
+            file.seek(SeekFrom::Start(super::INDEX_HEADER_BYTES as u64))
+                .unwrap();
+            file.write_all(&[0xFF]).unwrap();
+            file.flush().unwrap();
+        }
+
+        let err = ReadyDiskLineIndex::open_existing(&sidecar, metadata).unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+        ));
+
+        let rebuilt = build_or_open_index(&path, &storage, metadata).unwrap();
+        assert_eq!(rebuilt.total_lines, 40_001);
+        let checkpoint = rebuilt.checkpoint_for_line(16_384).unwrap();
+        assert!(checkpoint.line0 <= 16_384);
+        assert!(checkpoint.byte0 <= storage.len() as u64);
+
+        let _ = fs::remove_file(&sidecar);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir_all(&dir);
     }

@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +30,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --all-features
         run: cargo test --all-features
+
+  feature-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cargo test (default features)
+            command: cargo test
+          - name: cargo test --no-default-features
+            command: cargo test --no-default-features
+          - name: cargo check --no-default-features --features editor,tmp-auto
+            command: cargo check --no-default-features --features editor,tmp-auto
+          - name: cargo check --no-default-features --features editor,tmp-source-dir
+            command: cargo check --no-default-features --features editor,tmp-source-dir
+          - name: cargo check --no-default-features --features editor,tmp-system-dir
+            command: cargo check --no-default-features --features editor,tmp-system-dir
+          - name: cargo check --no-default-features --features editor,tmp-exe-dir
+            command: cargo check --no-default-features --features editor,tmp-exe-dir
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: ${{ matrix.name }}
+        run: ${{ matrix.command }}
 
   lint-and-docs:
     runs-on: ubuntu-latest
@@ -43,6 +68,34 @@ jobs:
         run: cargo clippy --all-features --all-targets -- -D warnings
       - name: cargo doc
         run: cargo doc --all-features --no-deps
+
+  examples:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cargo build --examples --all-features
+            command: cargo build --examples --all-features
+          - name: cargo build --example viewport --no-default-features
+            command: cargo build --example viewport --no-default-features
+          - name: cargo build --example typed_editing --no-default-features
+            command: cargo build --example typed_editing --no-default-features
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: ${{ matrix.name }}
+        run: ${{ matrix.command }}
+
+  benches:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo bench --bench document_perf --no-run
+        run: cargo bench --bench document_perf --no-run
 
   msrv:
     runs-on: ubuntu-latest

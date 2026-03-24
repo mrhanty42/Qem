@@ -1,3 +1,4 @@
+use crate::source_identity::{sampled_content_fingerprint, sampled_file_fingerprint};
 use crate::storage::FileStorage;
 use crc32fast::Hasher;
 use std::collections::{HashMap, VecDeque};
@@ -120,6 +121,7 @@ struct EditLogHeader {
     page_count: u64,
     source_len: u64,
     source_mtime_ns: u64,
+    source_fingerprint: u64,
     history_first_page_id: u64,
     history_page_count: u64,
     history_len: u64,
@@ -135,6 +137,7 @@ struct EditLogHeader {
 struct SourceMetadata {
     len: u64,
     mtime_ns: u64,
+    fingerprint: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,8 +195,11 @@ impl PieceTree {
 
     pub(crate) fn try_open_disk_session(
         source_path: &Path,
+        storage: &FileStorage,
     ) -> io::Result<Option<(Self, Vec<u8>, SessionMeta)>> {
-        let Some((store, history, history_index, add, meta)) = DiskPageStore::open(source_path)?
+        let source = source_metadata_with_bytes(source_path, storage.bytes())?;
+        let Some((store, history, history_index, add, meta)) =
+            DiskPageStore::open(source_path, source)?
         else {
             return Ok(None);
         };
@@ -218,7 +224,8 @@ impl PieceTree {
 
     #[cfg(test)]
     pub(crate) fn open_disk(source_path: &Path) -> io::Result<Self> {
-        let Some((tree, _, _)) = Self::try_open_disk_session(source_path)? else {
+        let storage = FileStorage::open(source_path).map_err(|err| err.into_io_error())?;
+        let Some((tree, _, _)) = Self::try_open_disk_session(source_path, &storage)? else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "no persisted editlog session found",
@@ -722,16 +729,18 @@ impl DiskPageStore {
         })
     }
 
-    fn open(source_path: &Path) -> io::Result<OpenDiskSession> {
+    fn open(source_path: &Path, source: SourceMetadata) -> io::Result<OpenDiskSession> {
         let path = editlog_path(source_path);
         if !path.exists() {
             return Ok(None);
         }
 
-        let source = source_metadata(source_path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         let header = read_editlog_header(&mut file)?;
-        if header.source_len != source.len || header.source_mtime_ns != source.mtime_ns {
+        if header.source_len != source.len
+            || header.source_mtime_ns != source.mtime_ns
+            || header.source_fingerprint != source.fingerprint
+        {
             return Ok(None);
         }
 
@@ -868,6 +877,7 @@ impl DiskPageStore {
             page_count: self.next_page_id,
             source_len: self.source.len,
             source_mtime_ns: self.source.mtime_ns,
+            source_fingerprint: self.source.fingerprint,
             history_first_page_id,
             history_page_count: history_page_count as u64,
             history_len: history.len() as u64,
@@ -982,21 +992,22 @@ fn write_editlog_header(file: &mut File, header: EditLogHeader) -> io::Result<()
     buf[16..24].copy_from_slice(&header.page_count.to_le_bytes());
     buf[24..32].copy_from_slice(&header.source_len.to_le_bytes());
     buf[32..40].copy_from_slice(&header.source_mtime_ns.to_le_bytes());
-    buf[40..48].copy_from_slice(&header.history_first_page_id.to_le_bytes());
-    buf[48..56].copy_from_slice(&header.history_page_count.to_le_bytes());
-    buf[56..64].copy_from_slice(&header.history_len.to_le_bytes());
-    buf[64..72].copy_from_slice(&header.history_index.to_le_bytes());
-    buf[72..80].copy_from_slice(&header.add_first_page_id.to_le_bytes());
-    buf[80..88].copy_from_slice(&header.add_page_count.to_le_bytes());
-    buf[88..96].copy_from_slice(&header.add_len.to_le_bytes());
-    buf[96..104].copy_from_slice(&header.known_byte_len.to_le_bytes());
-    buf[104..112].copy_from_slice(&header.flags.to_le_bytes());
+    buf[40..48].copy_from_slice(&header.source_fingerprint.to_le_bytes());
+    buf[48..56].copy_from_slice(&header.history_first_page_id.to_le_bytes());
+    buf[56..64].copy_from_slice(&header.history_page_count.to_le_bytes());
+    buf[64..72].copy_from_slice(&header.history_len.to_le_bytes());
+    buf[72..80].copy_from_slice(&header.history_index.to_le_bytes());
+    buf[80..88].copy_from_slice(&header.add_first_page_id.to_le_bytes());
+    buf[88..96].copy_from_slice(&header.add_page_count.to_le_bytes());
+    buf[96..104].copy_from_slice(&header.add_len.to_le_bytes());
+    buf[104..112].copy_from_slice(&header.known_byte_len.to_le_bytes());
+    buf[112..120].copy_from_slice(&header.flags.to_le_bytes());
     let committed_at_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
         .min(u64::MAX as u128) as u64;
-    buf[112..120].copy_from_slice(&committed_at_ns.to_le_bytes());
+    buf[120..128].copy_from_slice(&committed_at_ns.to_le_bytes());
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&buf)
 }
@@ -1023,15 +1034,16 @@ fn read_editlog_header(file: &mut File) -> io::Result<EditLogHeader> {
         page_count: u64::from_le_bytes(buf[16..24].try_into().unwrap_or([0; 8])),
         source_len: u64::from_le_bytes(buf[24..32].try_into().unwrap_or([0; 8])),
         source_mtime_ns: u64::from_le_bytes(buf[32..40].try_into().unwrap_or([0; 8])),
-        history_first_page_id: u64::from_le_bytes(buf[40..48].try_into().unwrap_or([0; 8])),
-        history_page_count: u64::from_le_bytes(buf[48..56].try_into().unwrap_or([0; 8])),
-        history_len: u64::from_le_bytes(buf[56..64].try_into().unwrap_or([0; 8])),
-        history_index: u64::from_le_bytes(buf[64..72].try_into().unwrap_or([0; 8])),
-        add_first_page_id: u64::from_le_bytes(buf[72..80].try_into().unwrap_or([0; 8])),
-        add_page_count: u64::from_le_bytes(buf[80..88].try_into().unwrap_or([0; 8])),
-        add_len: u64::from_le_bytes(buf[88..96].try_into().unwrap_or([0; 8])),
-        known_byte_len: u64::from_le_bytes(buf[96..104].try_into().unwrap_or([0; 8])),
-        flags: u64::from_le_bytes(buf[104..112].try_into().unwrap_or([0; 8])),
+        source_fingerprint: u64::from_le_bytes(buf[40..48].try_into().unwrap_or([0; 8])),
+        history_first_page_id: u64::from_le_bytes(buf[48..56].try_into().unwrap_or([0; 8])),
+        history_page_count: u64::from_le_bytes(buf[56..64].try_into().unwrap_or([0; 8])),
+        history_len: u64::from_le_bytes(buf[64..72].try_into().unwrap_or([0; 8])),
+        history_index: u64::from_le_bytes(buf[72..80].try_into().unwrap_or([0; 8])),
+        add_first_page_id: u64::from_le_bytes(buf[80..88].try_into().unwrap_or([0; 8])),
+        add_page_count: u64::from_le_bytes(buf[88..96].try_into().unwrap_or([0; 8])),
+        add_len: u64::from_le_bytes(buf[96..104].try_into().unwrap_or([0; 8])),
+        known_byte_len: u64::from_le_bytes(buf[104..112].try_into().unwrap_or([0; 8])),
+        flags: u64::from_le_bytes(buf[112..120].try_into().unwrap_or([0; 8])),
     })
 }
 
@@ -1394,7 +1406,28 @@ fn source_metadata(path: &Path) -> io::Result<SourceMetadata> {
         .unwrap_or_default()
         .as_nanos()
         .min(u64::MAX as u128) as u64;
-    Ok(SourceMetadata { len, mtime_ns })
+    let fingerprint = sampled_file_fingerprint(path)?;
+    Ok(SourceMetadata {
+        len,
+        mtime_ns,
+        fingerprint,
+    })
+}
+
+fn source_metadata_with_bytes(path: &Path, bytes: &[u8]) -> io::Result<SourceMetadata> {
+    let metadata = std::fs::metadata(path)?;
+    let len = metadata.len();
+    let mtime_ns = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64;
+    Ok(SourceMetadata {
+        len,
+        mtime_ns,
+        fingerprint: sampled_content_fingerprint(bytes),
+    })
 }
 
 pub(crate) fn editlog_path(source_path: &Path) -> PathBuf {
@@ -1518,7 +1551,10 @@ fn coalesce_adjacent(pieces: &mut Vec<Piece>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{editlog_path, Piece, PieceSource, PieceTree, SessionMeta};
+    use super::{
+        editlog_path, source_metadata, DiskPageStore, Piece, PieceSource, PieceTree, SessionMeta,
+        SourceMetadata,
+    };
     use std::fs;
 
     fn collect(tree: &PieceTree) -> Vec<(PieceSource, usize, usize, usize)> {
@@ -1798,6 +1834,42 @@ mod tests {
             ]
         );
 
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_open_rejects_stale_content_fingerprint_even_with_matching_file_metadata() {
+        let dir = std::env::temp_dir().join(format!(
+            "qem-piece-tree-stale-fingerprint-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef\n").unwrap();
+        let tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 7,
+                line_breaks: 1,
+            }],
+        )
+        .unwrap();
+        drop(tree);
+
+        let source_meta = source_metadata(&source).unwrap();
+        let stale = SourceMetadata {
+            len: source_meta.len,
+            mtime_ns: source_meta.mtime_ns,
+            fingerprint: source_meta.fingerprint ^ 1,
+        };
+        let reopened = DiskPageStore::open(&source, stale).unwrap();
+        assert!(reopened.is_none());
+
+        let sidecar = editlog_path(&source);
         let _ = fs::remove_file(&sidecar);
         let _ = fs::remove_file(&source);
         let _ = fs::remove_dir_all(&dir);

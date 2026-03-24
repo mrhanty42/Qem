@@ -1,16 +1,20 @@
 use memmap2::Mmap;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(not(windows))]
 use std::io::{Seek, SeekFrom};
 
 static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+static STALE_CLEANUP_CACHE: OnceLock<Mutex<HashMap<PathBuf, u128>>> = OnceLock::new();
 const STALE_QEM_TEMP_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+const STALE_QEM_CLEANUP_MIN_INTERVAL: Duration = Duration::from_secs(60);
+const STALE_CLEANUP_CACHE_LIMIT: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TempDirPolicy {
@@ -283,9 +287,34 @@ fn replace_file_contents(path: &Path, data: &[u8]) -> io::Result<()> {
     replace_file(path, |temp_file| temp_file.write_all(data))
 }
 
+#[derive(Debug)]
+struct TempPathGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempPathGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempPathGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn replace_file(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
     cleanup_stale_qem_artifacts(path);
     let temp_path = unique_qem_temp_path(path, "tmp", TempArtifactKind::AtomicRewrite);
+    let mut temp_guard = TempPathGuard::new(temp_path.clone());
 
     let mut temp_file = OpenOptions::new()
         .create_new(true)
@@ -297,20 +326,22 @@ fn replace_file(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) ->
     temp_file.sync_all()?;
     drop(temp_file);
 
-    if let Err(err) = replace_temp_file(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err);
-    }
+    replace_temp_file(&temp_path, path)?;
+    temp_guard.disarm();
 
     Ok(())
 }
 
 fn cleanup_stale_qem_artifacts(path: &Path) {
-    let prefix = qem_temp_prefix(path);
     let now_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    if !should_run_stale_cleanup(path, now_nanos) {
+        return;
+    }
+
+    let prefix = qem_temp_prefix(path);
     let stale_after = STALE_QEM_TEMP_MAX_AGE.as_nanos();
 
     for dir in temp_artifact_candidate_dirs(path) {
@@ -339,6 +370,35 @@ fn cleanup_stale_qem_artifacts(path: &Path) {
     }
 }
 
+fn should_run_stale_cleanup(path: &Path, now_nanos: u128) -> bool {
+    let mut cache = match stale_cleanup_cache().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    let min_interval = STALE_QEM_CLEANUP_MIN_INTERVAL.as_nanos();
+    if let Some(last_scan) = cache.get(path) {
+        if now_nanos.saturating_sub(*last_scan) < min_interval {
+            return false;
+        }
+    }
+
+    if cache.len() >= STALE_CLEANUP_CACHE_LIMIT {
+        let keep_after = now_nanos.saturating_sub(min_interval);
+        cache.retain(|_, last_scan| *last_scan >= keep_after);
+        if cache.len() >= STALE_CLEANUP_CACHE_LIMIT {
+            cache.clear();
+        }
+    }
+
+    cache.insert(path.to_path_buf(), now_nanos);
+    true
+}
+
+fn stale_cleanup_cache() -> &'static Mutex<HashMap<PathBuf, u128>> {
+    STALE_CLEANUP_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn parse_qem_temp_name<'a>(name: &'a str, prefix: &str) -> Option<(&'a str, u128, &'a str)> {
     let rest = name.strip_prefix(prefix)?;
     let mut parts = rest.rsplitn(3, '.');
@@ -358,15 +418,23 @@ fn temp_artifact_candidate_dirs(path: &Path) -> Vec<PathBuf> {
 }
 
 fn configured_tmp_root(path: &Path) -> Option<PathBuf> {
-    if let Some(custom) = std::env::var_os("QEM_TMP_DIR").filter(|v| !v.is_empty()) {
-        let custom = PathBuf::from(custom);
-        if is_usable_tmp_dir(&custom, path) {
-            return Some(custom);
-        }
+    let custom_root = std::env::var_os("QEM_TMP_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    configured_tmp_root_for(path, custom_root.as_deref(), temp_dir_policy())
+}
+
+fn configured_tmp_root_for(
+    path: &Path,
+    custom_root: Option<&Path>,
+    policy: TempDirPolicy,
+) -> Option<PathBuf> {
+    if let Some(custom) = validated_custom_tmp_root(custom_root, path) {
+        return Some(custom);
     }
 
     let mut candidates = Vec::new();
-    match temp_dir_policy() {
+    match policy {
         TempDirPolicy::Auto => {
             #[cfg(windows)]
             {
@@ -403,17 +471,36 @@ fn configured_tmp_root(path: &Path) -> Option<PathBuf> {
         .find(|candidate| is_usable_tmp_dir(candidate, path))
 }
 
+fn validated_custom_tmp_root(custom_root: Option<&Path>, source_path: &Path) -> Option<PathBuf> {
+    let custom_root = custom_root?;
+    if !custom_root.is_absolute() {
+        return None;
+    }
+
+    is_usable_tmp_dir(custom_root, source_path).then(|| custom_root.to_path_buf())
+}
+
 fn temp_dir_policy() -> TempDirPolicy {
     if let Ok(value) = std::env::var("QEM_TMP_POLICY") {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "file" | "source" | "source-dir" | "near-file" => return TempDirPolicy::SourceDir,
-            "temp" | "system" | "system-dir" | "system-temp" => return TempDirPolicy::SystemDir,
-            "exe" | "exe-dir" | "near-exe" => return TempDirPolicy::ExeDir,
-            "auto" => return TempDirPolicy::Auto,
-            _ => {}
+        if let Some(policy) = parse_temp_dir_policy(&value) {
+            return policy;
         }
     }
 
+    feature_temp_dir_policy()
+}
+
+fn parse_temp_dir_policy(value: &str) -> Option<TempDirPolicy> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "file" | "source" | "source-dir" | "near-file" => Some(TempDirPolicy::SourceDir),
+        "temp" | "system" | "system-dir" | "system-temp" => Some(TempDirPolicy::SystemDir),
+        "exe" | "exe-dir" | "near-exe" => Some(TempDirPolicy::ExeDir),
+        "auto" => Some(TempDirPolicy::Auto),
+        _ => None,
+    }
+}
+
+fn feature_temp_dir_policy() -> TempDirPolicy {
     if cfg!(feature = "tmp-source-dir") {
         TempDirPolicy::SourceDir
     } else if cfg!(feature = "tmp-system-dir") {
@@ -581,11 +668,16 @@ fn qem_temp_tag(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{qem_temp_prefix, FileStorage};
+    use super::{
+        configured_tmp_root_for, feature_temp_dir_policy, parse_temp_dir_policy, qem_temp_prefix,
+        should_run_stale_cleanup, stale_cleanup_cache, temp_root_for_artifact, FileStorage,
+        TempArtifactKind, TempDirPolicy, STALE_QEM_CLEANUP_MIN_INTERVAL,
+    };
     use std::fs;
     #[cfg(windows)]
     use std::fs::OpenOptions;
-    use std::path::PathBuf;
+    use std::io::{self, Write};
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -624,7 +716,30 @@ mod tests {
     }
 
     #[test]
+    fn replace_with_write_error_preserves_original_file_and_cleans_temp() {
+        let dir = test_dir("replace-error");
+        let path = dir.join("mapped.bin");
+        fs::write(&path, b"abcdef").unwrap();
+
+        let err = FileStorage::replace_with(&path, |file| {
+            file.write_all(b"xy")?;
+            Err(io::Error::other("injected write failure"))
+        })
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(fs::read(&path).unwrap(), b"abcdef");
+        assert!(
+            temp_artifacts_in_dir(&dir, &path).is_empty(),
+            "failed replace should not leave fresh qem temp files behind"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn open_cleans_stale_qem_temp_artifacts() {
+        clear_stale_cleanup_cache();
         let dir = test_dir("cleanup");
         let path = dir.join("artifact.bin");
         fs::write(&path, b"abcdef").unwrap();
@@ -640,6 +755,96 @@ mod tests {
 
         drop(storage);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_cleanup_is_throttled_per_source_path() {
+        clear_stale_cleanup_cache();
+        let path = PathBuf::from("throttle.bin");
+        let start = 123_456u128;
+        let later = start + 1;
+        let after_interval = start + STALE_QEM_CLEANUP_MIN_INTERVAL.as_nanos();
+
+        assert!(should_run_stale_cleanup(&path, start));
+        assert!(!should_run_stale_cleanup(&path, later));
+        assert!(should_run_stale_cleanup(&path, after_interval));
+    }
+
+    #[test]
+    fn custom_tmp_root_must_be_absolute_to_override_policy() {
+        let dir = test_dir("custom-policy");
+        let path = dir.join("artifact.bin");
+        fs::write(&path, b"abcdef").unwrap();
+
+        let relative = PathBuf::from("relative-qem-tmp");
+        let chosen =
+            configured_tmp_root_for(&path, Some(relative.as_path()), TempDirPolicy::SystemDir)
+                .expect("system temp dir should be usable");
+
+        assert_ne!(chosen, relative);
+        assert_eq!(chosen, std::env::temp_dir());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn absolute_custom_tmp_root_overrides_policy() {
+        let dir = test_dir("custom-absolute");
+        let path = dir.join("artifact.bin");
+        let custom = dir.join("custom-root");
+        fs::write(&path, b"abcdef").unwrap();
+
+        let chosen =
+            configured_tmp_root_for(&path, Some(custom.as_path()), TempDirPolicy::SystemDir)
+                .expect("custom temp root should be usable");
+
+        assert_eq!(chosen, custom);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_rewrite_temp_stays_next_to_destination() {
+        let dir = test_dir("atomic-root");
+        let path = dir.join("artifact.bin");
+
+        let temp_root = temp_root_for_artifact(&path, TempArtifactKind::AtomicRewrite);
+
+        assert_eq!(temp_root, dir);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_temp_dir_policy_supports_documented_values() {
+        assert_eq!(parse_temp_dir_policy("auto"), Some(TempDirPolicy::Auto));
+        assert_eq!(
+            parse_temp_dir_policy("source-dir"),
+            Some(TempDirPolicy::SourceDir)
+        );
+        assert_eq!(
+            parse_temp_dir_policy("system-temp"),
+            Some(TempDirPolicy::SystemDir)
+        );
+        assert_eq!(
+            parse_temp_dir_policy("near-exe"),
+            Some(TempDirPolicy::ExeDir)
+        );
+        assert_eq!(parse_temp_dir_policy("invalid"), None);
+    }
+
+    #[test]
+    fn feature_temp_dir_policy_matches_enabled_feature_set() {
+        let policy = feature_temp_dir_policy();
+        if cfg!(feature = "tmp-source-dir") {
+            assert_eq!(policy, TempDirPolicy::SourceDir);
+        } else if cfg!(feature = "tmp-system-dir") {
+            assert_eq!(policy, TempDirPolicy::SystemDir);
+        } else if cfg!(feature = "tmp-exe-dir") {
+            assert_eq!(policy, TempDirPolicy::ExeDir);
+        } else {
+            assert_eq!(policy, TempDirPolicy::Auto);
+        }
     }
 
     #[cfg(windows)]
@@ -677,11 +882,34 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn temp_artifacts_in_dir(dir: &Path, source_path: &Path) -> Vec<PathBuf> {
+        let prefix = qem_temp_prefix(source_path);
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect()
+    }
+
     fn test_dir(name: &str) -> PathBuf {
         let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir =
             std::env::temp_dir().join(format!("qem-storage-{name}-{}-{id}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn clear_stale_cleanup_cache() {
+        let mut cache = match stale_cleanup_cache().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        cache.clear();
     }
 }
