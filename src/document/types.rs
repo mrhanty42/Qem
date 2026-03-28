@@ -126,9 +126,7 @@ impl DocumentEncodingOrigin {
     pub const fn used_auto_detection(self) -> bool {
         matches!(
             self,
-            Self::AutoDetected
-                | Self::AutoDetectFallbackUtf8
-                | Self::AutoDetectFallbackOverride
+            Self::AutoDetected | Self::AutoDetectFallbackUtf8 | Self::AutoDetectFallbackOverride
         )
     }
 

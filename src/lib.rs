@@ -243,12 +243,12 @@ pub mod storage;
 
 pub use document::{
     ByteProgress, CompactionPolicy, CompactionRecommendation, CompactionUrgency, CutResult,
-    Document, DocumentBacking, DocumentEncoding, DocumentEncodingErrorKind,
-    DocumentEncodingOrigin, DocumentError, DocumentMaintenanceStatus, DocumentOpenOptions,
-    DocumentSaveOptions, DocumentStatus, EditCapability, EditResult, FragmentationStats,
-    IdleCompactionOutcome, LineCount, LineEnding, LineSlice, LiteralSearchIter,
-    LiteralSearchQuery, MaintenanceAction, OpenEncodingPolicy, SaveEncodingPolicy, SearchMatch,
-    TextPosition, TextRange, TextSelection, TextSlice, Viewport, ViewportRequest, ViewportRow,
+    Document, DocumentBacking, DocumentEncoding, DocumentEncodingErrorKind, DocumentEncodingOrigin,
+    DocumentError, DocumentMaintenanceStatus, DocumentOpenOptions, DocumentSaveOptions,
+    DocumentStatus, EditCapability, EditResult, FragmentationStats, IdleCompactionOutcome,
+    LineCount, LineEnding, LineSlice, LiteralSearchIter, LiteralSearchQuery, MaintenanceAction,
+    OpenEncodingPolicy, SaveEncodingPolicy, SearchMatch, TextPosition, TextRange, TextSelection,
+    TextSlice, Viewport, ViewportRequest, ViewportRow,
 };
 #[cfg(feature = "editor")]
 pub use editor::{

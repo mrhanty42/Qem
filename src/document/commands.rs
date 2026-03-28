@@ -133,7 +133,8 @@ impl Document {
                 let start = piece_table.byte_offset_for_col(line0, start_col0);
                 let end = piece_table.advance_offset_by_text_units(start, len_chars);
                 let delete_result = if end > start {
-                    let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
+                    let path =
+                        session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
                     Some(
                         piece_table
                             .delete_range(start, end - start)
@@ -371,7 +372,8 @@ impl Document {
                 let start = piece_table.byte_offset_for_col(line0, start_col0);
                 let end = piece_table.advance_offset_by_text_units(start, 1);
                 let delete_result = if end > start {
-                    let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
+                    let path =
+                        session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
                     Some(
                         piece_table
                             .delete_range(start, end - start)

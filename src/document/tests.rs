@@ -1422,7 +1422,10 @@ fn lossy_shift_jis_source_can_be_explicitly_converted_to_utf8() {
         .unwrap();
 
     assert_eq!(doc.encoding(), DocumentEncoding::utf8());
-    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert_eq!(
+        doc.encoding_origin(),
+        DocumentEncodingOrigin::SaveConversion
+    );
     assert!(!doc.decoding_had_errors());
     assert_eq!(std::fs::read_to_string(&saved).unwrap(), "\u{FFFD}");
 }
@@ -1467,7 +1470,10 @@ fn invalid_utf8_fast_path_can_be_explicitly_converted_to_clean_utf8_without_edit
 
     assert_eq!(doc.path(), Some(saved.as_path()));
     assert_eq!(doc.encoding(), DocumentEncoding::utf8());
-    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert_eq!(
+        doc.encoding_origin(),
+        DocumentEncodingOrigin::SaveConversion
+    );
     assert!(!doc.decoding_had_errors());
     assert_eq!(std::fs::read_to_string(&saved).unwrap(), "fo\u{FFFD}o\n");
 }
@@ -1510,7 +1516,10 @@ fn edited_invalid_utf8_fast_path_becomes_lossy_preserve_rejecting() {
 
     doc.save_to_with_encoding(&saved, DocumentEncoding::utf8())
         .unwrap();
-    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert_eq!(
+        doc.encoding_origin(),
+        DocumentEncodingOrigin::SaveConversion
+    );
     assert!(!doc.decoding_had_errors());
     assert_eq!(std::fs::read_to_string(&saved).unwrap(), "Xfo\u{FFFD}o\n");
 }
@@ -1536,10 +1545,15 @@ fn piece_table_invalid_utf8_fast_path_converts_to_clean_utf8() {
 
     assert_eq!(doc.path(), Some(saved.as_path()));
     assert_eq!(doc.encoding(), DocumentEncoding::utf8());
-    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert_eq!(
+        doc.encoding_origin(),
+        DocumentEncodingOrigin::SaveConversion
+    );
     assert!(!doc.decoding_had_errors());
     assert!(!doc.has_piece_table());
-    assert!(std::fs::read_to_string(&saved).unwrap().starts_with("Xfo\u{FFFD}o\n"));
+    assert!(std::fs::read_to_string(&saved)
+        .unwrap()
+        .starts_with("Xfo\u{FFFD}o\n"));
 }
 
 #[test]
@@ -1554,7 +1568,10 @@ fn save_to_with_encoding_gb18030_converts_utf8_document() {
     doc.save_to_with_encoding(&path, encoding).unwrap();
 
     assert_eq!(doc.encoding(), encoding);
-    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert_eq!(
+        doc.encoding_origin(),
+        DocumentEncodingOrigin::SaveConversion
+    );
     assert!(!doc.decoding_had_errors());
 
     let raw = std::fs::read(&path).unwrap();
@@ -1593,7 +1610,10 @@ fn open_with_options_auto_detects_utf16le_bom_and_allows_utf8_convert_save() {
         "header\nhello\nworld\n"
     );
     assert_eq!(doc.encoding(), DocumentEncoding::utf8());
-    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert_eq!(
+        doc.encoding_origin(),
+        DocumentEncodingOrigin::SaveConversion
+    );
     assert!(!doc.decoding_had_errors());
 }
 
@@ -1618,8 +1638,7 @@ fn open_with_auto_detection_detects_utf16be_bom() {
 #[test]
 fn open_options_auto_detection_fallback_exposes_override() {
     let encoding = DocumentEncoding::from_label("windows-1252").unwrap();
-    let options =
-        DocumentOpenOptions::new().with_auto_encoding_detection_and_fallback(encoding);
+    let options = DocumentOpenOptions::new().with_auto_encoding_detection_and_fallback(encoding);
 
     assert_eq!(options.encoding_override(), Some(encoding));
     assert_eq!(
@@ -1723,7 +1742,10 @@ fn save_to_with_encoding_converts_utf8_document() {
     doc.save_to_with_encoding(&path, encoding).unwrap();
 
     assert_eq!(doc.encoding(), encoding);
-    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert_eq!(
+        doc.encoding_origin(),
+        DocumentEncodingOrigin::SaveConversion
+    );
     assert!(!doc.decoding_had_errors());
     let raw = std::fs::read(&path).unwrap();
     let (decoded, used, had_errors) = WINDOWS_1251.decode(&raw);
@@ -2009,7 +2031,9 @@ fn singular_partial_piece_table_line_slice_does_not_fall_back_to_stale_mmap() {
 #[test]
 fn partial_piece_table_find_prev_does_not_return_match_after_unresolved_before_position() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("partial-piece-table-find-prev-boundary.txt");
+    let path = dir
+        .path()
+        .join("partial-piece-table-find-prev-boundary.txt");
     let mut bytes = b"zero\n".to_vec();
     bytes.extend(std::iter::repeat_n(
         b'x',
@@ -2054,7 +2078,9 @@ fn partial_piece_table_find_prev_does_not_return_match_after_unresolved_before_p
 #[test]
 fn partial_piece_table_find_next_does_not_start_before_unresolved_from_position() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("partial-piece-table-find-next-boundary.txt");
+    let path = dir
+        .path()
+        .join("partial-piece-table-find-next-boundary.txt");
     let mut bytes = b"zero\n".to_vec();
     bytes.extend(std::iter::repeat_n(
         b'x',
@@ -2196,7 +2222,10 @@ fn partial_piece_table_find_next_can_start_on_scannable_incomplete_line() {
     assert!(found_text.is_exact());
 
     let query = LiteralSearchQuery::new("target").unwrap();
-    assert_eq!(doc.find_next_query(&query, TextPosition::new(2, 0)), Some(found));
+    assert_eq!(
+        doc.find_next_query(&query, TextPosition::new(2, 0)),
+        Some(found)
+    );
     assert_eq!(
         doc.find_all_from("target", TextPosition::new(2, 0))
             .collect::<Vec<_>>(),
@@ -2301,7 +2330,10 @@ fn partial_piece_table_find_prev_can_end_on_scannable_incomplete_line() {
     assert_eq!(found.end(), TextPosition::new(2, 6));
 
     let query = LiteralSearchQuery::new("target").unwrap();
-    assert_eq!(doc.find_prev_query(&query, TextPosition::new(2, 6)), Some(found));
+    assert_eq!(
+        doc.find_prev_query(&query, TextPosition::new(2, 6)),
+        Some(found)
+    );
 }
 
 #[test]
@@ -2588,13 +2620,18 @@ fn partial_piece_table_find_next_in_range_does_not_rewind_unresolved_start() {
         None
     );
     let query = LiteralSearchQuery::new("target").unwrap();
-    assert_eq!(doc.find_next_query_in_range(&query, TextRange::new(TextPosition::new(3, 0), 8)), None);
+    assert_eq!(
+        doc.find_next_query_in_range(&query, TextRange::new(TextPosition::new(3, 0), 8)),
+        None
+    );
 }
 
 #[test]
 fn partial_piece_table_line_slices_do_not_invent_trailing_empty_line_without_newline() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("partial-piece-table-no-trailing-newline.txt");
+    let path = dir
+        .path()
+        .join("partial-piece-table-no-trailing-newline.txt");
     let mut bytes = b"zero\n".to_vec();
     bytes.extend(std::iter::repeat_n(b'x', 64));
     std::fs::write(&path, &bytes).unwrap();
@@ -2671,7 +2708,10 @@ fn partial_piece_table_position_helpers_do_not_fall_back_to_stale_mmap_beyond_sc
 
     assert_eq!(doc.line_slice(3, 0, 16).text(), "");
     assert_eq!(doc.line_len_chars(3), 0);
-    assert_eq!(doc.clamp_position(TextPosition::new(3, 99)), TextPosition::new(3, 0));
+    assert_eq!(
+        doc.clamp_position(TextPosition::new(3, 99)),
+        TextPosition::new(3, 0)
+    );
 }
 
 #[test]
@@ -2686,12 +2726,14 @@ fn lines_iterator_yields_current_document_lines() {
 
 #[test]
 fn lines_iterator_uses_known_lower_bound_while_mmap_indexing_is_incomplete() {
-    let dir = std::env::temp_dir().join(format!("qem-doc-lines-lower-bound-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("qem-doc-lines-lower-bound-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("single-line-large.bin");
     {
         let file = std::fs::File::create(&path).unwrap();
-        file.set_len((INLINE_FULL_INDEX_MAX_FILE_BYTES + 1) as u64).unwrap();
+        file.set_len((INLINE_FULL_INDEX_MAX_FILE_BYTES + 1) as u64)
+            .unwrap();
     }
 
     let doc = Document::open(&path).unwrap();
@@ -2732,7 +2774,6 @@ fn raw_rope_edit_helpers_clamp_out_of_range_line_indices() {
     assert_eq!(backspace, (true, 1, 2));
     assert_eq!(doc.text_lossy(), "hello\n>>ld");
 }
-
 
 #[test]
 fn replace_range_updates_rope_backed_documents() {
@@ -3254,7 +3295,10 @@ fn large_piece_table_non_utf8_save_is_rejected_before_write() {
             && failed_encoding == encoding
             && max_bytes == MAX_ROPE_EDIT_FILE_BYTES
     ));
-    assert!(!dst.exists(), "rejected save must not write a partial destination");
+    assert!(
+        !dst.exists(),
+        "rejected save must not write a partial destination"
+    );
     assert_eq!(doc.path(), Some(src.as_path()));
     assert!(doc.is_dirty());
     assert!(doc.has_piece_table());
@@ -3307,7 +3351,10 @@ fn piece_table_save_to_with_encoding_reopens_as_converted_rope_contract() {
 
     assert_eq!(doc.path(), Some(dst.as_path()));
     assert_eq!(doc.encoding(), encoding);
-    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert_eq!(
+        doc.encoding_origin(),
+        DocumentEncodingOrigin::SaveConversion
+    );
     assert!(!doc.is_dirty());
     assert!(!doc.has_piece_table());
     assert!(doc.has_rope());
@@ -3414,7 +3461,10 @@ fn recovered_piece_table_session_preserves_utf8_save_conversion_origin() {
         let mut doc = Document::open(path.clone()).unwrap();
         doc.save_to_with_encoding(&path, DocumentEncoding::utf8())
             .unwrap();
-        assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+        assert_eq!(
+            doc.encoding_origin(),
+            DocumentEncodingOrigin::SaveConversion
+        );
         let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
         doc.flush_session().unwrap();
     }
@@ -3424,7 +3474,10 @@ fn recovered_piece_table_session_preserves_utf8_save_conversion_origin() {
     assert!(recovered.is_dirty());
     assert!(recovered.has_piece_table());
     assert_eq!(recovered.encoding(), DocumentEncoding::utf8());
-    assert_eq!(recovered.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert_eq!(
+        recovered.encoding_origin(),
+        DocumentEncodingOrigin::SaveConversion
+    );
     assert!(!recovered.decoding_had_errors());
     assert!(recovered.text_lossy().starts_with("123abc\ndef\n"));
 
@@ -3915,7 +3968,10 @@ fn partial_piece_table_position_helpers_follow_current_text_after_prefix_edit() 
     let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
 
     assert_eq!(doc.line_len_chars(3), 3);
-    assert_eq!(doc.clamp_position(TextPosition::new(3, 99)), TextPosition::new(3, 3));
+    assert_eq!(
+        doc.clamp_position(TextPosition::new(3, 99)),
+        TextPosition::new(3, 3)
+    );
     assert_eq!(doc.char_index_for_position(TextPosition::new(3, 2)), 15);
     assert_eq!(
         doc.text_units_between(TextPosition::new(3, 1), TextPosition::new(4, 2)),
@@ -3935,7 +3991,9 @@ fn partial_piece_table_position_helpers_follow_current_text_after_prefix_edit() 
 #[test]
 fn partial_piece_table_clamp_position_preserves_scannable_lines_beyond_estimated_display_count() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("partial-piece-table-clamp-scannable-lines.txt");
+    let path = dir
+        .path()
+        .join("partial-piece-table-clamp-scannable-lines.txt");
     std::fs::write(&path, b"a\nb\nc\n").unwrap();
     let storage = FileStorage::open(&path).unwrap();
 
@@ -3963,7 +4021,10 @@ fn partial_piece_table_clamp_position_preserves_scannable_lines_beyond_estimated
     assert_eq!(doc.line_slice(2, 0, 16).text(), "c");
     assert!(doc.line_slice(2, 0, 16).is_exact());
 
-    assert_eq!(doc.clamp_position(TextPosition::new(2, 99)), TextPosition::new(2, 1));
+    assert_eq!(
+        doc.clamp_position(TextPosition::new(2, 99)),
+        TextPosition::new(2, 1)
+    );
 
     let slice = doc.read_text(TextRange::new(TextPosition::new(2, 0), 1));
     assert_eq!(slice.text(), "c");
@@ -3975,7 +4036,10 @@ fn partial_piece_table_position_helpers_do_not_invent_text_units_past_safe_bound
     let dir = tempdir().unwrap();
     let path = dir.path().join("partial-piece-table-position-tail.txt");
     let mut bytes = b"zero\n".to_vec();
-    bytes.extend(std::iter::repeat_n(b'x', PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32)));
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
     std::fs::write(&path, &bytes).unwrap();
     let storage = FileStorage::open(&path).unwrap();
 
@@ -4078,7 +4142,10 @@ fn incomplete_mmap_line_len_chars_does_not_invent_tail_columns() {
     assert_eq!(doc.line_len_chars(0), 4);
     assert_eq!(doc.line_len_chars(1), 0);
     assert_eq!(doc.line_len_chars(99), 0);
-    assert_eq!(doc.clamp_position(TextPosition::new(99, 7)), TextPosition::new(1, 0));
+    assert_eq!(
+        doc.clamp_position(TextPosition::new(99, 7)),
+        TextPosition::new(1, 0)
+    );
 }
 
 #[test]
@@ -4309,7 +4376,9 @@ fn incomplete_mmap_nonempty_range_read_past_eof_is_empty_and_inexact() {
 #[test]
 fn incomplete_mmap_typed_read_uses_exact_start_offset_instead_of_heuristic_line_range() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("incomplete-mmap-typed-read-exact-start.txt");
+    let path = dir
+        .path()
+        .join("incomplete-mmap-typed-read-exact-start.txt");
     std::fs::write(&path, b"zero\none\ntwo\n").unwrap();
     let storage = FileStorage::open(&path).unwrap();
 
@@ -4518,7 +4587,10 @@ fn long_exact_mmap_lines_do_not_cap_typed_columns_or_rewind_search_start() {
         doc.clamp_position(TextPosition::new(0, line_len)),
         TextPosition::new(0, line_len)
     );
-    assert_eq!(doc.find_next("target", TextPosition::new(0, line_len)), None);
+    assert_eq!(
+        doc.find_next("target", TextPosition::new(0, line_len)),
+        None
+    );
 }
 
 #[test]
@@ -4541,7 +4613,10 @@ fn long_piece_table_lines_do_not_cap_typed_columns_or_rewind_search_start() {
         doc.clamp_position(TextPosition::new(0, line_len)),
         TextPosition::new(0, line_len)
     );
-    assert_eq!(doc.find_next("target", TextPosition::new(0, line_len)), None);
+    assert_eq!(
+        doc.find_next("target", TextPosition::new(0, line_len)),
+        None
+    );
 }
 
 #[test]
@@ -4839,7 +4914,9 @@ fn selection_replace_promotes_partial_piece_table_before_clamping_unresolved_hea
 #[test]
 fn selection_edit_capability_requires_promotion_for_unresolved_partial_piece_table_head() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("selection-capability-partial-piece-table.txt");
+    let path = dir
+        .path()
+        .join("selection-capability-partial-piece-table.txt");
     let mut bytes = b"zero\n".to_vec();
     bytes.extend(std::iter::repeat_n(
         b'x',
@@ -4953,7 +5030,10 @@ fn document_status_reports_frontend_snapshot() {
     assert_eq!(status.display_line_count(), 2);
     assert!(status.is_line_count_exact());
     assert_eq!(status.line_ending(), LineEnding::Lf);
-    assert_eq!(status.encoding_origin(), DocumentEncodingOrigin::NewDocument);
+    assert_eq!(
+        status.encoding_origin(),
+        DocumentEncodingOrigin::NewDocument
+    );
     assert!(status.can_preserve_save());
     assert_eq!(status.preserve_save_error(), None);
     assert!(status.has_edit_buffer());
@@ -5036,10 +5116,7 @@ fn lossy_document_save_conversion_preflight_allows_utf8_salvage() {
 
     let doc = Document::open_with_encoding(path, shift_jis).unwrap();
 
-    assert_eq!(
-        doc.save_error_for_encoding(DocumentEncoding::utf8()),
-        None
-    );
+    assert_eq!(doc.save_error_for_encoding(DocumentEncoding::utf8()), None);
     assert!(doc.can_save_with_encoding(DocumentEncoding::utf8()));
     assert_eq!(
         doc.save_error_for_encoding(shift_jis),
@@ -5053,7 +5130,8 @@ fn preserve_save_preflight_reports_unrepresentable_legacy_edits() {
     let path = dir.path().join("legacy-cp1251-preflight.txt");
     let saved = dir.path().join("legacy-cp1251-preflight-saved.txt");
     let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
-    let (bytes, used, had_errors) = WINDOWS_1251.encode("\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}\n");
+    let (bytes, used, had_errors) =
+        WINDOWS_1251.encode("\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}\n");
     assert_eq!(used, WINDOWS_1251);
     assert!(!had_errors);
     std::fs::write(&path, bytes.as_ref()).unwrap();

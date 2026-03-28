@@ -248,9 +248,10 @@ impl Document {
                     ),
                 }
             }
-            OpenEncodingPolicy::Reinterpret(encoding) => {
-                (Some(encoding), DocumentEncodingOrigin::ExplicitReinterpretation)
-            }
+            OpenEncodingPolicy::Reinterpret(encoding) => (
+                Some(encoding),
+                DocumentEncodingOrigin::ExplicitReinterpretation,
+            ),
         };
         let doc = if let Some(encoding) = encoding {
             Self::from_storage_with_encoding(
@@ -262,13 +263,7 @@ impl Document {
                 phase,
             )?
         } else {
-            Self::from_storage_with_progress(
-                path,
-                storage,
-                encoding_origin,
-                &mut tracker,
-                phase,
-            )
+            Self::from_storage_with_progress(path, storage, encoding_origin, &mut tracker, phase)
         };
         phase(OpenProgressPhase::Ready);
         tracker.complete();
@@ -309,7 +304,11 @@ impl Document {
         })?;
 
         if encoding.is_utf8() {
-            return Ok(Self::from_storage_with_origin(path, storage, encoding_origin));
+            return Ok(Self::from_storage_with_origin(
+                path,
+                storage,
+                encoding_origin,
+            ));
         }
 
         let total_bytes = storage.len() as u64;

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.1
+
+### Changed
+
+- Tightened the session/save contract around `set_path()` and explicit clean
+  saves so sync/async save paths no longer silently no-op when callers have
+  changed the destination path or when the live file has diverged from the
+  current clean backing.
+- Expanded CI coverage into a clearer cross-platform matrix for Windows, Linux,
+  and macOS, plus a dedicated Linux stress job for the heaviest
+  recovery/save/history property tests.
+
+### Fixed
+
+- Hardened same-path async save discard recovery so piece-table sessions keep
+  their dirty state, immediate recoverability, and undo/redo history even when
+  older history roots reference pre-save `Add` text that no longer exists in
+  the current saved snapshot.
+- Fixed multiple quiet lifecycle mismatches in the editor/session layer,
+  including deferred clean-mark handling after open, truthful sync/async
+  save-in-progress guards, and same-path clean-save semantics.
+- Eliminated a wide set of partial `piece_table` and incomplete `mmap`
+  exactness/position/search/read bugs that could previously return stale text,
+  phantom rows, incorrect boundary matches, or misleading `is_exact` flags.
+- Added deeper regression coverage for discarded background jobs, recovery
+  survival after reopen failures, clean-save path overrides, long-line
+  edge cases, and partial/inexact read/search invariants.
+
 ## 0.6.0
 
 ### Added

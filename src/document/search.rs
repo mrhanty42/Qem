@@ -140,7 +140,9 @@ fn scanned_piece_table_byte_offset_for_position(
     position: TextPosition,
 ) -> Option<usize> {
     if piece_table.full_index() || position.line0() < piece_table.line_count() {
-        let actual_col0 = position.col0().min(piece_table.line_len_chars(position.line0()));
+        let actual_col0 = position
+            .col0()
+            .min(piece_table.line_len_chars(position.line0()));
         return Some(piece_table.byte_offset_for_col(position.line0(), actual_col0));
     }
 
@@ -166,13 +168,11 @@ fn scanned_piece_table_byte_offset_for_position(
     }
 
     let range = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
-    Some(
-        scan_start.saturating_add(byte_offset_for_text_col_in_bytes(
-            &bytes,
-            range.range,
-            position.col0(),
-        )),
-    )
+    Some(scan_start.saturating_add(byte_offset_for_text_col_in_bytes(
+        &bytes,
+        range.range,
+        position.col0(),
+    )))
 }
 
 fn line_offsets_anchor_for_line(offsets: &LineOffsets, line0: usize) -> (usize, usize) {
@@ -363,7 +363,10 @@ impl Iterator for LiteralSearchIter<'_> {
                 self.finished = true;
                 return None;
             }
-            let Some(rel) = query.finder.find(&buffered.bytes[buffered.next_rel_offset..]) else {
+            let Some(rel) = query
+                .finder
+                .find(&buffered.bytes[buffered.next_rel_offset..])
+            else {
                 self.finished = true;
                 return None;
             };
@@ -828,8 +831,8 @@ impl Document {
 
         if let Some(piece_table) = &self.piece_table {
             let start_offset = piece_table.byte_offset_for_col(start.line0(), start.col0());
-            let start_offset =
-                scanned_piece_table_byte_offset_for_position(piece_table, start).unwrap_or(start_offset);
+            let start_offset = scanned_piece_table_byte_offset_for_position(piece_table, start)
+                .unwrap_or(start_offset);
             let end_offset =
                 piece_table.advance_offset_by_text_units(start_offset, range.len_chars());
             let end = piece_table.position_for_byte_offset_from(start_offset, start, end_offset);
@@ -1254,7 +1257,9 @@ impl Document {
         }
         if let Some(piece_table) = &self.piece_table {
             return scanned_piece_table_byte_offset_for_position(piece_table, position)
-                .unwrap_or_else(|| piece_table.byte_offset_for_col(position.line0(), position.col0()));
+                .unwrap_or_else(|| {
+                    piece_table.byte_offset_for_col(position.line0(), position.col0())
+                });
         }
         self.mmap_byte_offset_for_position(position)
     }

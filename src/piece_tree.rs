@@ -1278,7 +1278,10 @@ impl DiskPageStore {
             } else {
                 0
             }),
-            encoding_origin: meta.encoding_origin.map(encode_encoding_origin).unwrap_or(0),
+            encoding_origin: meta
+                .encoding_origin
+                .map(encode_encoding_origin)
+                .unwrap_or(0),
         };
         // Durability protocol:
         // 1. append all newly reachable pages first

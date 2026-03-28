@@ -73,7 +73,8 @@ impl Document {
             return true;
         }
 
-        let Some(scanned) = Self::scanned_piece_table_line_range(piece_table, position.line0()) else {
+        let Some(scanned) = Self::scanned_piece_table_line_range(piece_table, position.line0())
+        else {
             return false;
         };
         let bytes = piece_table.read_range(scanned.range.0, scanned.range.1);
@@ -158,11 +159,7 @@ impl Document {
     ) -> Option<(usize, bool)> {
         let scanned = Self::scanned_piece_table_line_range(piece_table, position.line0())?;
         let bytes = piece_table.read_range(scanned.range.0, scanned.range.1);
-        let offset = byte_offset_for_text_col_in_bytes(
-            &bytes,
-            (0, bytes.len()),
-            position.col0(),
-        );
+        let offset = byte_offset_for_text_col_in_bytes(&bytes, (0, bytes.len()), position.col0());
         Some((
             scanned.range.0.saturating_add(offset),
             Self::piece_table_position_is_representable(piece_table, position),
@@ -244,7 +241,10 @@ impl Document {
             let bytes = self.mmap_bytes();
             let file_len = self.file_len.min(bytes.len());
             let eof_position = self.mmap_position_for_byte_offset(file_len);
-            if self.mmap_line_start_offset_exact(position.line0()).is_some() {
+            if self
+                .mmap_line_start_offset_exact(position.line0())
+                .is_some()
+            {
                 position.line0()
             } else {
                 eof_position.line0()
@@ -337,7 +337,9 @@ impl Document {
         let file_len = self.file_len.min(bytes.len());
         let start_offset = self.mmap_byte_offset_for_position(start).min(file_len);
         let end_offset = self.mmap_byte_offset_for_position(end).min(file_len);
-        count_text_units_in_bytes(&bytes[start_offset.min(end_offset)..end_offset.max(start_offset)])
+        count_text_units_in_bytes(
+            &bytes[start_offset.min(end_offset)..end_offset.max(start_offset)],
+        )
     }
 
     /// Builds a typed edit range between two positions.

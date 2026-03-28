@@ -68,7 +68,10 @@ fn mmap_line_visible_bytes(
     &line_bytes[start..end]
 }
 
-fn trimmed_line_byte_range(bytes: &[u8], line_range: Option<(usize, usize)>) -> Option<(usize, usize)> {
+fn trimmed_line_byte_range(
+    bytes: &[u8],
+    line_range: Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
     let (start0, mut end0) = line_range?;
     if end0 > bytes.len() {
         end0 = bytes.len();
@@ -208,8 +211,13 @@ fn scanned_piece_table_offset_for_position(
     position: TextPosition,
 ) -> Option<(usize, bool)> {
     if piece_table.full_index() || position.line0() < piece_table.line_count() {
-        let actual_col0 = position.col0().min(piece_table.line_len_chars(position.line0()));
-        return Some((piece_table.byte_offset_for_col(position.line0(), actual_col0), true));
+        let actual_col0 = position
+            .col0()
+            .min(piece_table.line_len_chars(position.line0()));
+        return Some((
+            piece_table.byte_offset_for_col(position.line0(), actual_col0),
+            true,
+        ));
     }
 
     let scan_start = piece_table.known_byte_len.min(piece_table.total_len());
@@ -497,7 +505,10 @@ impl Document {
             return piece_table.line_slices_exact(first_line0, line_count, start_col, max_cols);
         }
 
-        let exact_available = piece_table.line_count().saturating_sub(first_line0).min(line_count);
+        let exact_available = piece_table
+            .line_count()
+            .saturating_sub(first_line0)
+            .min(line_count);
         let mut slices = if exact_available > 0 {
             piece_table.line_slices_exact(first_line0, exact_available, start_col, max_cols)
         } else {
@@ -546,8 +557,7 @@ impl Document {
         let mut rel_start = 0usize;
         let mut skip_lines = first_line0.saturating_sub(piece_table.line_count());
         while skip_lines > 0 {
-            let scanned =
-                next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+            let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
             if scanned.range.1 <= rel_start {
                 return None;
             }
@@ -930,7 +940,8 @@ impl Document {
             })
             .unwrap_or(true);
         let slice = self.read_text(self.text_range_for_selection(selection));
-        if !piece_table_endpoints_exact || self.selection_requires_piece_table_promotion(selection) {
+        if !piece_table_endpoints_exact || self.selection_requires_piece_table_promotion(selection)
+        {
             return TextSlice::new(slice.into_text(), false);
         }
         slice

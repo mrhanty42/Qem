@@ -406,9 +406,7 @@ impl Document {
         encoded_len: usize,
     ) -> Option<DocumentEncodingErrorKind> {
         let reload_after_save = !self.has_edit_buffer() || self.has_piece_table();
-        (reload_after_save
-            && !encoding.is_utf8()
-            && encoded_len > MAX_ROPE_EDIT_FILE_BYTES)
+        (reload_after_save && !encoding.is_utf8() && encoded_len > MAX_ROPE_EDIT_FILE_BYTES)
             .then_some(DocumentEncodingErrorKind::SaveReopenTooLarge {
                 max_bytes: MAX_ROPE_EDIT_FILE_BYTES,
             })

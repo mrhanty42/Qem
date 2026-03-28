@@ -143,7 +143,11 @@ fn saved_source_spans(snapshot_pieces: &[Piece]) -> Vec<SavedSourceSpan> {
     spans
 }
 
-fn next_saved_source_start(spans: &[SavedSourceSpan], src: PieceSource, after: usize) -> Option<usize> {
+fn next_saved_source_start(
+    spans: &[SavedSourceSpan],
+    src: PieceSource,
+    after: usize,
+) -> Option<usize> {
     spans
         .iter()
         .filter(|span| span.src == src && span.src_start > after)
@@ -364,22 +368,27 @@ impl Document {
         let add_bytes = piece_table.add.clone();
         let mut rebased_add = add_bytes.clone();
         let session_meta = piece_table.session_meta();
-        let remap_result = piece_table.pieces.rebuild_history_roots_disk(path, |piece| {
-            remap_discarded_history_piece(
-                piece,
-                &spans,
-                saved_bytes,
-                &old_original,
-                &add_bytes,
-                &mut rebased_add,
-            )
-        });
+        let remap_result = piece_table
+            .pieces
+            .rebuild_history_roots_disk(path, |piece| {
+                remap_discarded_history_piece(
+                    piece,
+                    &spans,
+                    saved_bytes,
+                    &old_original,
+                    &add_bytes,
+                    &mut rebased_add,
+                )
+            });
         let Ok(mut rebuilt_pieces) = remap_result else {
             piece_table.pieces.detach_persistence();
             clear_session_sidecar(path);
             return;
         };
-        if rebuilt_pieces.flush_session(&rebased_add, session_meta).is_err() {
+        if rebuilt_pieces
+            .flush_session(&rebased_add, session_meta)
+            .is_err()
+        {
             piece_table.pieces.detach_persistence();
             clear_session_sidecar(path);
             return;
@@ -603,9 +612,7 @@ impl Document {
         };
 
         let reload_after_save = !self.has_edit_buffer() || self.has_piece_table();
-        if reload_after_save
-            && !encoding.is_utf8()
-            && total_bytes > MAX_ROPE_EDIT_FILE_BYTES as u64
+        if reload_after_save && !encoding.is_utf8() && total_bytes > MAX_ROPE_EDIT_FILE_BYTES as u64
         {
             return Err(save_encoding_error(
                 path,
@@ -659,15 +666,16 @@ impl Document {
             .and_then(|old_path| std::fs::read(editlog_path(old_path)).ok());
         clear_session_sidecar(&path);
         let reopen_path = path.clone();
-        let reopened = match Self::reopen_with_encoding_contract(reopen_path, encoding, encoding_origin) {
-            Ok(doc) => doc,
-            Err(err) => {
-                if let Some(sidecar_bytes) = same_path_sidecar_backup {
-                    let _ = std::fs::write(editlog_path(&path), sidecar_bytes);
+        let reopened =
+            match Self::reopen_with_encoding_contract(reopen_path, encoding, encoding_origin) {
+                Ok(doc) => doc,
+                Err(err) => {
+                    if let Some(sidecar_bytes) = same_path_sidecar_backup {
+                        let _ = std::fs::write(editlog_path(&path), sidecar_bytes);
+                    }
+                    return Err(err);
                 }
-                return Err(err);
-            }
-        };
+            };
         if let Some(old_path) = previous_path.as_deref() {
             if old_path != path.as_path() {
                 clear_session_sidecar(old_path);

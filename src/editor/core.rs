@@ -509,8 +509,10 @@ impl SessionCore {
                 source: io::Error::other("cannot save while load is in progress"),
             });
         }
-        if matches!(options.encoding_policy(), crate::SaveEncodingPolicy::Preserve)
-            && self.doc.can_skip_clean_preserve_save_to_path(&path)
+        if matches!(
+            options.encoding_policy(),
+            crate::SaveEncodingPolicy::Preserve
+        ) && self.doc.can_skip_clean_preserve_save_to_path(&path)
         {
             return Ok(());
         }

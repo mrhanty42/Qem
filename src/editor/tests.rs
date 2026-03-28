@@ -145,7 +145,9 @@ fn session_open_file_with_encoding_gb18030_round_trips_default_save() {
     fs::write(&path, bytes.as_ref()).unwrap();
 
     let mut session = DocumentSession::new();
-    session.open_file_with_encoding(path.clone(), encoding).unwrap();
+    session
+        .open_file_with_encoding(path.clone(), encoding)
+        .unwrap();
 
     assert_eq!(session.encoding(), encoding);
     assert_eq!(
@@ -193,7 +195,10 @@ fn session_open_file_with_auto_detection_handles_utf16le_bom() {
         .unwrap();
 
     assert_eq!(session.encoding(), DocumentEncoding::utf16le());
-    assert_eq!(session.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
+    assert_eq!(
+        session.encoding_origin(),
+        DocumentEncodingOrigin::AutoDetected
+    );
     assert_eq!(session.text(), "hello\n");
 
     let _ = fs::remove_file(&path);
@@ -252,7 +257,9 @@ fn session_save_as_with_encoding_surfaces_typed_unrepresentable_error() {
         .try_insert(TextPosition::new(0, 0), "emoji \u{1F642}\n")
         .unwrap();
 
-    let err = session.save_as_with_encoding(path.clone(), encoding).unwrap_err();
+    let err = session
+        .save_as_with_encoding(path.clone(), encoding)
+        .unwrap_err();
     assert!(matches!(
         err,
         DocumentError::Encoding {
@@ -268,10 +275,8 @@ fn session_save_as_with_encoding_surfaces_typed_unrepresentable_error() {
 
 #[test]
 fn session_preserve_save_rejects_lossy_shift_jis_source() {
-    let dir = std::env::temp_dir().join(format!(
-        "qem-editor-lossy-shift-jis-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("qem-editor-lossy-shift-jis-{}", std::process::id()));
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("lossy-shift-jis.txt");
     let saved = dir.join("lossy-shift-jis-saved.txt");
@@ -282,7 +287,9 @@ fn session_preserve_save_rejects_lossy_shift_jis_source() {
     fs::write(&path, invalid_bytes).unwrap();
 
     let mut session = DocumentSession::new();
-    session.open_file_with_encoding(path.clone(), encoding).unwrap();
+    session
+        .open_file_with_encoding(path.clone(), encoding)
+        .unwrap();
 
     assert!(session.decoding_had_errors());
     assert_eq!(session.text(), "\u{FFFD}");
@@ -394,7 +401,10 @@ fn session_save_as_async_same_path_utf8_convert_sanitizes_clean_invalid_utf8() {
     }
 
     assert_eq!(session.encoding(), DocumentEncoding::utf8());
-    assert_eq!(session.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert_eq!(
+        session.encoding_origin(),
+        DocumentEncodingOrigin::SaveConversion
+    );
     assert!(!session.decoding_had_errors());
     assert_eq!(fs::read_to_string(&path).unwrap(), "fo\u{FFFD}o\n");
 
@@ -437,13 +447,19 @@ fn tab_save_as_async_same_path_utf8_convert_sanitizes_clean_invalid_utf8() {
     }
 
     assert_eq!(tab.encoding(), DocumentEncoding::utf8());
-    assert_eq!(tab.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert_eq!(
+        tab.encoding_origin(),
+        DocumentEncodingOrigin::SaveConversion
+    );
     assert!(!tab.decoding_had_errors());
     assert_eq!(fs::read_to_string(&path).unwrap(), "fo\u{FFFD}o\n");
 
     let status = tab.status();
     assert_eq!(status.encoding(), DocumentEncoding::utf8());
-    assert_eq!(status.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert_eq!(
+        status.encoding_origin(),
+        DocumentEncodingOrigin::SaveConversion
+    );
     assert!(!status.decoding_had_errors());
 
     let _ = fs::remove_file(&path);
@@ -457,7 +473,10 @@ fn session_and_tab_save_conversion_preflight_reports_success_and_failures() {
     let mut session = DocumentSession::new();
     let _ = session
         .document_mut()
-        .try_insert(TextPosition::new(0, 0), "\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}\n")
+        .try_insert(
+            TextPosition::new(0, 0),
+            "\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}\n",
+        )
         .unwrap();
     assert_eq!(session.save_error_for_encoding(cp1251), None);
     assert!(session.can_save_with_encoding(cp1251));
@@ -532,13 +551,16 @@ fn session_preserve_save_preflight_reports_unrepresentable_legacy_edits() {
     let path = dir.join("legacy-cp1251.txt");
     let saved = dir.join("legacy-cp1251-saved.txt");
     let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
-    let (bytes, used, had_errors) = WINDOWS_1251.encode("\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}\n");
+    let (bytes, used, had_errors) =
+        WINDOWS_1251.encode("\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}\n");
     assert_eq!(used, WINDOWS_1251);
     assert!(!had_errors);
     fs::write(&path, bytes.as_ref()).unwrap();
 
     let mut session = DocumentSession::new();
-    session.open_file_with_encoding(path.clone(), encoding).unwrap();
+    session
+        .open_file_with_encoding(path.clone(), encoding)
+        .unwrap();
     let _ = session
         .try_insert(TextPosition::new(0, 0), "emoji \u{1F642}\n")
         .unwrap();
@@ -586,7 +608,9 @@ fn session_save_async_rejects_invalid_preserve_without_starting_job() {
     fs::write(&path, [0x82]).unwrap();
 
     let mut session = DocumentSession::new();
-    session.open_file_with_encoding(path.clone(), encoding).unwrap();
+    session
+        .open_file_with_encoding(path.clone(), encoding)
+        .unwrap();
     let _ = session.try_insert(TextPosition::new(0, 0), "x").unwrap();
 
     let err = session.save_async().unwrap_err();
@@ -602,7 +626,10 @@ fn session_save_async_rejects_invalid_preserve_without_starting_job() {
     assert!(!session.is_saving());
     assert!(session.save_state().is_none());
     assert!(session.background_issue().is_none());
-    assert!(matches!(session.background_activity(), BackgroundActivity::Idle));
+    assert!(matches!(
+        session.background_activity(),
+        BackgroundActivity::Idle
+    ));
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
@@ -646,7 +673,10 @@ fn tab_open_file_async_with_auto_detection_and_fallback_prefers_detected_bom() {
 
     let status = tab.status();
     assert_eq!(status.encoding(), DocumentEncoding::utf16le());
-    assert_eq!(status.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
+    assert_eq!(
+        status.encoding_origin(),
+        DocumentEncodingOrigin::AutoDetected
+    );
     assert!(!status.decoding_had_errors());
     assert_eq!(status.document().encoding(), DocumentEncoding::utf16le());
     assert!(!tab.can_preserve_save());
@@ -705,7 +735,10 @@ fn tab_open_file_async_with_auto_detection_handles_utf16be_bom() {
 
     let status = tab.status();
     assert_eq!(status.encoding(), DocumentEncoding::utf16be());
-    assert_eq!(status.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
+    assert_eq!(
+        status.encoding_origin(),
+        DocumentEncodingOrigin::AutoDetected
+    );
     assert!(!status.decoding_had_errors());
     assert_eq!(
         status.preserve_save_error(),
@@ -732,7 +765,9 @@ fn tab_save_as_async_with_encoding_rejects_unrepresentable_conversion_without_st
         .try_insert(TextPosition::new(0, 0), "emoji \u{1F642}\n")
         .unwrap();
 
-    let err = tab.save_as_async_with_encoding(path.clone(), encoding).unwrap_err();
+    let err = tab
+        .save_as_async_with_encoding(path.clone(), encoding)
+        .unwrap_err();
     assert!(matches!(
         err,
         DocumentError::Encoding {
@@ -745,7 +780,10 @@ fn tab_save_as_async_with_encoding_rejects_unrepresentable_conversion_without_st
     assert!(!tab.is_saving());
     assert!(tab.save_state().is_none());
     assert!(tab.background_issue().is_none());
-    assert!(matches!(tab.background_activity(), BackgroundActivity::Idle));
+    assert!(matches!(
+        tab.background_activity(),
+        BackgroundActivity::Idle
+    ));
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1270,7 +1308,10 @@ fn session_sync_save_rejects_when_async_save_is_in_progress() {
             result.unwrap();
             break;
         }
-        assert!(Instant::now() < deadline, "session async save guard timed out");
+        assert!(
+            Instant::now() < deadline,
+            "session async save guard timed out"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 
@@ -1310,10 +1351,8 @@ fn session_sync_save_as_same_path_preserve_is_clean_noop() {
 
 #[test]
 fn tab_sync_save_as_rejects_when_async_save_is_in_progress() {
-    let dir = std::env::temp_dir().join(format!(
-        "qem-tab-sync-save-as-guard-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("qem-tab-sync-save-as-guard-{}", std::process::id()));
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("source.txt");
     let output_a = dir.join("a.txt");
