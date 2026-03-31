@@ -1,5 +1,6 @@
 use super::lifecycle::OpenProgressPhase;
 use super::*;
+use crate::index::DiskLineIndex;
 use encoding_rs::{GB18030, SHIFT_JIS, WINDOWS_1251};
 use proptest::prelude::*;
 use std::io::Write;
@@ -711,6 +712,53 @@ fn insert_fully_indexes_medium_unindexed_piece_table_documents() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn partial_piece_table_can_report_exact_total_lines_without_precise_line_lengths() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("partial-piece-table-exact-total-lines.txt");
+    std::fs::write(&path, b"zero\none\ntwo\nthree").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: std::fs::metadata(&path).unwrap().len() as usize,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new_with_encoding_state(
+            storage,
+            vec![5, 4],
+            false,
+            Some(4),
+            DocumentEncodingOrigin::Utf8FastPath,
+            false,
+        )),
+        dirty: false,
+    };
+
+    assert_eq!(doc.exact_line_count(), Some(4));
+    assert!(doc.is_line_count_exact());
+    assert!(!doc.has_precise_line_lengths());
+
+    let cursor = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    assert_eq!(cursor, (1, 0));
+    assert_eq!(doc.exact_line_count(), Some(5));
+    assert_eq!(doc.display_line_count(), 5);
+    assert!(doc.is_line_count_exact());
+    assert!(!doc.has_precise_line_lengths());
 }
 
 #[test]
@@ -3771,6 +3819,8 @@ fn try_insert_rejects_large_piece_table_promotion_to_rope() {
                 line_breaks: 0,
             }]),
             known_line_count: 1,
+            exact_base_line_breaks: None,
+            exact_base_total_lines: None,
             known_byte_len: 1,
             total_len: MAX_ROPE_EDIT_FILE_BYTES + 1,
             full_index: false,
@@ -5040,6 +5090,83 @@ fn document_status_reports_frontend_snapshot() {
     assert!(status.has_rope());
     assert!(!status.has_piece_table());
     assert!(!status.is_indexing());
+    assert!(!status.is_line_count_pending());
+}
+
+#[test]
+fn document_status_reports_pending_exact_line_count() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pending-line-count.txt");
+    std::fs::write(&path, b"alpha\nbeta").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path),
+        storage: Some(storage),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: Some(DiskLineIndex::building_for_tests()),
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: 10,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: None,
+        dirty: false,
+    };
+
+    assert!(doc.is_line_count_pending());
+    assert_eq!(doc.exact_line_count(), None);
+
+    let status = doc.status();
+    assert!(status.is_line_count_pending());
+    assert!(!status.is_line_count_exact());
+}
+
+#[test]
+fn wait_for_exact_line_count_observes_background_disk_index_completion() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wait-line-count.txt");
+    std::fs::write(&path, b"alpha\nbeta").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+    let disk_index = DiskLineIndex::building_for_tests();
+    let background_index = disk_index.clone();
+
+    let doc = Document {
+        path: Some(path),
+        storage: Some(storage),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: Some(disk_index),
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: 10,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: None,
+        dirty: false,
+    };
+
+    let worker = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        background_index.finish_build_for_tests(2);
+    });
+
+    assert_eq!(
+        doc.wait_for_exact_line_count(std::time::Duration::from_secs(1)),
+        Some(2)
+    );
+    worker.join().unwrap();
 }
 
 #[test]
@@ -5324,6 +5451,8 @@ fn edit_capability_reports_partial_piece_table_promotion_limits() {
                 line_breaks: 0,
             }]),
             known_line_count: 1,
+            exact_base_line_breaks: None,
+            exact_base_total_lines: None,
             known_byte_len: 1,
             total_len: MAX_ROPE_EDIT_FILE_BYTES + 1,
             full_index: false,

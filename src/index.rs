@@ -20,6 +20,7 @@ const INDEX_PAGE_HEADER_BYTES: usize = 16;
 const INDEX_ENTRY_BYTES: usize = 24;
 const INDEX_CACHE_PAGES: usize = 32;
 const INDEX_BUILD_MIN_FILE_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+const INDEX_SYNC_BUILD_MAX_SCAN_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 const INDEX_CHECKPOINT_STRIDE_LINES: u64 = 8_192;
 const INDEX_CHECKPOINT_STRIDE_BYTES: u64 = 1_048_576; // 1 MiB
 
@@ -97,6 +98,14 @@ struct IndexMetadata {
     source_fingerprint: u64,
 }
 
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct FileAllocatedRangeBuffer {
+    file_offset: i64,
+    length: i64,
+}
+
 impl DiskLineIndex {
     pub(crate) fn open_or_build(path: &Path, storage: &FileStorage) -> Option<Self> {
         if storage.len() < INDEX_BUILD_MIN_FILE_BYTES {
@@ -121,6 +130,14 @@ impl DiskLineIndex {
             .map(|state| matches!(&*state, DiskLineIndexState::Ready(_)))
             .unwrap_or(false);
         if already_ready {
+            return Some(this);
+        }
+
+        if should_build_index_synchronously(path, storage.len()) {
+            let ready = build_or_open_index(path, storage, metadata).ok()?;
+            if let Ok(mut guard) = this.state.write() {
+                *guard = DiskLineIndexState::Ready(Arc::new(ready));
+            }
             return Some(this);
         }
 
@@ -154,11 +171,43 @@ impl DiskLineIndex {
         usize::try_from(ready.total_lines).ok()
     }
 
+    pub(crate) fn is_building(&self) -> bool {
+        self.state
+            .read()
+            .ok()
+            .map(|state| matches!(&*state, DiskLineIndexState::Building))
+            .unwrap_or(false)
+    }
+
     fn ready(&self) -> Option<Arc<ReadyDiskLineIndex>> {
         let state = self.state.read().ok()?;
         match &*state {
             DiskLineIndexState::Ready(ready) => Some(Arc::clone(ready)),
             DiskLineIndexState::Building | DiskLineIndexState::Failed => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn building_for_tests() -> Self {
+        Self {
+            state: Arc::new(RwLock::new(DiskLineIndexState::Building)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_build_for_tests(&self, total_lines: usize) {
+        let Ok(total_lines) = u64::try_from(total_lines) else {
+            return;
+        };
+        let ready = ReadyDiskLineIndex {
+            path: PathBuf::new(),
+            total_lines,
+            root_page: 0,
+            page_count: 0,
+            cache: Mutex::new(PageCache::default()),
+        };
+        if let Ok(mut guard) = self.state.write() {
+            *guard = DiskLineIndexState::Ready(Arc::new(ready));
         }
     }
 }
@@ -318,17 +367,23 @@ fn build_or_open_index(
         return Ok(ready);
     }
 
-    build_index_file(&sidecar, storage, metadata)?;
+    build_index_file(source_path, &sidecar, storage, metadata)?;
     ReadyDiskLineIndex::open_existing(&sidecar, metadata)
 }
 
-fn build_index_file(path: &Path, storage: &FileStorage, metadata: IndexMetadata) -> io::Result<()> {
+fn build_index_file(
+    source_path: &Path,
+    path: &Path,
+    storage: &FileStorage,
+    metadata: IndexMetadata,
+) -> io::Result<()> {
     FileStorage::replace_with(path, |file| {
         file.write_all(&[0u8; INDEX_HEADER_BYTES])?;
 
         let page_capacity =
             ((INDEX_PAGE_SIZE - INDEX_PAGE_HEADER_BYTES) / INDEX_ENTRY_BYTES).max(1);
         let bytes = storage.bytes();
+        let ranges = scannable_ranges(source_path, bytes.len());
         let mut page_count = 0u64;
         let mut leaf_entries = Vec::with_capacity(page_capacity);
         let mut summaries = Vec::new();
@@ -342,35 +397,40 @@ fn build_index_file(path: &Path, storage: &FileStorage, metadata: IndexMetadata)
             child_page: 0,
         });
 
-        for pos in memchr2_iter(b'\n', b'\r', bytes) {
-            if bytes[pos] == b'\r' && pos + 1 < bytes.len() && bytes[pos + 1] == b'\n' {
-                continue;
-            }
+        for (start, end) in ranges {
+            let start = start.min(bytes.len());
+            let end = end.min(bytes.len()).max(start);
+            for rel in memchr2_iter(b'\n', b'\r', &bytes[start..end]) {
+                let pos = start + rel;
+                if bytes[pos] == b'\r' && pos + 1 < bytes.len() && bytes[pos + 1] == b'\n' {
+                    continue;
+                }
 
-            let line_start = (pos + 1) as u64;
-            let line0 = total_lines;
-            total_lines = total_lines.saturating_add(1);
-            if line0 < next_line_checkpoint && line_start < next_byte_checkpoint {
-                continue;
-            }
+                let line_start = (pos + 1) as u64;
+                let line0 = total_lines;
+                total_lines = total_lines.saturating_add(1);
+                if line0 < next_line_checkpoint && line_start < next_byte_checkpoint {
+                    continue;
+                }
 
-            leaf_entries.push(PageEntry {
-                line0,
-                byte0: line_start,
-                child_page: 0,
-            });
-            next_line_checkpoint = line0.saturating_add(INDEX_CHECKPOINT_STRIDE_LINES);
-            next_byte_checkpoint = line_start.saturating_add(INDEX_CHECKPOINT_STRIDE_BYTES);
-
-            if leaf_entries.len() >= page_capacity {
-                let page_id = write_page(file, PageKind::Leaf, &leaf_entries, &mut page_count)?;
-                let first = leaf_entries[0];
-                summaries.push(PageEntry {
-                    line0: first.line0,
-                    byte0: first.byte0,
-                    child_page: page_id,
+                leaf_entries.push(PageEntry {
+                    line0,
+                    byte0: line_start,
+                    child_page: 0,
                 });
-                leaf_entries.clear();
+                next_line_checkpoint = line0.saturating_add(INDEX_CHECKPOINT_STRIDE_LINES);
+                next_byte_checkpoint = line_start.saturating_add(INDEX_CHECKPOINT_STRIDE_BYTES);
+
+                if leaf_entries.len() >= page_capacity {
+                    let page_id = write_page(file, PageKind::Leaf, &leaf_entries, &mut page_count)?;
+                    let first = leaf_entries[0];
+                    summaries.push(PageEntry {
+                        line0: first.line0,
+                        byte0: first.byte0,
+                        child_page: page_id,
+                    });
+                    leaf_entries.clear();
+                }
             }
         }
 
@@ -397,6 +457,140 @@ fn build_index_file(path: &Path, storage: &FileStorage, metadata: IndexMetadata)
         file.seek(SeekFrom::Start(0))?;
         write_header(file, header)
     })
+}
+
+fn scannable_ranges(source_path: &Path, file_len: usize) -> Vec<(usize, usize)> {
+    if file_len == 0 {
+        return Vec::new();
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(ranges) = windows_allocated_ranges(source_path, file_len) {
+            return ranges;
+        }
+    }
+
+    vec![(0, file_len)]
+}
+
+fn total_scannable_bytes(ranges: &[(usize, usize)]) -> usize {
+    ranges
+        .iter()
+        .fold(0usize, |acc, (start, end)| acc.saturating_add(end.saturating_sub(*start)))
+}
+
+fn should_build_index_synchronously(source_path: &Path, file_len: usize) -> bool {
+    if file_len == 0 {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(ranges) = windows_allocated_ranges(source_path, file_len) {
+            return total_scannable_bytes(&ranges) <= INDEX_SYNC_BUILD_MAX_SCAN_BYTES;
+        }
+    }
+
+    false
+}
+
+fn merge_contiguous_ranges(mut ranges: Vec<(usize, usize)>, file_len: usize) -> Vec<(usize, usize)> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+
+    ranges.sort_unstable_by_key(|range| range.0);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        let start = start.min(file_len);
+        let end = end.min(file_len).max(start);
+        if start >= end {
+            continue;
+        }
+
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+#[cfg(windows)]
+fn windows_allocated_ranges(source_path: &Path, file_len: usize) -> io::Result<Vec<(usize, usize)>> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+
+    const ERROR_MORE_DATA: i32 = 234;
+    const FSCTL_QUERY_ALLOCATED_RANGES: u32 = 0x0009_40CF;
+
+    unsafe extern "system" {
+        fn DeviceIoControl(
+            device: *mut c_void,
+            io_control_code: u32,
+            in_buffer: *mut c_void,
+            in_buffer_size: u32,
+            out_buffer: *mut c_void,
+            out_buffer_size: u32,
+            bytes_returned: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+    }
+
+    let file = File::open(source_path)?;
+    let handle = file.as_raw_handle().cast::<c_void>();
+    let query = FileAllocatedRangeBuffer {
+        file_offset: 0,
+        length: file_len.min(i64::MAX as usize) as i64,
+    };
+    let entry_size = std::mem::size_of::<FileAllocatedRangeBuffer>();
+    let mut capacity = 64usize;
+
+    loop {
+        let mut output = vec![FileAllocatedRangeBuffer::default(); capacity];
+        let mut returned = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_QUERY_ALLOCATED_RANGES,
+                (&query as *const FileAllocatedRangeBuffer).cast_mut().cast::<c_void>(),
+                entry_size as u32,
+                output.as_mut_ptr().cast::<c_void>(),
+                output
+                    .len()
+                    .saturating_mul(entry_size)
+                    .min(u32::MAX as usize) as u32,
+                &mut returned,
+                ptr::null_mut(),
+            )
+        };
+        if ok != 0 {
+            let count = (returned as usize) / entry_size;
+            output.truncate(count);
+            let ranges = output
+                .into_iter()
+                .filter_map(|range| {
+                    let start = usize::try_from(range.file_offset).ok()?;
+                    let len = usize::try_from(range.length).ok()?;
+                    let end = start.checked_add(len)?;
+                    Some((start, end))
+                })
+                .collect();
+            return Ok(merge_contiguous_ranges(ranges, file_len));
+        }
+
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_MORE_DATA) && capacity < (1 << 20) {
+            capacity = capacity.saturating_mul(2);
+            continue;
+        }
+        return Err(err);
+    }
 }
 
 fn build_internal_levels(
@@ -568,7 +762,8 @@ fn source_metadata(path: &Path, bytes: &[u8]) -> io::Result<IndexMetadata> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_index_file, build_or_open_index, sidecar_path, source_metadata, FileHeader,
+        build_index_file, build_or_open_index, merge_contiguous_ranges, sidecar_path,
+        source_metadata, FileHeader,
         ReadyDiskLineIndex,
     };
     use crate::storage::FileStorage;
@@ -586,7 +781,7 @@ mod tests {
         let storage = FileStorage::open(&path).unwrap();
         let metadata = source_metadata(&path, storage.bytes()).unwrap();
         let sidecar = sidecar_path(&path);
-        build_index_file(&sidecar, &storage, metadata).unwrap();
+        build_index_file(&path, &sidecar, &storage, metadata).unwrap();
         let ready = ReadyDiskLineIndex::open_existing(&sidecar, metadata).unwrap();
 
         assert_eq!(ready.total_lines, 20_001);
@@ -647,7 +842,7 @@ mod tests {
         let storage = FileStorage::open(&path).unwrap();
         let metadata = source_metadata(&path, storage.bytes()).unwrap();
         let sidecar = sidecar_path(&path);
-        build_index_file(&sidecar, &storage, metadata).unwrap();
+        build_index_file(&path, &sidecar, &storage, metadata).unwrap();
 
         let stale = super::IndexMetadata {
             source_len: metadata.source_len,
@@ -674,7 +869,7 @@ mod tests {
         let storage = FileStorage::open(&path).unwrap();
         let metadata = source_metadata(&path, storage.bytes()).unwrap();
         let sidecar = sidecar_path(&path);
-        build_index_file(&sidecar, &storage, metadata).unwrap();
+        build_index_file(&path, &sidecar, &storage, metadata).unwrap();
 
         {
             let mut file = fs::OpenOptions::new().write(true).open(&sidecar).unwrap();
@@ -699,5 +894,13 @@ mod tests {
         let _ = fs::remove_file(&sidecar);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_contiguous_ranges_coalesces_touching_extents() {
+        assert_eq!(
+            merge_contiguous_ranges(vec![(32, 48), (0, 16), (16, 32), (64, 64), (80, 96)], 128),
+            vec![(0, 48), (80, 96)]
+        );
     }
 }

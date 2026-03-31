@@ -62,6 +62,32 @@ impl Document {
         self.indexed_bytes() >= self.file_len
     }
 
+    /// Returns `true` while the exact total line count can still improve from
+    /// background indexing or a disk-backed line index sidecar.
+    pub fn is_line_count_pending(&self) -> bool {
+        self.exact_line_count_value().is_none()
+            && (self.is_indexing() || self.raw_disk_index_is_building())
+    }
+
+    /// Blocks until the exact line count is known or the timeout expires.
+    ///
+    /// This is a convenience helper for tools, tests, and explicit workflows
+    /// that intentionally trade latency for a stable exact total. Frontends
+    /// should generally prefer polling [`Document::is_line_count_pending`]
+    /// instead of blocking the UI thread.
+    pub fn wait_for_exact_line_count(&self, timeout: Duration) -> Option<usize> {
+        if let Some(lines) = self.exact_line_count_value() {
+            return Some(lines);
+        }
+
+        let deadline = Instant::now() + timeout;
+        while self.is_line_count_pending() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        self.exact_line_count_value()
+    }
+
     /// Returns the elapsed time since indexing started.
     pub fn indexing_elapsed(&self) -> Option<Duration> {
         let started = self.indexing_started?;
@@ -106,7 +132,18 @@ impl Document {
         if self.rope.is_some() || self.piece_table.is_some() {
             return None;
         }
+        self.raw_disk_index_total_lines()
+    }
+
+    pub(super) fn raw_disk_index_total_lines(&self) -> Option<usize> {
         self.disk_index.as_ref()?.total_lines()
+    }
+
+    fn raw_disk_index_is_building(&self) -> bool {
+        self.disk_index
+            .as_ref()
+            .map(DiskLineIndex::is_building)
+            .unwrap_or(false)
     }
 
     fn disk_index_checkpoint_for_line(&self, line0: usize) -> Option<(usize, usize)> {
@@ -259,8 +296,10 @@ impl Document {
 
     fn exact_line_count_value(&self) -> Option<usize> {
         if let Some(piece_table) = &self.piece_table {
-            if piece_table.full_index() {
-                return Some(piece_table.line_count().max(1));
+            if let Some(lines) =
+                piece_table.exact_line_count_with_fallback(self.raw_disk_index_total_lines())
+            {
+                return Some(lines.max(1));
             }
         }
         if let Some(rope) = &self.rope {
@@ -318,6 +357,7 @@ impl Document {
             self.is_dirty(),
             self.file_len(),
             self.line_count(),
+            self.is_line_count_pending(),
             self.line_ending(),
             self.encoding(),
             self.preserve_save_error(),

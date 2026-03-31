@@ -956,6 +956,8 @@ pub(crate) struct PieceTable {
     add: Vec<u8>,
     pieces: PieceTree,
     known_line_count: usize,
+    exact_base_line_breaks: Option<usize>,
+    exact_base_total_lines: Option<usize>,
     known_byte_len: usize,
     total_len: usize,
     full_index: bool,
@@ -980,92 +982,6 @@ impl EditOutcome {
     }
 }
 
-struct PieceTableLineSliceCollector {
-    target_lines: usize,
-    start_col: usize,
-    max_cols: usize,
-    slices: Vec<LineSlice>,
-    line_buf: Vec<u8>,
-    line_col: usize,
-    visible_cols: usize,
-    pending_cr: bool,
-}
-
-impl PieceTableLineSliceCollector {
-    fn new(target_lines: usize, start_col: usize, max_cols: usize) -> Self {
-        Self {
-            target_lines,
-            start_col,
-            max_cols,
-            slices: Vec::with_capacity(target_lines),
-            line_buf: Vec::with_capacity(max_cols.min(256).saturating_mul(4)),
-            line_col: 0,
-            visible_cols: 0,
-            pending_cr: false,
-        }
-    }
-
-    fn is_done(&self) -> bool {
-        self.slices.len() >= self.target_lines
-    }
-
-    fn push_segment(&mut self, bytes: &[u8]) {
-        let mut i = 0usize;
-        while i < bytes.len() && !self.is_done() {
-            let b = bytes[i];
-            if self.pending_cr {
-                self.pending_cr = false;
-                if b == b'\n' {
-                    i += 1;
-                    continue;
-                }
-            }
-
-            match b {
-                b'\n' => {
-                    self.finish_line();
-                    i += 1;
-                }
-                b'\r' => {
-                    self.finish_line();
-                    self.pending_cr = true;
-                    i += 1;
-                }
-                _ => {
-                    let step = utf8_step(bytes, i, bytes.len());
-                    if self.line_col >= self.start_col && self.visible_cols < self.max_cols {
-                        self.line_buf.extend_from_slice(&bytes[i..i + step]);
-                        self.visible_cols += 1;
-                    }
-                    self.line_col += 1;
-                    i += step;
-                }
-            }
-        }
-    }
-
-    fn finish_eof(&mut self) {
-        if !self.is_done() {
-            self.finish_line();
-        }
-    }
-
-    fn into_slices(self) -> Vec<LineSlice> {
-        self.slices
-    }
-
-    fn finish_line(&mut self) {
-        if self.is_done() {
-            return;
-        }
-        let text = String::from_utf8(std::mem::take(&mut self.line_buf))
-            .unwrap_or_else(|err| String::from_utf8_lossy(&err.into_bytes()).into_owned());
-        self.slices.push(LineSlice::new(text, true));
-        self.line_col = 0;
-        self.visible_cols = 0;
-    }
-}
-
 impl PieceTable {
     #[cfg_attr(not(test), allow(dead_code))]
     fn new(original: FileStorage, line_lengths: Vec<usize>, full_index: bool) -> Self {
@@ -1073,6 +989,7 @@ impl PieceTable {
             original,
             line_lengths,
             full_index,
+            None,
             DocumentEncodingOrigin::Utf8FastPath,
             false,
         )
@@ -1082,6 +999,7 @@ impl PieceTable {
         original: FileStorage,
         mut line_lengths: Vec<usize>,
         full_index: bool,
+        exact_base_total_lines: Option<usize>,
         encoding_origin: DocumentEncodingOrigin,
         decoding_had_errors: bool,
     ) -> Self {
@@ -1099,6 +1017,8 @@ impl PieceTable {
             add: Vec::new(),
             pieces,
             known_line_count,
+            exact_base_line_breaks: Some(known_line_count.saturating_sub(1)),
+            exact_base_total_lines: exact_base_total_lines.or(full_index.then_some(known_line_count)),
             known_byte_len,
             total_len,
             full_index,
@@ -1127,6 +1047,8 @@ impl PieceTable {
             add,
             pieces,
             known_line_count,
+            exact_base_line_breaks: meta.full_index.then_some(known_line_count.saturating_sub(1)),
+            exact_base_total_lines: meta.full_index.then_some(known_line_count),
             known_byte_len,
             total_len,
             full_index: meta.full_index,
@@ -1152,6 +1074,24 @@ impl PieceTable {
 
     pub(crate) fn full_index(&self) -> bool {
         self.full_index
+    }
+
+    pub(crate) fn exact_line_count_with_fallback(
+        &self,
+        fallback_total_lines: Option<usize>,
+    ) -> Option<usize> {
+        if self.full_index {
+            return Some(self.line_count().max(1));
+        }
+
+        let base_breaks = self.exact_base_line_breaks?;
+        let base_total_lines = self.exact_base_total_lines.or(fallback_total_lines)?.max(1);
+        let current_breaks = self.pieces.total_line_breaks();
+        if current_breaks >= base_breaks {
+            Some(base_total_lines.saturating_add(current_breaks - base_breaks).max(1))
+        } else {
+            Some(base_total_lines.saturating_sub(base_breaks - current_breaks).max(1))
+        }
     }
 
     pub(crate) fn fragmentation_stats(&self) -> FragmentationStats {
@@ -1286,37 +1226,46 @@ impl PieceTable {
         if max_cols == 0 || line0 >= self.line_count() {
             return String::new();
         }
-        let (line_start, line_end) = self.line_range(line0);
-        if line_start >= line_end {
+        let Some(line_start) = self.line_start_byte(line0) else {
+            return String::new();
+        };
+        if line_start >= self.known_byte_len {
             return String::new();
         }
         let start = self.byte_offset_for_col(line0, start_col);
-        if start >= line_end {
+        if start >= self.known_byte_len {
             return String::new();
         }
 
         let mut out = Vec::with_capacity(max_cols.min(4096).saturating_mul(4));
         let mut cols = 0usize;
-        self.pieces
-            .visit_range(start, line_end, |piece, local_start, local_end| {
+        let _ = self
+            .pieces
+            .visit_range_while(start, self.known_byte_len, |piece, local_start, local_end| {
                 if cols >= max_cols {
-                    return;
+                    return false;
                 }
+
                 let seg_start = piece.start + local_start;
                 let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
                 let mut i = seg_start;
-                while i < seg_end && cols < max_cols {
+
+                while i < seg_end {
                     let b = src[i];
                     if b == b'\n' || b == b'\r' {
-                        cols = max_cols;
-                        break;
+                        return false;
                     }
                     let step = utf8_step(src, i, seg_end);
                     out.extend_from_slice(&src[i..i + step]);
                     cols += 1;
+                    if cols >= max_cols {
+                        return false;
+                    }
                     i += step;
                 }
+
+                true
             });
 
         String::from_utf8(out)
@@ -1341,30 +1290,14 @@ impl PieceTable {
             .line_count()
             .saturating_sub(first_line0)
             .min(line_count);
-        let Some(start) = self.line_start_byte(first_line0) else {
-            return vec![LineSlice::new(String::new(), true); line_count];
-        };
-        if start >= self.known_byte_len {
-            return vec![LineSlice::new(String::new(), true); line_count];
+        let mut slices = Vec::with_capacity(line_count);
+        for offset in 0..available {
+            let line0 = first_line0.saturating_add(offset);
+            slices.push(LineSlice::new(
+                self.line_visible_segment(line0, start_col, max_cols),
+                true,
+            ));
         }
-
-        let mut collector = PieceTableLineSliceCollector::new(available, start_col, max_cols);
-        self.pieces.visit_range(
-            start,
-            self.known_byte_len,
-            |piece, local_start, local_end| {
-                if collector.is_done() {
-                    return;
-                }
-                let seg_start = piece.start + local_start;
-                let seg_end = piece.start + local_end;
-                let src = self.source_bytes(piece.src);
-                collector.push_segment(&src[seg_start..seg_end]);
-            },
-        );
-        collector.finish_eof();
-
-        let mut slices = collector.into_slices();
         slices.resize(line_count, LineSlice::new(String::new(), true));
         slices
     }
@@ -1735,38 +1668,84 @@ impl PieceTable {
         let mut chunk_breaks = 0usize;
         let mut chunk_lines = 0usize;
         let known_line_count = line_lengths.len().max(1);
+        let flush_chunk = |pieces: &mut Vec<Piece>,
+                           start: &mut usize,
+                           chunk_len: &mut usize,
+                           chunk_breaks: &mut usize,
+                           chunk_lines: &mut usize| {
+            if *chunk_len == 0 {
+                return;
+            }
+            pieces.push(Piece {
+                src: PieceSource::Original,
+                start: *start,
+                len: *chunk_len,
+                line_breaks: *chunk_breaks,
+            });
+            *start = start.saturating_add(*chunk_len);
+            *chunk_len = 0;
+            *chunk_breaks = 0;
+            *chunk_lines = 0;
+        };
 
         for (idx, len) in line_lengths.iter().copied().enumerate() {
+            let line_has_break = idx + 1 < known_line_count;
+            if line_has_break && len > PIECE_TREE_TARGET_BYTES {
+                flush_chunk(
+                    &mut pieces,
+                    &mut start,
+                    &mut chunk_len,
+                    &mut chunk_breaks,
+                    &mut chunk_lines,
+                );
+
+                let tail_len = PIECE_TREE_TARGET_BYTES.min(len);
+                let body_len = len.saturating_sub(tail_len);
+                if body_len > 0 {
+                    pieces.push(Piece {
+                        src: PieceSource::Original,
+                        start,
+                        len: body_len,
+                        line_breaks: 0,
+                    });
+                    start = start.saturating_add(body_len);
+                }
+                pieces.push(Piece {
+                    src: PieceSource::Original,
+                    start,
+                    len: tail_len,
+                    line_breaks: 1,
+                });
+                start = start.saturating_add(tail_len);
+                continue;
+            }
+
             chunk_len = chunk_len.saturating_add(len);
-            if idx + 1 < known_line_count {
+            if line_has_break {
                 chunk_breaks = chunk_breaks.saturating_add(1);
             }
             chunk_lines = chunk_lines.saturating_add(1);
 
             let should_flush =
                 chunk_len >= PIECE_TREE_TARGET_BYTES || chunk_lines >= PIECE_TREE_TARGET_LINES;
-            if should_flush && chunk_len > 0 {
-                pieces.push(Piece {
-                    src: PieceSource::Original,
-                    start,
-                    len: chunk_len,
-                    line_breaks: chunk_breaks,
-                });
-                start = start.saturating_add(chunk_len);
-                chunk_len = 0;
-                chunk_breaks = 0;
-                chunk_lines = 0;
+            if should_flush {
+                flush_chunk(
+                    &mut pieces,
+                    &mut start,
+                    &mut chunk_len,
+                    &mut chunk_breaks,
+                    &mut chunk_lines,
+                );
             }
         }
 
-        if chunk_len > 0 {
-            pieces.push(Piece {
-                src: PieceSource::Original,
-                start,
-                len: chunk_len,
-                line_breaks: chunk_breaks,
-            });
-        }
+        flush_chunk(
+            &mut pieces,
+            &mut start,
+            &mut chunk_len,
+            &mut chunk_breaks,
+            &mut chunk_lines,
+        );
 
         if known_byte_len < total_len {
             pieces.push(Piece {

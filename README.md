@@ -52,14 +52,14 @@ If Qem is useful to you and you want to support the project:
 
 ```toml
 [dependencies]
-qem = "0.6.1"
+qem = "0.6.2"
 ```
 
 To disable the editor/session wrapper and use only the document/storage layer:
 
 ```toml
 [dependencies]
-qem = { version = "0.6.1", default-features = false }
+qem = { version = "0.6.2", default-features = false }
 ```
 
 ## Cargo features
@@ -76,7 +76,7 @@ Example:
 
 ```toml
 [dependencies]
-qem = { version = "0.6.1", default-features = false, features = ["editor", "tmp-exe-dir"] }
+qem = { version = "0.6.2", default-features = false, features = ["editor", "tmp-exe-dir"] }
 ```
 
 Runtime override is also available:
@@ -350,4 +350,4 @@ cargo bench --bench document_perf -- session_layer
 
 - Benchmark methodology lives in [`BENCHMARKS.md`](BENCHMARKS.md).
 - Cross-platform CI and Linux stress coverage live in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
-- Repository: <https://github.com/MrHanty1488/Qem>
+- Repository: <https://github.com/MrHanty42/Qem>

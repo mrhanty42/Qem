@@ -1941,7 +1941,10 @@ fn coalesce_adjacent(pieces: &mut Vec<Piece>) {
     let mut out: Vec<Piece> = Vec::with_capacity(pieces.len());
     for piece in pieces.drain(..) {
         if let Some(last) = out.last_mut() {
-            if last.src == piece.src && last.start + last.len == piece.start {
+            let merge_original =
+                last.src == PieceSource::Original && last.line_breaks == 0 && piece.line_breaks == 0;
+            let merge_add = last.src == PieceSource::Add;
+            if last.src == piece.src && last.start + last.len == piece.start && (merge_original || merge_add) {
                 last.len = last.len.saturating_add(piece.len);
                 last.line_breaks = last.line_breaks.saturating_add(piece.line_breaks);
                 continue;
@@ -2075,6 +2078,74 @@ mod tests {
             ]
         );
         assert_eq!(tree.total_len(), 6);
+    }
+
+    #[test]
+    fn coalesce_adjacent_preserves_original_break_boundaries() {
+        let mut pieces = vec![
+            Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 64,
+                line_breaks: 0,
+            },
+            Piece {
+                src: PieceSource::Original,
+                start: 64,
+                len: 8,
+                line_breaks: 1,
+            },
+            Piece {
+                src: PieceSource::Original,
+                start: 72,
+                len: 64,
+                line_breaks: 0,
+            },
+            Piece {
+                src: PieceSource::Add,
+                start: 0,
+                len: 2,
+                line_breaks: 1,
+            },
+            Piece {
+                src: PieceSource::Add,
+                start: 2,
+                len: 3,
+                line_breaks: 0,
+            },
+        ];
+
+        super::coalesce_adjacent(&mut pieces);
+
+        assert_eq!(
+            pieces,
+            vec![
+                Piece {
+                    src: PieceSource::Original,
+                    start: 0,
+                    len: 64,
+                    line_breaks: 0,
+                },
+                Piece {
+                    src: PieceSource::Original,
+                    start: 64,
+                    len: 8,
+                    line_breaks: 1,
+                },
+                Piece {
+                    src: PieceSource::Original,
+                    start: 72,
+                    len: 64,
+                    line_breaks: 0,
+                },
+                Piece {
+                    src: PieceSource::Add,
+                    start: 0,
+                    len: 5,
+                    line_breaks: 1,
+                },
+            ]
+        );
     }
 
     #[test]

@@ -240,14 +240,13 @@ impl Document {
         } else {
             let bytes = self.mmap_bytes();
             let file_len = self.file_len.min(bytes.len());
-            let eof_position = self.mmap_position_for_byte_offset(file_len);
             if self
                 .mmap_line_start_offset_exact(position.line0())
                 .is_some()
             {
                 position.line0()
             } else {
-                eof_position.line0()
+                self.mmap_position_for_byte_offset(file_len).line0()
             }
         };
         let col0 = position.col0().min(self.line_len_chars(line0));

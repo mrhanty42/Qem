@@ -133,6 +133,7 @@ impl Document {
                     storage,
                     line_lengths,
                     full_index,
+                    self.raw_disk_index_total_lines(),
                     self.encoding_origin,
                     self.decoding_had_errors,
                 ));

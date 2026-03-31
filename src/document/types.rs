@@ -916,6 +916,7 @@ pub struct DocumentStatus {
     dirty: bool,
     file_len: usize,
     line_count: LineCount,
+    exact_line_count_pending: bool,
     line_ending: LineEnding,
     encoding: DocumentEncoding,
     preserve_save_error: Option<DocumentEncodingErrorKind>,
@@ -933,6 +934,7 @@ impl DocumentStatus {
         dirty: bool,
         file_len: usize,
         line_count: LineCount,
+        exact_line_count_pending: bool,
         line_ending: LineEnding,
         encoding: DocumentEncoding,
         preserve_save_error: Option<DocumentEncodingErrorKind>,
@@ -946,6 +948,7 @@ impl DocumentStatus {
             dirty,
             file_len,
             line_count,
+            exact_line_count_pending,
             line_ending,
             encoding,
             preserve_save_error,
@@ -989,6 +992,12 @@ impl DocumentStatus {
     /// Returns `true` when the current line count is exact.
     pub fn is_line_count_exact(&self) -> bool {
         self.line_count.is_exact()
+    }
+
+    /// Returns `true` when background work may still upgrade the total line
+    /// count from an estimate to an exact value.
+    pub fn is_line_count_pending(&self) -> bool {
+        self.exact_line_count_pending
     }
 
     /// Returns the currently detected line ending style.

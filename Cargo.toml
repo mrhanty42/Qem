@@ -1,14 +1,14 @@
 [package]
 name = "qem"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 rust-version = "1.85"
 description = "High-performance cross-platform text engine for massive files."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 documentation = "https://docs.rs/qem"
-repository = "https://github.com/MrHanty1488/Qem"
-homepage = "https://github.com/MrHanty1488/Qem"
+repository = "https://github.com/MrHanty42/Qem"
+homepage = "https://github.com/MrHanty42/Qem"
 keywords = ["text", "editor", "mmap", "rope", "piece-table"]
 categories = ["text-processing", "filesystem", "data-structures"]
 include = [

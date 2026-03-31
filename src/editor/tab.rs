@@ -4,6 +4,7 @@ use crate::{
     DocumentMaintenanceStatus, FragmentationStats, IdleCompactionOutcome, LiteralSearchIter,
     MaintenanceAction,
 };
+use std::time::Duration;
 
 /// Lightweight editor-tab state with a document, cursor, and async save tracking.
 ///
@@ -182,6 +183,11 @@ impl EditorTab {
     /// Returns `true` when the current line count is exact.
     pub fn is_line_count_exact(&self) -> bool {
         self.core.document().is_line_count_exact()
+    }
+
+    /// Blocks until the exact line count is known or the timeout expires.
+    pub fn wait_for_exact_line_count(&self, timeout: Duration) -> Option<usize> {
+        self.core.document().wait_for_exact_line_count(timeout)
     }
 
     /// Returns the current document length in bytes.

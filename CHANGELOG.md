@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.2
+
+### Added
+
+- Added explicit `is_line_count_pending()` / `wait_for_exact_line_count(...)`
+  flows so callers can distinguish "still estimating" from "done" and
+  intentionally block only when they truly need an exact total line count.
+- Added sparse-aware `.qem.lineidx` build behavior plus honest `perf_probe`
+  reporting for pending exact line counts and exact-count wait time.
+
+### Fixed
+
+- Removed several hidden huge-file `O(file_size)` edit/read paths that caused
+  the first prefix edit or first exact viewport after edit to degrade from
+  interactive latency into tens of seconds or minutes on multi-gigabyte files.
+- Preserved original line-break boundaries in the piece tree so exact line
+  navigation after giant-line edits no longer has to rescan gigabytes to find
+  the next line start.
+- Kept exact total line counts available after partial large-file
+  piece-table promotion whenever the sidecar line index already knows the full
+  source-line total.
+
 ## 0.6.1
 
 ### Changed

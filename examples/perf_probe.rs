@@ -58,11 +58,13 @@ struct PerfProbeReport {
     backing: String,
     display_line_count: usize,
     line_count_exact: bool,
+    line_count_pending: bool,
     exact_line_count: Option<usize>,
     indexed_bytes: usize,
     open_ms: f64,
     index_wait_ms: f64,
     indexing_complete: bool,
+    exact_line_count_wait_ms: f64,
     seed_edit_ms: Option<f64>,
     seed_edit_cursor: Option<TextPosition>,
     viewport_ms: f64,
@@ -93,12 +95,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut doc = Document::open(&options.input)?;
     let open_ms = millis(open_started.elapsed());
 
-    let index_wait_started = Instant::now();
-    let deadline = Instant::now() + options.wait_timeout;
-    while doc.is_indexing() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    let index_wait_ms = millis(index_wait_started.elapsed());
+    let index_wait_ms = wait_until(
+        options.wait_timeout,
+        || doc.is_indexing(),
+        Duration::from_millis(10),
+    );
     let indexing_complete = !doc.is_indexing();
 
     let mut seed_edit_ms = None;
@@ -110,10 +111,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seed_edit_cursor = Some(cursor);
     }
 
+    let exact_line_count_started = Instant::now();
+    let exact_line_count = doc.wait_for_exact_line_count(options.wait_timeout);
+    let exact_line_count_wait_ms = millis(exact_line_count_started.elapsed());
+
     let file_len_bytes = doc.file_len();
     let display_line_count = doc.display_line_count();
     let line_count_exact = doc.is_line_count_exact();
-    let exact_line_count = doc.exact_line_count();
+    let line_count_pending = doc.is_line_count_pending();
     let indexed_bytes = doc.indexed_bytes();
     let viewport_line = options.viewport_anchor.resolve_line(display_line_count);
     let viewport_request = ViewportRequest::new(viewport_line, 120).with_columns(0, 160);
@@ -192,11 +197,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         backing: doc.backing().as_str().to_owned(),
         display_line_count,
         line_count_exact,
+        line_count_pending,
         exact_line_count,
         indexed_bytes,
         open_ms,
         index_wait_ms,
         indexing_complete,
+        exact_line_count_wait_ms,
         seed_edit_ms,
         seed_edit_cursor,
         viewport_ms,
@@ -318,13 +325,27 @@ fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+fn wait_until(
+    timeout: Duration,
+    mut pending: impl FnMut() -> bool,
+    poll_interval: Duration,
+) -> f64 {
+    let started = Instant::now();
+    let deadline = started + timeout;
+    while pending() && Instant::now() < deadline {
+        thread::sleep(poll_interval);
+    }
+    millis(started.elapsed())
+}
+
 fn print_human_report(report: &PerfProbeReport) {
     println!(
-        "file_len_bytes={}, indexed_bytes={}, display_line_count={}, line_count_exact={}, exact_line_count={}",
+        "file_len_bytes={}, indexed_bytes={}, display_line_count={}, line_count_exact={}, line_count_pending={}, exact_line_count={}",
         report.file_len_bytes,
         report.indexed_bytes,
         report.display_line_count,
         report.line_count_exact,
+        report.line_count_pending,
         report
             .exact_line_count
             .map(|value| value.to_string())
@@ -334,6 +355,10 @@ fn print_human_report(report: &PerfProbeReport) {
     println!(
         "index_wait_ms={:.3}, indexing_complete={}",
         report.index_wait_ms, report.indexing_complete
+    );
+    println!(
+        "exact_line_count_wait_ms={:.3}, line_count_pending={}",
+        report.exact_line_count_wait_ms, report.line_count_pending
     );
     if let (Some(ms), Some(cursor)) = (report.seed_edit_ms, report.seed_edit_cursor) {
         println!(
@@ -393,17 +418,19 @@ fn print_human_report(report: &PerfProbeReport) {
 
 fn print_json_report(report: &PerfProbeReport) {
     println!(
-        "{{\"input\":\"{}\",\"file_len_bytes\":{},\"backing\":\"{}\",\"display_line_count\":{},\"line_count_exact\":{},\"exact_line_count\":{},\"indexed_bytes\":{},\"open_ms\":{:.3},\"index_wait_ms\":{:.3},\"indexing_complete\":{},\"seed_edit_ms\":{},\"seed_edit_cursor\":{},\"viewport_anchor\":\"{}\",\"viewport_ms\":{:.3},\"viewport_line\":{},\"viewport_rows\":{},\"piece_count\":{},\"average_piece_bytes\":{},\"fragmentation_ratio\":{},\"compaction_urgency\":{},\"maintenance_action\":\"{}\",\"next_ms\":{},\"next_match\":{},\"prev_ms\":{},\"prev_match\":{},\"find_all_ms\":{},\"find_all_count\":{},\"find_all_limit\":{},\"find_all_range_lines\":{},\"save_ms\":{},\"save_output\":{}}}",
+        "{{\"input\":\"{}\",\"file_len_bytes\":{},\"backing\":\"{}\",\"display_line_count\":{},\"line_count_exact\":{},\"line_count_pending\":{},\"exact_line_count\":{},\"indexed_bytes\":{},\"open_ms\":{:.3},\"index_wait_ms\":{:.3},\"indexing_complete\":{},\"exact_line_count_wait_ms\":{:.3},\"seed_edit_ms\":{},\"seed_edit_cursor\":{},\"viewport_anchor\":\"{}\",\"viewport_ms\":{:.3},\"viewport_line\":{},\"viewport_rows\":{},\"piece_count\":{},\"average_piece_bytes\":{},\"fragmentation_ratio\":{},\"compaction_urgency\":{},\"maintenance_action\":\"{}\",\"next_ms\":{},\"next_match\":{},\"prev_ms\":{},\"prev_match\":{},\"find_all_ms\":{},\"find_all_count\":{},\"find_all_limit\":{},\"find_all_range_lines\":{},\"save_ms\":{},\"save_output\":{}}}",
         json_escape(&report.input.display().to_string()),
         report.file_len_bytes,
         json_escape(&report.backing),
         report.display_line_count,
         report.line_count_exact,
+        report.line_count_pending,
         option_usize_json(report.exact_line_count),
         report.indexed_bytes,
         report.open_ms,
         report.index_wait_ms,
         report.indexing_complete,
+        report.exact_line_count_wait_ms,
         option_f64_json(report.seed_edit_ms),
         option_position_json(report.seed_edit_cursor),
         json_escape(&report.viewport_anchor),
