@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.3
+
+### Fixed
+
+- Ran `rustfmt` on the recent huge-file line-count and piece-tree changes so
+  `cargo fmt --all --check` passes again in CI.
+- Scoped sparse-index helper code correctly for non-Windows builds so
+  `cargo clippy --all-targets --all-features -- -D warnings` passes on Linux
+  and other non-Windows CI runners.
+
 ## 0.6.2
 
 ### Added
