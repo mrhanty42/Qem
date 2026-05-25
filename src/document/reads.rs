@@ -268,10 +268,8 @@ pub(super) fn trailing_mmap_line_ranges(
         pos -= 1;
         match bytes[pos] {
             b'\n' => starts.push(pos + 1),
-            b'\r' => {
-                if pos + 1 >= file_len || bytes[pos + 1] != b'\n' {
-                    starts.push(pos + 1);
-                }
+            b'\r' if pos + 1 >= file_len || bytes[pos + 1] != b'\n' => {
+                starts.push(pos + 1);
             }
             _ => {}
         }

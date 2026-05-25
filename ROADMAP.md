@@ -26,7 +26,7 @@ public API at `1.0.0`.
 
 ## Current Release Line
 
-Current published release: `0.7.0`
+Current published release: `0.7.1`
 
 Current target: `0.8.0`
 

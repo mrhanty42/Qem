@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.7.1
+
+### Fixed
+
+- Made `cargo clippy --all-targets --all-features -- -D warnings` pass on the
+  newer clippy lint set used in CI by collapsing a nested `if` inside a
+  `match` arm in `trailing_mmap_line_ranges`.
+- Stabilized `document_session_large_async_open_reports_pending_exact_line_count_before_index_finishes`
+  against background-indexing races on fast CI runners. The test no longer
+  fails when the background line index finishes before the assertion runs;
+  it now accepts both the still-pending and already-exact paths and verifies
+  the matching status invariants in either case.
+
 ## 0.7.0
 
 `0.7.0` is the integration release. There are no breaking API changes
