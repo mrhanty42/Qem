@@ -14,6 +14,24 @@ function Format-InvariantNumber {
     return $Value.ToString("0.000", $InvariantCulture)
 }
 
+function Format-SizeLabel {
+    param(
+        [double]$Bytes
+    )
+
+    if ($Bytes -ge 1GB) {
+        return ('{0} GiB' -f (Format-InvariantNumber ($Bytes / 1GB)))
+    }
+    if ($Bytes -ge 1MB) {
+        return ('{0} MiB' -f (Format-InvariantNumber ($Bytes / 1MB)))
+    }
+    if ($Bytes -ge 1KB) {
+        return ('{0} KiB' -f (Format-InvariantNumber ($Bytes / 1KB)))
+    }
+
+    return ('{0} B' -f [int64]$Bytes)
+}
+
 function Get-StatsRow {
     param(
         [object[]]$Values
@@ -69,8 +87,8 @@ $lines.Add("# Perf Matrix Summary")
 $lines.Add("")
 $lines.Add(('Source: `{0}`' -f $InputJsonl))
 $lines.Add("")
-$lines.Add('| input | size GiB | label | anchor | state | backing | runs | open ms | viewport ms | next ms | prev ms | find_all ms |')
-$lines.Add('| --- | ---: | --- | --- | --- | --- | ---: | --- | --- | --- | --- | --- |')
+$lines.Add('| input | size | label | anchor | state | backing | runs | open ms | index wait ms | exact line wait ms | edit ms | viewport ms | save ms | next ms | prev ms | find_all ms | peak WS MiB |')
+$lines.Add('| --- | --- | --- | --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---: |')
 
 foreach ($group in ($groups | Sort-Object Name)) {
     $parts = $group.Name.Split('|', 5)
@@ -87,30 +105,48 @@ foreach ($group in ($groups | Sort-Object Name)) {
     }
 
     $firstRow = $group.Group | Select-Object -First 1
-    $sizeGiB = Format-InvariantNumber (([double]$firstRow.file_len_bytes) / 1GB)
+    $sizeLabel = Format-SizeLabel ([double]$firstRow.file_len_bytes)
 
     $openStats = Get-StatsRow ($group.Group | ForEach-Object { $_.open_ms })
+    $indexWaitStats = Get-StatsRow ($group.Group | ForEach-Object { $_.index_wait_ms })
+    $exactLineWaitStats = Get-StatsRow ($group.Group | ForEach-Object { $_.exact_line_count_wait_ms })
+    $seedEditStats = Get-StatsRow ($group.Group | ForEach-Object { $_.seed_edit_ms })
     $viewportStats = Get-StatsRow ($group.Group | ForEach-Object { $_.viewport_ms })
+    $saveStats = Get-StatsRow ($group.Group | ForEach-Object { $_.save_ms })
     $nextStats = Get-StatsRow ($group.Group | ForEach-Object { $_.next_ms })
     $prevStats = Get-StatsRow ($group.Group | ForEach-Object { $_.prev_ms })
     $findAllStats = Get-StatsRow ($group.Group | ForEach-Object { $_.find_all_ms })
-
-    $lines.Add(
-        ('| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} [{8}-{9}] | {10} [{11}-{12}] | {13} [{14}-{15}] | {16} [{17}-{18}] | {19} [{20}-{21}] |' -f
-            $inputLabel,
-            $sizeGiB,
-            $matrixLabel,
-            $viewportAnchor,
-            $state,
-            $backing,
-            $group.Count,
-            $openStats.median, $openStats.min, $openStats.max,
-            $viewportStats.median, $viewportStats.min, $viewportStats.max,
-            $nextStats.median, $nextStats.min, $nextStats.max,
-            $prevStats.median, $prevStats.min, $prevStats.max,
-            $findAllStats.median, $findAllStats.min, $findAllStats.max
-        )
+    $peakWorkingSetStats = Get-StatsRow (
+        $group.Group | ForEach-Object {
+            if ($_.PSObject.Properties.Name -contains 'matrix_peak_working_set_bytes' -and $_.matrix_peak_working_set_bytes -ne $null) {
+                ([double]$_.matrix_peak_working_set_bytes) / 1MB
+            }
+            else {
+                $null
+            }
+        }
     )
+
+    $row = @(
+        $inputLabel,
+        $sizeLabel,
+        $matrixLabel,
+        $viewportAnchor,
+        $state,
+        $backing,
+        [string]$group.Count,
+        ('{0} [{1}-{2}]' -f $openStats.median, $openStats.min, $openStats.max),
+        ('{0} [{1}-{2}]' -f $indexWaitStats.median, $indexWaitStats.min, $indexWaitStats.max),
+        ('{0} [{1}-{2}]' -f $exactLineWaitStats.median, $exactLineWaitStats.min, $exactLineWaitStats.max),
+        ('{0} [{1}-{2}]' -f $seedEditStats.median, $seedEditStats.min, $seedEditStats.max),
+        ('{0} [{1}-{2}]' -f $viewportStats.median, $viewportStats.min, $viewportStats.max),
+        ('{0} [{1}-{2}]' -f $saveStats.median, $saveStats.min, $saveStats.max),
+        ('{0} [{1}-{2}]' -f $nextStats.median, $nextStats.min, $nextStats.max),
+        ('{0} [{1}-{2}]' -f $prevStats.median, $prevStats.min, $prevStats.max),
+        ('{0} [{1}-{2}]' -f $findAllStats.median, $findAllStats.min, $findAllStats.max),
+        ('{0} [{1}-{2}]' -f $peakWorkingSetStats.median, $peakWorkingSetStats.min, $peakWorkingSetStats.max)
+    )
+    $lines.Add('| ' + ($row -join ' | ') + ' |')
 }
 
 $outputDir = Split-Path -Parent $outputPath

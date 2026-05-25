@@ -346,6 +346,12 @@ impl DocumentSessionStatus {
         self.document.is_line_count_exact()
     }
 
+    /// Returns `true` when background work may still upgrade the line count
+    /// from an estimate to an exact value.
+    pub fn is_line_count_pending(&self) -> bool {
+        self.document.is_line_count_pending()
+    }
+
     /// Returns the current document length in bytes.
     pub fn file_len(&self) -> usize {
         self.document.file_len()
@@ -531,6 +537,12 @@ impl EditorTabStatus {
     /// Returns `true` when the current line count is exact.
     pub fn is_line_count_exact(&self) -> bool {
         self.session.is_line_count_exact()
+    }
+
+    /// Returns `true` when background work may still upgrade the line count
+    /// from an estimate to an exact value.
+    pub fn is_line_count_pending(&self) -> bool {
+        self.session.is_line_count_pending()
     }
 
     /// Returns the current document length in bytes.

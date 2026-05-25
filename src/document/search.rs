@@ -4,6 +4,14 @@ use memchr::memmem::{Finder, FinderRev};
 const REVERSE_POSITION_FAST_PATH_BYTES: usize = 1024;
 const BUFFERED_LITERAL_RANGE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// Maximum residual mmap byte distance from the highest indexed line anchor to
+/// EOF for which `mmap_byte_offset_for_position` will still pay the precise
+/// per-line walk for an out-of-range typed line. Above this threshold the
+/// helper collapses out-of-range lines to `file_len`, which preserves the
+/// "at or past EOF" semantics that typed search relies on while avoiding
+/// multi-gigabyte mmap scans on huge files.
+const LARGE_MMAP_OFFSET_FAST_PATH_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, Default)]
 struct PositionScanState {
     line0: usize,
@@ -1146,9 +1154,28 @@ impl Document {
 
         let mut line0 = 0usize;
         let mut line_start = 0usize;
+        let mut last_anchor_line = 0usize;
         if let Ok(offsets) = self.line_offsets.read() {
             (line0, line_start) = line_offsets_anchor_for_line(&offsets, position.line0());
             line_start = line_start.min(file_len);
+            last_anchor_line = offsets.len().saturating_sub(1);
+        }
+
+        // Fast path for out-of-range positions on huge mmap files. When the
+        // requested line is past the highest indexed line anchor and the
+        // residual byte distance to EOF is large, walking line-by-line from
+        // the last anchor up to that out-of-range line would scan multiple
+        // gigabytes through the file. For typed-search semantics that scan
+        // produces no useful information beyond "this is at or past EOF", so
+        // we collapse it to `file_len` directly. Inputs like
+        // `TextPosition::new(usize::MAX, usize::MAX)` (used by `find_prev` to
+        // mean "from the end of the document") used to take many minutes on a
+        // 50 GiB file before this short-circuit.
+        if position.line0() > last_anchor_line {
+            let residual = file_len.saturating_sub(line_start);
+            if residual >= LARGE_MMAP_OFFSET_FAST_PATH_BYTES {
+                return file_len;
+            }
         }
 
         while line0 < position.line0() && line_start < file_len {

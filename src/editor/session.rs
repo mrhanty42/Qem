@@ -181,6 +181,12 @@ impl DocumentSession {
         self.core.document().is_line_count_exact()
     }
 
+    /// Returns `true` when background work may still upgrade the line count
+    /// from an estimate to an exact value.
+    pub fn is_line_count_pending(&self) -> bool {
+        self.core.document().is_line_count_pending()
+    }
+
     /// Blocks until the exact line count is known or the timeout expires.
     pub fn wait_for_exact_line_count(&self, timeout: Duration) -> Option<usize> {
         self.core.document().wait_for_exact_line_count(timeout)

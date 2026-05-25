@@ -4,9 +4,9 @@ use super::{
 };
 use crate::{
     CompactionPolicy, CompactionUrgency, Document, DocumentBacking, DocumentEncoding,
-    DocumentEncodingErrorKind, DocumentEncodingOrigin, DocumentError, EditCapability,
-    IdleCompactionOutcome, LiteralSearchQuery, MaintenanceAction, TextPosition, TextSelection,
-    ViewportRequest,
+    DocumentEncodingErrorKind, DocumentEncodingOrigin, DocumentError, DocumentStatus,
+    EditCapability, IdleCompactionOutcome, LineCount, LineEnding, LiteralSearchQuery,
+    MaintenanceAction, TextPosition, TextSelection, ViewportRequest,
 };
 use encoding_rs::{GB18030, SHIFT_JIS, WINDOWS_1251};
 use std::fs;
@@ -1995,6 +1995,8 @@ fn open_file_async_completes_and_exposes_progress() {
     assert_eq!(tab.exact_line_count(), Some(3));
     assert_eq!(tab.display_line_count(), 3);
     assert!(tab.is_line_count_exact());
+    assert!(!tab.is_line_count_pending());
+    assert!(!tab.status().is_line_count_pending());
     assert_eq!(tab.line_len_chars(0), 5);
     assert_eq!(tab.position_for_char_index(6), TextPosition::new(1, 0));
     assert_eq!(tab.char_index_for_position(TextPosition::new(1, 0)), 6);
@@ -2206,6 +2208,34 @@ fn editor_tab_try_insert_updates_cursor() {
     assert!(status.has_rope());
     assert!(!status.has_piece_table());
     assert!(!status.is_busy());
+    assert!(!status.is_line_count_pending());
+}
+
+#[test]
+fn session_and_tab_status_expose_pending_line_count_passthrough() {
+    let document = DocumentStatus::new(
+        None,
+        false,
+        1024,
+        LineCount::Estimated(42),
+        true,
+        LineEnding::Lf,
+        DocumentEncoding::utf8(),
+        None,
+        DocumentEncodingOrigin::Utf8FastPath,
+        false,
+        None,
+        DocumentBacking::Mmap,
+    );
+    let session =
+        super::DocumentSessionStatus::new(7, document, BackgroundActivity::Idle, None, false);
+    let tab = super::EditorTabStatus::new(11, session.clone(), CursorPosition::default(), false);
+
+    assert_eq!(session.display_line_count(), 42);
+    assert!(session.is_line_count_pending());
+    assert!(!session.is_line_count_exact());
+    assert!(tab.is_line_count_pending());
+    assert!(!tab.is_line_count_exact());
 }
 
 #[test]
@@ -3014,6 +3044,7 @@ fn document_session_open_save_and_viewport_flow() {
     assert!(!status.is_dirty());
     assert_eq!(status.display_line_count(), 3);
     assert_eq!(status.exact_line_count(), Some(3));
+    assert!(!status.is_line_count_pending());
     assert_eq!(status.file_len(), session.file_len());
     assert_eq!(status.line_ending(), session.line_ending());
     assert!(!status.is_busy());
@@ -3024,6 +3055,7 @@ fn document_session_open_save_and_viewport_flow() {
     assert_eq!(session.exact_line_count(), Some(3));
     assert_eq!(session.display_line_count(), 3);
     assert!(session.is_line_count_exact());
+    assert!(!session.is_line_count_pending());
     assert_eq!(session.line_len_chars(1), 4);
     assert_eq!(session.position_for_char_index(6), TextPosition::new(1, 0));
     assert_eq!(session.char_index_for_position(TextPosition::new(1, 0)), 6);
@@ -3129,5 +3161,154 @@ fn document_session_open_save_and_viewport_flow() {
 
     let _ = fs::remove_file(&input);
     let _ = fs::remove_file(&output);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn document_session_crlf_viewport_edit_and_save_preserves_line_endings() {
+    let dir = std::env::temp_dir().join(format!("qem-session-crlf-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let input = dir.join("input-crlf.txt");
+    let output = dir.join("output-crlf.txt");
+    fs::write(&input, b"alpha\r\nbeta\r\n").unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file(input.clone()).unwrap();
+
+    assert_eq!(session.line_ending(), LineEnding::Crlf);
+    assert_eq!(session.status().line_ending(), LineEnding::Crlf);
+    assert_eq!(
+        session.text_units_between(TextPosition::new(0, 5), TextPosition::new(1, 0)),
+        1
+    );
+
+    let viewport = session.read_viewport(ViewportRequest::new(0, 2).with_columns(0, 16));
+    assert_eq!(viewport.rows()[0].text(), "alpha");
+    assert_eq!(viewport.rows()[1].text(), "beta");
+
+    let deleted = session.try_delete_forward(TextPosition::new(0, 5)).unwrap();
+    assert!(deleted.changed());
+    assert_eq!(deleted.cursor(), TextPosition::new(0, 5));
+    assert_eq!(session.text(), "alphabeta\n");
+
+    let cursor = session.try_insert(TextPosition::new(0, 5), "\n").unwrap();
+    assert_eq!(cursor, TextPosition::new(1, 0));
+    assert_eq!(session.text(), "alpha\nbeta\n");
+    assert_eq!(session.line_ending(), LineEnding::Crlf);
+
+    session.save_as(output.clone()).unwrap();
+    assert_eq!(fs::read(&output).unwrap(), b"alpha\r\nbeta\r\n");
+
+    let _ = fs::remove_file(&input);
+    let _ = fs::remove_file(&output);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn document_session_long_line_viewport_edit_and_save_flow() {
+    let dir = std::env::temp_dir().join(format!("qem-session-long-line-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let input = dir.join("input-long-line.txt");
+    let output = dir.join("output-long-line.txt");
+
+    let long_line = "x".repeat(128 * 1024);
+    let column = 64 * 1024;
+    let text = format!("{long_line}\ntrailer\n");
+    fs::write(&input, text.as_bytes()).unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file(input.clone()).unwrap();
+
+    assert_eq!(session.display_line_count(), 3);
+    assert_eq!(session.line_len_chars(0), long_line.len());
+
+    let viewport = session.read_viewport(ViewportRequest::new(0, 1).with_columns(column, 16));
+    assert_eq!(viewport.rows()[0].text(), &long_line[column..column + 16]);
+    assert!(viewport.rows()[0].is_exact());
+
+    let selection = TextSelection::new(
+        TextPosition::new(0, column.saturating_sub(2)),
+        TextPosition::new(0, column.saturating_add(2)),
+    );
+    let selected = session.read_selection(selection);
+    assert!(selected.is_exact());
+    assert_eq!(selected.text(), &long_line[column - 2..column + 2]);
+
+    let cursor = session
+        .try_insert(TextPosition::new(0, column), "[qem]")
+        .unwrap();
+    assert_eq!(cursor, TextPosition::new(0, column + 5));
+    assert_eq!(session.line_len_chars(0), long_line.len() + 5);
+
+    let edited = session.read_viewport(ViewportRequest::new(0, 1).with_columns(column - 2, 9));
+    assert_eq!(edited.rows()[0].text(), "xx[qem]xx");
+    assert!(edited.rows()[0].is_exact());
+
+    session.save_as(output.clone()).unwrap();
+    let expected = format!(
+        "{}[qem]{}\ntrailer\n",
+        &long_line[..column],
+        &long_line[column..]
+    );
+    assert_eq!(fs::read_to_string(&output).unwrap(), expected);
+
+    let _ = fs::remove_file(&input);
+    let _ = fs::remove_file(&output);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn document_session_large_async_open_reports_pending_exact_line_count_before_index_finishes() {
+    let dir = std::env::temp_dir().join(format!("qem-session-large-open-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("large-input.txt");
+
+    let large_len = 16 * 1024 * 1024;
+    let mut bytes = Vec::with_capacity(large_len);
+    bytes.extend_from_slice(b"a\n");
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        large_len.saturating_sub(bytes.len()),
+    ));
+    fs::write(&path, &bytes).unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file_async(path.clone()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(result) = session.poll_background_job() {
+            result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "large async session open timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let status = session.status();
+    assert_eq!(status.path(), Some(path.as_path()));
+    assert!(status.is_line_count_pending());
+    assert!(!status.is_line_count_exact());
+    assert!(status.indexing_state().is_some());
+    assert!(session.is_line_count_pending());
+    assert!(!session.is_line_count_exact());
+
+    let viewport = session.read_viewport(ViewportRequest::new(0, 2).with_columns(0, 16));
+    assert_eq!(viewport.rows()[0].text(), "a");
+    assert!(!viewport.rows().is_empty());
+
+    let exact = session.wait_for_exact_line_count(Duration::from_secs(10));
+    assert!(exact.is_some());
+    assert!(!session.is_line_count_pending());
+    assert!(session.is_line_count_exact());
+
+    let final_status = session.status();
+    assert!(!final_status.is_line_count_pending());
+    assert_eq!(final_status.exact_line_count(), exact);
+
+    let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
 }

@@ -94,6 +94,10 @@ jobs:
         include:
           - name: cargo build --examples --all-features
             command: cargo build --examples --all-features
+          - name: cargo check -p qem-egui-demo
+            command: cargo check -p qem-egui-demo
+          - name: cargo check -p qem-egui-demo --bin large_file
+            command: cargo check -p qem-egui-demo --bin large_file
           - name: cargo build --example viewport --no-default-features
             command: cargo build --example viewport --no-default-features
           - name: cargo build --example typed_editing --no-default-features
@@ -106,6 +110,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: ${{ matrix.name }}
         run: ${{ matrix.command }}
+
+  example-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: run example smoke
+        shell: pwsh
+        run: .\scripts\smoke_examples.ps1
 
   benches:
     runs-on: ubuntu-latest

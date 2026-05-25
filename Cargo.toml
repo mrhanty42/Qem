@@ -1,6 +1,11 @@
+[workspace]
+members = ["demos/qem-egui-demo"]
+default-members = ["."]
+resolver = "2"
+
 [package]
 name = "qem"
-version = "0.6.3"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.85"
 description = "High-performance cross-platform text engine for massive files."
@@ -14,6 +19,9 @@ categories = ["text-processing", "filesystem", "data-structures"]
 include = [
     "Cargo.toml",
     "README.md",
+    "ROADMAP.md",
+    "MIGRATION-0.7.md",
+    "PERF-BASELINE-0.7.md",
     "CHANGELOG.md",
     "LICENSE",
     "LICENSE-APACHE",

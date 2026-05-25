@@ -1,0 +1,10 @@
+[package]
+name = "qem-egui-demo"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+qem = { path = "../..", default-features = false, features = ["editor", "tmp-auto"] }

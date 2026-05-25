@@ -1,1 +1,10 @@
 /target
+
+# Local scratch dumps and probe runs that should never be committed.
+/all_combined.txt
+/tmp_probe.rs
+/scripts/huge_test.log
+
+# Per-OS junk.
+.DS_Store
+Thumbs.db

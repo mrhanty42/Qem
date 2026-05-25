@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true, Position = 0)]
     [string]$Path,
 
-    [string]$LogicalSize = "1TB",
+    [string]$LogicalSize = "500GB",
 
     [string]$HeadText = "QEM_SPARSE_HEAD`n",
 

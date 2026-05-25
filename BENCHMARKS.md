@@ -143,6 +143,11 @@ machine-readable for later spreadsheets or notebooks. It does not fake cold
 cache: if you need a true cold-cache row, reboot or flush caches first and then
 run the script for that labeled pass.
 
+If you also want the matrix to include save latency and a coarse peak process
+memory number, add `-MeasureSave`. The JSONL rows then include `save_ms` plus
+`matrix_peak_working_set_bytes`, and the markdown summary surfaces those
+columns directly.
+
 To turn that JSONL into one quick markdown table with medians/min/max:
 
 ```powershell

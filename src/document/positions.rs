@@ -1,5 +1,15 @@
 use super::*;
 
+/// Maximum residual mmap byte distance from the last line-index anchor to EOF
+/// for which `clamp_position` will still pay the precise byte-by-byte EOF
+/// rescan when the requested line is past the indexed prefix. Above this
+/// threshold the clamp falls back to the engine's known display line count.
+///
+/// Sized so multi-gigabyte files (where the residual scan would dominate
+/// search latency) take the fast path, while small partially indexed files
+/// keep the existing precise behavior.
+const LARGE_MMAP_CLAMP_FAST_PATH_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug)]
 struct PieceTableScanRange {
     range: (usize, usize),
@@ -238,9 +248,57 @@ impl Document {
                     .min(self.display_line_count().max(1).saturating_sub(1))
             }
         } else {
+            // For huge mmap files, deciding whether the requested line is
+            // exactly findable must not run a multi-gigabyte byte-by-byte walk
+            // first. We only call into the precise line-start lookup when the
+            // requested line is within (or close to) the indexed prefix.
+            // Anything past the last indexed line anchor with a large residual
+            // distance to EOF is treated as "past EOF for typed-search
+            // purposes" and clamps to the engine's known display line count.
+            //
+            // Without this guard, inputs like
+            // `TextPosition::new(usize::MAX, usize::MAX)` (used by `find_prev`
+            // to mean "from the end of the document") used to take many
+            // minutes on a 50 GiB file because `mmap_line_start_offset_exact`
+            // would shuffle through hundreds of millions of memchr-anchored
+            // line walks before answering `None`.
+            let display_cap = self.display_line_count().max(1).saturating_sub(1);
             let bytes = self.mmap_bytes();
             let file_len = self.file_len.min(bytes.len());
-            if self
+            let (last_anchor_line, last_anchor_offset) = self
+                .line_offsets
+                .read()
+                .ok()
+                .map(|guard| {
+                    let len = guard.len();
+                    if len == 0 {
+                        (0usize, 0usize)
+                    } else {
+                        (len - 1, guard.get_usize(len - 1).unwrap_or(0))
+                    }
+                })
+                .unwrap_or((0, 0));
+            let last_anchor_offset = last_anchor_offset.min(file_len);
+            let residual = file_len.saturating_sub(last_anchor_offset);
+            let line_in_indexed_prefix = position.line0() <= last_anchor_line;
+
+            if line_in_indexed_prefix
+                && self
+                    .mmap_line_start_offset_exact(position.line0())
+                    .is_some()
+            {
+                position.line0()
+            } else if residual >= LARGE_MMAP_CLAMP_FAST_PATH_BYTES {
+                // Past the indexed prefix on a huge file: clamp to the last
+                // anchored line. We deliberately do not clamp up to
+                // `display_line_count` here; that value is an estimate, and
+                // anchoring to a line we have not actually scanned would let
+                // typed reads invent positions that don't exist on disk yet.
+                // The last anchor line is the highest line that is known to
+                // exist, and it preserves the contract that out-of-range
+                // typed positions land on a real, scannable line.
+                last_anchor_line.min(display_cap)
+            } else if self
                 .mmap_line_start_offset_exact(position.line0())
                 .is_some()
             {

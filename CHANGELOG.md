@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+## 0.7.0
+
+`0.7.0` is the integration release. There are no breaking API changes
+between `0.6.x` and `0.7.0`; see [`MIGRATION-0.7.md`](MIGRATION-0.7.md) for
+a full upgrade summary.
+
+### Fixed
+
+- Eliminated a degenerate `find_prev` / `find_prev_query` slow path on huge
+  mmap-backed files. Calling reverse literal search with an out-of-range
+  before-position such as `TextPosition::new(usize::MAX, usize::MAX)` (the
+  natural way to mean "from the end of the document") used to walk hundreds
+  of millions of memchr-anchored line starts before answering. On a real
+  50 GiB file that path now returns in microseconds instead of timing out
+  past the 10-minute mark. Out-of-range typed positions on huge mmap files
+  now short-circuit through the highest indexed line anchor instead of doing
+  a multi-gigabyte byte-by-byte rescan.
+
+### Added
+
+- Added a workspace `qem-egui-demo` integration target with separate minimal
+  and large-file-oriented `egui` frontends so real GUI integration can evolve
+  without pulling GUI dependencies into the core crate.
+- Added example smoke coverage in CI for the current official CLI/frontend
+  examples.
+- Added `ROADMAP.md` and `MIGRATION-0.7.md` release-planning documents that
+  describe the path from `0.7.0` integration through `0.8.0` (regex + fast
+  search + encoding stabilization), `0.9.0` (stability hardening), and
+  `1.0.0` (public API freeze).
+- Added `PERF-BASELINE-0.7.md` plus expanded perf-matrix tooling so the
+  repository now records a seed real-file baseline with edit/save and coarse
+  working-set numbers.
+- Added `is_line_count_pending()` passthrough helpers on the session/tab-facing
+  status surface so frontends no longer need to peel back into raw
+  `DocumentStatus` just to check whether exact line count is still pending.
+- Added explicit `DocumentSession` scenario coverage for CRLF-preserving
+  open/edit/save flows and very long line viewport/edit/save flows.
+
+### Changed
+
+- Repositioned the public roadmap around `0.7.0` as an integration release,
+  followed by `0.8.0` (regex + fast search + encoding stabilization),
+  `0.9.0` (stability hardening), and `1.0.0` (public API freeze).
+- Rewrote the public README and crate-level docs toward a clearer integration
+  contract around `Document`, `DocumentSession`, `EditorTab`, huge-file edit
+  limits, sidecars, and frontend-visible async semantics.
+
 ## 0.6.3
 
 ### Fixed

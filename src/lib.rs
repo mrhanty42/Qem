@@ -172,66 +172,118 @@
 //!   [`DocumentSession`], the convenience cursor wrapper [`EditorTab`], and
 //!   the related progress/save helper types.
 //!
-//! # Current Contract
+//! # Official Integration Demos
 //!
-//! - UTF-8 and ASCII text are the primary stable fast path: open, viewport
-//!   reads, edits, undo/redo, and saves are supported without transcoding.
-//! - Explicit encoding open/save is available through
-//!   [`Document::open_with_encoding`] and [`Document::save_to_with_encoding`]
-//!   plus the session/tab wrappers. For convenience, BOM-backed UTF-16 files
-//!   can also use [`Document::open_with_auto_encoding_detection`]. For a more
-//!   extensible contract, the same flows are also exposed through
-//!   [`DocumentOpenOptions`], [`OpenEncodingPolicy`], and
-//!   [`DocumentSaveOptions`].
-//! - Auto-detect open currently recognizes BOM-backed UTF-16 files and
-//!   otherwise keeps the normal UTF-8/ASCII fast path. Callers that already
-//!   know a likely legacy fallback can opt into "detect first, otherwise
-//!   reinterpret as X" through [`DocumentOpenOptions`] and the session/tab
-//!   convenience wrappers.
+//! The repository workspace contains two `egui` demos that exercise the
+//! frontend-facing path without pulling GUI dependencies into the library
+//! crate itself:
+//!
+//! - `qem-egui-demo`: minimal viewer/editor integration.
+//! - `qem-egui-demo --bin large_file`: large-file viewport integration with
+//!   gutter, explicit viewport window, caret, open/save, and visible
+//!   load/save/index status.
+//!
+//! # Current Support Contract
+//!
+//! ## UTF-8 and ASCII
+//!
+//! - UTF-8 / ASCII text is the primary stable fast path. Open, viewport reads,
+//!   edits, undo/redo, and save are supported without transcoding.
+//! - Huge-file reads use the mmap-oriented path when possible. Frontends
+//!   should treat this as the main scalable contract for text viewing.
+//! - Typed positions, ranges, selections, and viewport columns use document
+//!   text units. For UTF-8 text, line-local columns count Unicode scalar
+//!   values, not grapheme clusters and not display cells.
+//! - Stored CRLF still counts as one text unit between lines for typed
+//!   range/edit/navigation semantics.
+//!
+//! ## Invalid UTF-8 and Other Encodings
+//!
+//! - Explicit legacy-encoding open/save is supported through
+//!   [`Document::open_with_encoding`], [`Document::save_to_with_encoding`],
+//!   and the matching session/tab wrappers.
+//! - Auto-detect open currently recognizes BOM-backed UTF-16 files.
+//!   Otherwise Qem stays on the normal UTF-8 / ASCII path unless the caller
+//!   provides an explicit fallback through [`DocumentOpenOptions`].
 //! - Non-UTF8 opens currently materialize into a rope-backed document instead
-//!   of using the mmap fast path. Very large legacy-encoded files may therefore
-//!   still be rejected until the broader encoding contract lands in a later
-//!   release.
-//! - Preserve-save for some decoded encodings can still return a typed
-//!   [`DocumentError::Encoding`] with a structured
-//!   [`DocumentEncodingErrorKind`] until a broader persistence contract lands.
-//!   [`Document::decoding_had_errors`] means Qem has already seen malformed
-//!   source bytes, but preserve-save is only rejected when the write would
-//!   materialize lossy-decoded text. Raw mmap/piece-table preserve can still
-//!   remain valid, while rope-backed legacy opens and UTF-8 after lossy
-//!   materialization/edit correctly fail with
-//!   [`DocumentEncodingErrorKind::LossyDecodedPreserve`]. Frontends can
-//!   preflight both preserve and explicit conversion paths through
-//!   [`Document::preserve_save_error`], [`Document::save_error_for_options`],
-//!   and the matching session/tab wrappers before attempting the write.
-//!   Callers can already convert to a supported target through
-//!   [`DocumentSaveOptions`] or [`Document::save_to_with_encoding`].
-//! - Huge files are supported for mmap-backed reads, viewport rendering, line
-//!   counting, and background indexing without full materialization. Editing
-//!   may be rejected when it would require rope materialization beyond the
-//!   built-in safety limits.
-//! - Typed positions, ranges, and viewport columns use document text units.
-//!   For UTF-8 text, line-local columns count Unicode scalar values rather
-//!   than grapheme clusters or display cells. Stored CRLF still counts as one
-//!   text unit between lines.
-//! - Internal `.qem.lineidx` and `.qem.editlog` sidecars are validated against
-//!   source file length, modification time, and a sampled content fingerprint.
-//!   Their formats are internal cache/durability details rather than stable
-//!   interchange formats, so Qem may rebuild, discard, or version-bump them
-//!   across releases.
-//! - Session-facing async-open state is reported through byte progress plus an
-//!   explicit [`LoadPhase`] so frontends can distinguish "open is still being
-//!   prepared" from "the document is ready but background indexing continues".
-//! - Session-facing background failures and stale-result discards are retained
-//!   as typed [`BackgroundIssue`] values so frontends can keep showing the most
-//!   recent async-open/save problem after background activity has gone idle.
-//!   Call [`DocumentSession::take_background_issue`] or
-//!   [`EditorTab::take_background_issue`] when your app wants to acknowledge
-//!   and clear that retained issue explicitly.
-//! - Deferred closes are part of the public session contract:
-//!   [`DocumentSession::close_pending`] and the corresponding status snapshot
-//!   expose when `close_file()` is waiting for an in-flight background job to
-//!   finish before the document can actually disappear.
+//!   of using the mmap fast path. Very large legacy-encoded files may still be
+//!   rejected until the wider encoding contract expands.
+//! - [`Document::decoding_had_errors`] means the source required lossy decode
+//!   replacement at open time. That does not automatically mean preserve-save
+//!   is forbidden.
+//! - Preserve-save is rejected only when the write would materialize
+//!   lossy-decoded text. Callers can preflight this through
+//!   [`Document::preserve_save_error`] / [`Document::save_error_for_options`]
+//!   and explicitly convert through [`DocumentSaveOptions`] or
+//!   [`Document::save_to_with_encoding`].
+//!
+//! ## Large Files and Edit Limits
+//!
+//! - Large files are supported for mmap-backed reads, viewport rendering,
+//!   line-count estimation, and background indexing without full
+//!   materialization.
+//! - Editing is allowed only when Qem can do it without violating built-in
+//!   safety limits. If an edit would require an unsafe promotion or full
+//!   materialization, Qem returns [`DocumentError::EditUnsupported`].
+//! - Frontends should use [`Document::edit_capability_at`],
+//!   [`Document::edit_capability_for_range`], or
+//!   [`Document::edit_capability_for_selection`] when they need to surface
+//!   that boundary before the user commits the action.
+//! - [`Document::display_line_count`] is the supported scroll-sizing value
+//!   while indexing is still in progress. Exact total line count may arrive
+//!   later through [`Document::indexing_state`] and the line-count status
+//!   helpers.
+//!
+//! ## Session and Background Job Guarantees
+//!
+//! - Typed session/status APIs such as [`DocumentSession::loading_state`],
+//!   [`DocumentSession::loading_phase`], [`DocumentSession::save_state`],
+//!   [`DocumentSession::background_issue`],
+//!   [`DocumentSession::take_background_issue`], and
+//!   [`DocumentSession::close_pending`] are the supported frontend-facing
+//!   async surface.
+//! - [`DocumentSession`] and [`EditorTab`] typed edit helpers are idle-only.
+//!   While a background open/save is active they return
+//!   [`DocumentError::EditUnsupported`] instead of mutating state under an
+//!   in-flight worker result.
+//! - [`DocumentSession::close_file`] is truthful. If a background open/save is
+//!   still running, close is deferred until that job completes instead of
+//!   silently dropping the worker result.
+//! - Repeated async open/save requests use first-job-wins semantics. While a
+//!   load/save is active, later requests are rejected until
+//!   [`DocumentSession::poll_background_job`] consumes the active result.
+//! - Raw [`DocumentSession::document_mut`] and [`DocumentSession::set_path`]
+//!   are escape hatches. Using them while busy invalidates the in-flight
+//!   worker result and turns the next poll into a discard/error path instead
+//!   of applying stale state.
+//!
+//! ## Search and Typed Reads
+//!
+//! - Literal search is part of the current public contract through
+//!   [`Document::find_next`], [`Document::find_prev`], [`Document::find_all`],
+//!   [`LiteralSearchQuery`], and the bounded query/range helpers.
+//! - This is a typed, case-sensitive literal search surface. It is not a
+//!   regex subsystem.
+//! - Bounded search returns only matches fully contained within the requested
+//!   typed range or boundary positions.
+//!
+//! ## Sidecars and Recovery
+//!
+//! - `.qem.lineidx` and `.qem.editlog` are internal sidecars used for
+//!   cache/recovery behavior.
+//! - Qem validates them against file length, modification time, and sampled
+//!   content fingerprint. When they do not match, Qem may rebuild them,
+//!   discard them, or reopen cleanly instead of trusting stale state.
+//! - Sidecar recovery behavior is public. Sidecar on-disk format is not.
+//!
+//! ## Public Behavior vs Internal Format
+//!
+//! - Stable public behavior in this release line includes the typed API
+//!   surface, open/save lifecycle, async progress semantics, huge-file read
+//!   contract, edit rejection semantics, and typed line/column rules.
+//! - Internal implementation details include sidecar binary layout, cache
+//!   structure, exact storage layout, and backing/layout decisions that are
+//!   not explicitly promised by the typed API.
 
 pub mod document;
 #[cfg(feature = "editor")]

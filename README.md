@@ -52,14 +52,14 @@ If Qem is useful to you and you want to support the project:
 
 ```toml
 [dependencies]
-qem = "0.6.3"
+qem = "0.7.0"
 ```
 
 To disable the editor/session wrapper and use only the document/storage layer:
 
 ```toml
 [dependencies]
-qem = { version = "0.6.3", default-features = false }
+qem = { version = "0.7.0", default-features = false }
 ```
 
 ## Cargo features
@@ -76,7 +76,7 @@ Example:
 
 ```toml
 [dependencies]
-qem = { version = "0.6.3", default-features = false, features = ["editor", "tmp-exe-dir"] }
+qem = { version = "0.7.0", default-features = false, features = ["editor", "tmp-exe-dir"] }
 ```
 
 Runtime override is also available:
@@ -120,21 +120,54 @@ the selected temp policy.
 - Treat `document_mut()`, `set_path()`, unconditional `compact_piece_table()`, and full-document `text_lossy()` / `text()` as advanced surface for callers that intentionally manage those trade-offs themselves.
 - Reach for raw `Document` only when your application is deliberately building its own session/job layer on top of the lower-level engine.
 
-## Current Support Matrix
+## Current Support Contract
 
-- UTF-8 / ASCII text is the primary stable fast path: open, viewport reads, edits, undo/redo, and saves are supported without transcoding.
-- Explicit legacy-encoding open/save is available through `Document::open_with_encoding(...)`, `Document::save_to_with_encoding(...)`, and the matching `DocumentSession` / `EditorTab` wrappers. For BOM-backed UTF-16 files there is also a convenience `Document::open_with_auto_encoding_detection(...)` path. If you want a more extensible contract now, the same flows are also exposed through `DocumentOpenOptions`, `OpenEncodingPolicy`, and `DocumentSaveOptions`.
-- Auto-detect open currently recognizes BOM-backed UTF-16 files and otherwise keeps the normal UTF-8 / ASCII fast path. If you already know a likely legacy fallback, you can opt into "detect first, otherwise reinterpret as X" through `DocumentOpenOptions::with_auto_encoding_detection_and_fallback(...)` and the matching session/tab helpers.
-- Non-UTF8 opens currently materialize into a rope-backed document instead of using the mmap fast path. Very large legacy-encoded files may therefore still be rejected until the broader encoding contract lands in a later release.
-- `decoding_had_errors()` now means Qem has already seen malformed source bytes, but preserve-save is only rejected when the write would materialize lossy-decoded text. Clean raw mmap / piece-table preserve can still stay allowed, while rope-backed legacy opens and UTF-8 documents after lossy materialization/edit correctly fail with a typed `LossyDecodedPreserve`. You can preflight those cases through `preserve_save_error()` / `save_error_for_options(...)`, or explicitly convert on save through `DocumentSaveOptions::with_encoding(...)` and `Document::save_to_with_encoding(...)`.
-- Huge files are supported for mmap-backed reads, viewport rendering, line-count estimation, and background indexing without full materialization. Editing may be rejected when it would require unsafe rope promotion beyond the built-in size limits.
-- `.qem.lineidx` and `.qem.editlog` are internal cache/session sidecars. Qem invalidates them when file length, modification time, or sampled content fingerprint no longer match. Their on-disk formats are internal implementation details rather than stable interchange formats, so Qem may rebuild, discard, or version-bump them across releases.
-- Typed progress/state APIs such as `indexing_state()`, `loading_state()`, `loading_phase()`, `save_state()`, `background_issue()`, `take_background_issue()`, and `close_pending()` are the supported session-facing surface.
-- Literal search is available through `find_next(...)`, `find_prev(...)`, and `find_all(...)` on `Document`, `DocumentSession`, and `EditorTab`. For repeated searches with the same needle, `LiteralSearchQuery` lets you reuse a compiled literal query instead of rebuilding search state every time, including iterator paths through `find_all_query(...)` and the bounded `find_all_query_*` helpers. Bounded variants search only within a typed `TextRange` and reject matches that would cross the range boundary. This is a typed, case-sensitive literal search surface rather than a full regex/search subsystem.
-- `DocumentSession` and `EditorTab` typed edit helpers are idle-only: while a background open/save is active they return `EditUnsupported` instead of mutating a document that may soon be replaced or saved from an older snapshot. Raw `document_mut()` and `set_path()` remain escape hatches, but using either while busy invalidates the in-flight worker result so the next poll returns an error instead of applying stale state. If a close was deferred at the time, that new state change also cancels the deferred close.
-- `close_file()` is also truthful: if a background open/save is still running, the close is deferred until that job completes instead of silently dropping the worker result. Deferred closes after background saves are only applied on success; a failed save keeps the dirty document open.
-- Repeated async open/save requests use a first-job-wins policy: while a load/save is active, later requests are rejected and the original worker remains authoritative until `poll_background_job()` consumes its result.
-- Typed positions, ranges, and viewport columns use document text units. For UTF-8 text, line-local columns count Unicode scalar values, not grapheme clusters and not display cells. Stored CRLF still counts as one text unit between lines.
+### UTF-8 and ASCII
+
+- UTF-8 / ASCII text is the primary stable fast path. Open, viewport reads, edits, undo/redo, and save are supported without transcoding.
+- Huge-file reads use the mmap-oriented path when possible. Frontends should treat this as the main scalable contract for text viewing.
+- Typed positions, ranges, selections, and viewport columns use document text units. For UTF-8 text, line-local columns count Unicode scalar values, not grapheme clusters and not display cells.
+- Stored CRLF still counts as one text unit between lines for typed range/edit/navigation semantics.
+
+### Invalid UTF-8 and Other Encodings
+
+- Explicit legacy-encoding open/save is supported through `Document::open_with_encoding(...)`, `Document::save_to_with_encoding(...)`, and the matching `DocumentSession` / `EditorTab` wrappers.
+- Auto-detect open currently recognizes BOM-backed UTF-16 files. Otherwise Qem stays on the normal UTF-8 / ASCII path unless the caller provides an explicit fallback through `DocumentOpenOptions`.
+- Non-UTF8 opens currently materialize into a rope-backed document instead of using the mmap fast path. Very large legacy-encoded files may still be rejected until the wider encoding contract expands.
+- `decoding_had_errors()` means the source required lossy decode replacement at open time. That does not automatically mean preserve-save is forbidden.
+- Preserve-save is rejected only when the write would materialize lossy-decoded text. Callers can preflight this through `preserve_save_error()` / `save_error_for_options(...)` and explicitly convert through `DocumentSaveOptions::with_encoding(...)` or `Document::save_to_with_encoding(...)`.
+
+### Large Files and Edit Limits
+
+- Large files are supported for mmap-backed reads, viewport rendering, line-count estimation, and background indexing without full materialization.
+- Editing is allowed only when Qem can do it without violating built-in safety limits. If an edit would require an unsafe promotion or full materialization, Qem returns `EditUnsupported`.
+- Frontends should use `edit_capability_at(...)`, `edit_capability_for_range(...)`, or `edit_capability_for_selection(...)` when they need to surface that boundary before the user commits the action.
+- `display_line_count()` is the supported scroll-sizing value while indexing is still in progress. Exact total line count may arrive later through `indexing_state()` and the line-count status helpers.
+
+### Session and Background Job Guarantees
+
+- Typed session/status APIs such as `indexing_state()`, `loading_state()`, `loading_phase()`, `save_state()`, `background_issue()`, `take_background_issue()`, and `close_pending()` are the supported frontend-facing async surface.
+- `DocumentSession` and `EditorTab` typed edit helpers are idle-only. While a background open/save is active they return `EditUnsupported` instead of mutating state under an in-flight worker result.
+- `close_file()` is truthful. If a background open/save is still running, close is deferred until that job completes instead of silently dropping the worker result.
+- Repeated async open/save requests use first-job-wins semantics. While a load/save is active, later requests are rejected until `poll_background_job()` consumes the active result.
+- Raw `document_mut()` and `set_path()` are escape hatches. Using them while busy invalidates the in-flight worker result and turns the next poll into a discard/error path instead of applying stale state.
+
+### Search and Typed Reads
+
+- Literal search is part of the current public contract through `find_next(...)`, `find_prev(...)`, `find_all(...)`, `LiteralSearchQuery`, and the bounded query/range helpers.
+- This is a typed, case-sensitive literal search surface. It is not a regex subsystem.
+- Bounded search returns only matches fully contained within the requested typed range or boundary positions.
+
+### Sidecars and Recovery
+
+- `.qem.lineidx` and `.qem.editlog` are internal sidecars used for cache/recovery behavior.
+- Qem validates them against file length, modification time, and sampled content fingerprint. When they do not match, Qem may rebuild them, discard them, or reopen cleanly instead of trusting stale state.
+- Sidecar recovery behavior is public. Sidecar on-disk format is not.
+
+### Public Behavior vs Internal Format
+
+- Stable public behavior in this release line includes the typed API surface, open/save lifecycle, async progress semantics, huge-file read contract, edit rejection semantics, and typed line/column rules.
+- Internal implementation details include sidecar binary layout, cache structure, exact storage layout, and backing/layout decisions that are not explicitly promised by the typed API.
 
 ## Column Semantics
 
@@ -180,10 +213,28 @@ cargo run --example frontend_session --features editor -- input.txt output.txt
 
 ## Roadmap
 
-- `0.7.0`: Advanced Text Semantics.
-- `0.8.0`: Stable Extension Surface.
-- Ongoing: public benchmarks, honest `1TB` caveats, and more
-  recovery/huge-file-search regression coverage.
+Current focus is `0.7.0` as an integration release, not a feature-expansion
+release.
+
+- `0.7.0`: integration release. Ship official frontend entry examples, tighten
+  only the API surface that real integrations actually need, and make the
+  README/support contract usable without reading half the source.
+- `0.8.0`: regex + fast search + encoding stabilization. Add a typed regex
+  search surface alongside literal search, push literal and regex search to
+  practical real-file speed on `mmap`, `piece_table`, and `rope` backings,
+  and widen the encoding contract with full `LossyDecodedPreserve` semantics.
+- `0.9.0`: stability hardening. Make backing transitions, sidecar recovery,
+  and huge-file edit rejection explicit and predictable, complete the
+  "truth after error" test matrix, and land regression benches.
+- `1.0.0`: public API freeze. Stabilize the typed surface, publish migration
+  guidance, and keep internal storage/layout details explicitly out of the
+  stable API promise.
+
+The detailed release gates, non-goals, and exit criteria live in
+[`ROADMAP.md`](ROADMAP.md).
+
+Draft migration notes for the upcoming integration release live in
+[`MIGRATION-0.7.md`](MIGRATION-0.7.md).
 
 ## Examples
 
@@ -214,6 +265,23 @@ state, distinguish open phases from continued indexing, compute a viewport,
 read one maintenance snapshot through `maintenance_status()`, and render
 visible rows through `DocumentSession::read_viewport(...)` while keeping UI
 concerns out of the engine.
+
+Run the minimal workspace `egui` demo for a small viewer/editor integration:
+
+```powershell
+cargo run -p qem-egui-demo -- "C:\path\to\input.txt"
+```
+
+Run the large-file-oriented `egui` demo when you want an explicit viewport,
+gutter, caret, jump/page/tail navigation, open/save, and background status:
+
+```powershell
+cargo run -p qem-egui-demo --bin large_file -- "C:\path\to\huge.log"
+```
+
+The `qem-egui-demo` workspace member keeps GUI dependencies out of the core
+crate while exercising two actual frontend paths around `DocumentSession`:
+one minimal viewer/editor and one more explicit large-file viewport workflow.
 
 Exercise the typed `Document` edit/read API directly:
 
@@ -349,5 +417,6 @@ cargo bench --bench document_perf -- session_layer
 ## Project Links
 
 - Benchmark methodology lives in [`BENCHMARKS.md`](BENCHMARKS.md).
+- The current in-repo `0.7.0` seed perf matrix lives in [`PERF-BASELINE-0.7.md`](PERF-BASELINE-0.7.md).
 - Cross-platform CI and Linux stress coverage live in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 - Repository: <https://github.com/mrhanty42/Qem>

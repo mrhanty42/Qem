@@ -24,10 +24,88 @@ param(
 
     [string]$OutputJsonl = "target\perf-matrix.jsonl",
 
+    [switch]$MeasureSave,
+
+    [string]$SaveDir = "target\perf-matrix-saves",
+
+    [switch]$KeepSaveOutputs,
+
     [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
+
+function Get-SafePerfLabel {
+    param(
+        [string]$Value
+    )
+
+    $sanitized = $Value -replace '[^A-Za-z0-9._-]+', '_'
+    if ([string]::IsNullOrWhiteSpace($sanitized)) {
+        return "perf"
+    }
+
+    return $sanitized.Trim('_')
+}
+
+function Invoke-PerfProbe {
+    param(
+        [string]$ExePath,
+        [string[]]$Arguments,
+        [string]$WorkingDirectory
+    )
+
+    $token = [Guid]::NewGuid().ToString("N")
+    $stdoutPath = Join-Path $WorkingDirectory ("perf-probe-stdout-{0}.log" -f $token)
+    $stderrPath = Join-Path $WorkingDirectory ("perf-probe-stderr-{0}.log" -f $token)
+
+    try {
+        $process = Start-Process `
+            -FilePath $ExePath `
+            -ArgumentList $Arguments `
+            -WorkingDirectory $WorkingDirectory `
+            -NoNewWindow `
+            -PassThru `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath
+
+        $peakWorkingSetBytes = 0L
+        while (-not $process.HasExited) {
+            $process.Refresh()
+            if ($process.WorkingSet64 -gt $peakWorkingSetBytes) {
+                $peakWorkingSetBytes = [int64]$process.WorkingSet64
+            }
+            Start-Sleep -Milliseconds 10
+        }
+        $process.WaitForExit()
+        $process.Refresh()
+        if ($process.WorkingSet64 -gt $peakWorkingSetBytes) {
+            $peakWorkingSetBytes = [int64]$process.WorkingSet64
+        }
+
+        $outputLines = @()
+        if (Test-Path $stdoutPath) {
+            $outputLines += Get-Content $stdoutPath
+        }
+        if (Test-Path $stderrPath) {
+            $outputLines += Get-Content $stderrPath
+        }
+
+        return @{
+            ExitCode = $process.ExitCode
+            OutputLines = $outputLines
+            PeakWorkingSetBytes = $peakWorkingSetBytes
+        }
+    }
+    finally {
+        if (Test-Path $stdoutPath) {
+            Remove-Item -Force $stdoutPath
+        }
+        if (Test-Path $stderrPath) {
+            Remove-Item -Force $stderrPath
+        }
+    }
+}
 
 if ($FindAllLimit -gt 0 -and [string]::IsNullOrWhiteSpace($Needle)) {
     throw "--FindAllLimit requires -Needle."
@@ -74,6 +152,11 @@ if (Test-Path $outputPath) {
 }
 
 $perfProbeExe = Join-Path $repoRoot "target\debug\examples\perf_probe.exe"
+$saveRoot = Join-Path $repoRoot $SaveDir
+
+if ($MeasureSave -and -not (Test-Path $saveRoot)) {
+    New-Item -ItemType Directory -Path $saveRoot | Out-Null
+}
 
 Push-Location $repoRoot
 try {
@@ -118,13 +201,21 @@ try {
                         $args += @("--seed-edit", $SeedEdit)
                     }
 
+                    $saveOutput = $null
+                    if ($MeasureSave) {
+                        $label = Get-SafePerfLabel ("{0}-{1}-{2}-{3}-{4}" -f $inputLabel, $viewportAnchor, $state, $runIndex, $MatrixLabel)
+                        $saveOutput = Join-Path $saveRoot ("{0}.out" -f $label)
+                        $args += @("--save", $saveOutput)
+                    }
+
                     Write-Host ("[{0}/{1}] anchor={2} state={3} file={4}" -f $runIndex, $Repeats, $viewportAnchor, $state, $inputLabel)
 
-                    $rawOutput = & $perfProbeExe @args 2>&1
-                    if ($LASTEXITCODE -ne 0) {
+                    $probeRun = Invoke-PerfProbe -ExePath $perfProbeExe -Arguments $args -WorkingDirectory $repoRoot
+                    if ($probeRun.ExitCode -ne $null -and $probeRun.ExitCode -ne 0) {
                         throw "perf_probe failed for anchor=$viewportAnchor state=$state file=$inputFullPath"
                     }
 
+                    $rawOutput = $probeRun.OutputLines
                     $jsonLine = $rawOutput | Where-Object { $_.TrimStart().StartsWith("{") } | Select-Object -Last 1
                     if (-not $jsonLine) {
                         throw "perf_probe did not emit JSON for anchor=$viewportAnchor state=$state file=$inputFullPath"
@@ -137,8 +228,13 @@ try {
                     $record | Add-Member -NotePropertyName "matrix_wait_secs" -NotePropertyValue $WaitSecs
                     $record | Add-Member -NotePropertyName "matrix_label" -NotePropertyValue $MatrixLabel
                     $record | Add-Member -NotePropertyName "matrix_viewport_anchor" -NotePropertyValue $viewportAnchor
+                    $record | Add-Member -NotePropertyName "matrix_peak_working_set_bytes" -NotePropertyValue $probeRun.PeakWorkingSetBytes
 
                     ($record | ConvertTo-Json -Compress) | Add-Content -Path $outputPath
+
+                    if ($MeasureSave -and -not $KeepSaveOutputs -and $saveOutput -and (Test-Path $saveOutput)) {
+                        Remove-Item -Force $saveOutput
+                    }
                 }
             }
         }
