@@ -455,6 +455,7 @@ fn precise_piece_table_line_lengths_require_complete_index() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -485,6 +486,7 @@ fn precise_piece_table_line_lengths_reject_large_line_arrays() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -519,6 +521,7 @@ fn piece_table_line_lengths_for_edit_builds_partial_prefix() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -579,6 +582,58 @@ fn piece_table_insert_in_virtual_space_materializes_spaces() {
 }
 
 #[test]
+fn piece_table_insert_encoded_bytes_at_appends_raw_bytes_to_add_buffer() {
+    // The non-UTF-8 edit path must write the raw encoded bytes
+    // verbatim into the piece-tree add buffer without any UTF-8
+    // validation or normalization. Here we simulate a Class A
+    // (windows-1251) document: the original bytes 0xCF 0xF0 0xE8 are
+    // already in the target encoding, and we splice an additional
+    // legacy byte (0xC0) into the middle of the document.
+    let dir = std::env::temp_dir().join(format!(
+        "standpad-doc-insert-encoded-bytes-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("encoded.bin");
+    let original: &[u8] = &[0xCF, 0xF0, 0xE8];
+    std::fs::write(&path, original).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+    let mut piece_table = PieceTable::new(storage, vec![original.len()], true);
+
+    let inserted: &[u8] = &[0xC0];
+    let outcome = piece_table.insert_encoded_bytes_at(2, inserted).unwrap();
+
+    assert!(outcome.edited);
+    assert_eq!(outcome.cursor, (0, 0));
+
+    // Reading the full byte range must return the spliced byte stream
+    // exactly: original[..2] ++ inserted ++ original[2..].
+    let read = piece_table.read_range(0, piece_table.total_len());
+    assert_eq!(read, vec![0xCF, 0xF0, 0xC0, 0xE8]);
+    assert_eq!(piece_table.total_len(), original.len() + inserted.len());
+
+    // Inserting an empty slice must be a no-op and not bump total_len.
+    let prev_len = piece_table.total_len();
+    let no_op = piece_table.insert_encoded_bytes_at(1, &[]).unwrap();
+    assert!(!no_op.edited);
+    assert_eq!(piece_table.total_len(), prev_len);
+
+    // Inserting bytes containing a raw 0x0A must update the line counter
+    // (we count line breaks by scanning raw 0x0A / 0x0D bytes; this is
+    // exact for ASCII-supersets and an accepted approximation for UTF-16).
+    let line_count_before = piece_table.line_count();
+    let with_lf: &[u8] = &[0xC1, 0x0A, 0xC2];
+    let outcome = piece_table
+        .insert_encoded_bytes_at(piece_table.total_len(), with_lf)
+        .unwrap();
+    assert!(outcome.edited);
+    assert!(piece_table.line_count() > line_count_before);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn piece_table_line_lengths_for_edit_supports_large_exact_prefix() {
     let dir =
         std::env::temp_dir().join(format!("standpad-doc-large-prefix-{}", std::process::id()));
@@ -604,6 +659,7 @@ fn piece_table_line_lengths_for_edit_supports_large_exact_prefix() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -646,6 +702,7 @@ fn insert_uses_partial_piece_table_before_full_index_finishes() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -693,6 +750,7 @@ fn insert_fully_indexes_medium_unindexed_piece_table_documents() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -734,6 +792,7 @@ fn partial_piece_table_can_report_exact_total_lines_without_precise_line_lengths
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -1124,6 +1183,7 @@ fn document_compact_piece_table_preserves_recovery_and_clears_recommendation() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -1292,6 +1352,7 @@ fn prepare_save_with_forced_compaction_policy_compacts_before_snapshotting() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -1684,6 +1745,49 @@ fn open_with_auto_detection_detects_utf16be_bom() {
 }
 
 #[test]
+fn open_with_auto_detection_detects_utf8_bom_and_strips_it_from_content() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf8-bom-source.txt");
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(b"hello\nworld\n");
+    std::fs::write(&path, bytes).unwrap();
+
+    let doc = Document::open_with_auto_encoding_detection(path).unwrap();
+
+    assert_eq!(doc.encoding(), DocumentEncoding::utf8());
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
+    assert!(!doc.decoding_had_errors());
+    // BOM must not appear in document content.
+    assert_eq!(doc.text_lossy(), "hello\nworld\n");
+    assert_eq!(doc.line_len_chars(0), 5);
+}
+
+#[test]
+fn open_without_options_does_not_strip_utf8_bom_under_default_fast_path() {
+    // Without auto-detection the open path is the UTF-8 fast path. Frontends
+    // that intentionally bypass auto-detection are responsible for handling
+    // a BOM if they need to. This test pins that behavior so future changes
+    // do not silently rewrite content during a default open.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf8-bom-default-open.txt");
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(b"hello\n");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let doc = Document::open(&path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while doc.is_indexing() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(doc.encoding(), DocumentEncoding::utf8());
+    // Default open path: the BOM stays in raw bytes. Frontends opt in to
+    // BOM-aware behavior through `Document::open_with_auto_encoding_detection`
+    // or `DocumentOpenOptions::with_auto_encoding_detection`.
+    assert_eq!(doc.file_len(), bytes.len());
+}
+
+#[test]
 fn open_options_auto_detection_fallback_exposes_override() {
     let encoding = DocumentEncoding::from_label("windows-1252").unwrap();
     let options = DocumentOpenOptions::new().with_auto_encoding_detection_and_fallback(encoding);
@@ -1756,7 +1860,17 @@ fn open_with_auto_detection_and_fallback_still_prefers_detected_bom() {
 }
 
 #[test]
-fn preserve_save_reports_unsupported_contract_for_utf16_source() {
+fn preserve_save_succeeds_for_unedited_utf16_source() {
+    // A UTF-16 document opened through the Class B
+    // native path is mmap-only (`rope: None`, `piece_table: None`),
+    // so the on-disk bytes already exist in the target encoding.
+    // Preserve-save streams them byte-for-byte through the
+    // `SaveSnapshot::Mmap` branch even though `encoding_rs` cannot
+    // re-encode through `UTF-16LE` directly. Edited UTF-16 documents
+    // (rope or piece-table populated) still surface
+    // `PreserveSaveUnsupported` because they require a real encode
+    // path; that case is exercised by the dedicated
+    // unrepresentable-text tests below.
     let dir = tempdir().unwrap();
     let path = dir.path().join("utf16le-preserve.txt");
     let saved = dir.path().join("utf16le-preserve-saved.txt");
@@ -1764,19 +1878,21 @@ fn preserve_save_reports_unsupported_contract_for_utf16_source() {
     for unit in "hello\n".encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    std::fs::write(&path, bytes).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
 
     let mut doc = Document::open_with_auto_encoding_detection(path).unwrap();
-    let err = doc.save_to(&saved).unwrap_err();
-    assert!(matches!(
-        err,
-        DocumentError::Encoding {
-            path: failed_path,
-            operation: "save",
-            encoding,
-            reason: DocumentEncodingErrorKind::PreserveSaveUnsupported,
-        } if failed_path == saved && encoding == DocumentEncoding::utf16le()
-    ));
+    assert_eq!(doc.encoding(), DocumentEncoding::utf16le());
+    assert!(
+        doc.can_preserve_save(),
+        "mmap-only UTF-16 document must allow preserve-save",
+    );
+    doc.save_to(&saved).expect("preserve-save must succeed");
+
+    let saved_bytes = std::fs::read(&saved).unwrap();
+    assert_eq!(
+        saved_bytes, bytes,
+        "preserve-save without edits must produce byte-identical bytes",
+    );
 }
 
 #[test]
@@ -1885,6 +2001,7 @@ fn incomplete_mmap_singular_line_read_uses_exact_scan_for_existing_line() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -1917,6 +2034,7 @@ fn incomplete_mmap_single_row_batch_reads_match_singular_line_lookup() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2003,6 +2121,7 @@ fn partial_piece_table_line_reads_follow_current_text_after_prefix_edit() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2059,6 +2178,7 @@ fn singular_partial_piece_table_line_slice_does_not_fall_back_to_stale_mmap() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2105,6 +2225,7 @@ fn partial_piece_table_find_prev_does_not_return_match_after_unresolved_before_p
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2152,6 +2273,7 @@ fn partial_piece_table_find_next_does_not_start_before_unresolved_from_position(
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2198,6 +2320,7 @@ fn partial_piece_table_find_next_and_iterators_do_not_relabel_match_before_unres
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2250,6 +2373,7 @@ fn partial_piece_table_find_next_can_start_on_scannable_incomplete_line() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2314,6 +2438,7 @@ fn partial_piece_table_line_slice_stays_exact_on_scannable_incomplete_prefix() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2364,6 +2489,7 @@ fn partial_piece_table_find_prev_can_end_on_scannable_incomplete_line() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2412,6 +2538,7 @@ fn partial_piece_table_empty_typed_reads_stay_exact_on_scannable_incomplete_line
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2458,6 +2585,7 @@ fn selection_read_stays_exact_when_partial_piece_table_head_is_scannable_incompl
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2503,6 +2631,7 @@ fn typed_range_read_matches_selection_exactness_on_scannable_incomplete_partial_
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2550,6 +2679,7 @@ fn partial_piece_table_bounded_search_does_not_escape_unresolved_end_position() 
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2602,6 +2732,7 @@ fn partial_piece_table_bounded_search_does_not_expand_unresolved_end_line_to_eof
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2654,6 +2785,7 @@ fn partial_piece_table_find_next_in_range_does_not_rewind_unresolved_start() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2698,6 +2830,7 @@ fn partial_piece_table_line_slices_do_not_invent_trailing_empty_line_without_new
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2745,6 +2878,7 @@ fn partial_piece_table_position_helpers_do_not_fall_back_to_stale_mmap_beyond_sc
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -2987,6 +3121,7 @@ fn line_slices_near_tail_read_from_file_end_before_full_index() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -3027,6 +3162,7 @@ fn line_slices_near_tail_do_not_invent_empty_eof_row_without_trailing_newline() 
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -3086,6 +3222,7 @@ fn line_slices_bail_out_when_next_line_scan_would_be_unbounded() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -3119,6 +3256,7 @@ fn indexing_progress_reports_inflight_state() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -3378,7 +3516,7 @@ fn large_piece_table_non_utf8_save_preflight_reports_reopen_limit() {
 }
 
 #[test]
-fn piece_table_save_to_with_encoding_reopens_as_converted_rope_contract() {
+fn piece_table_save_to_with_encoding_reopens_as_class_a_native_contract() {
     let dir = std::env::temp_dir().join(format!(
         "qem-doc-save-piece-table-convert-{}",
         std::process::id()
@@ -3404,8 +3542,9 @@ fn piece_table_save_to_with_encoding_reopens_as_converted_rope_contract() {
         DocumentEncodingOrigin::SaveConversion
     );
     assert!(!doc.is_dirty());
-    assert!(!doc.has_piece_table());
-    assert!(doc.has_rope());
+    // windows-1251 (Class A) re-opens through the native mmap
+    // path with no rope or piece-table backing.
+    assert!(!doc.has_rope() && !doc.has_piece_table() && doc.encoding() == encoding);
     assert!(doc.text_lossy().starts_with(insert_hello));
     assert!(!editlog_path(&src).exists());
     assert!(!editlog_path(&dst).exists());
@@ -3806,6 +3945,7 @@ fn try_insert_rejects_large_piece_table_promotion_to_rope() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -4008,6 +4148,7 @@ fn partial_piece_table_position_helpers_follow_current_text_after_prefix_edit() 
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -4060,6 +4201,7 @@ fn partial_piece_table_clamp_position_preserves_scannable_lines_beyond_estimated
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -4106,6 +4248,7 @@ fn partial_piece_table_position_helpers_do_not_invent_text_units_past_safe_bound
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -4144,6 +4287,7 @@ fn incomplete_mmap_position_helpers_clamp_to_eof_instead_of_inventing_lines() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -4182,6 +4326,7 @@ fn incomplete_mmap_line_len_chars_does_not_invent_tail_columns() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -4284,6 +4429,7 @@ fn selection_read_is_inexact_when_partial_piece_table_head_is_unresolved() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -4326,6 +4472,7 @@ fn selection_read_stays_exact_on_long_exact_partial_piece_table_line() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -4371,6 +4518,7 @@ fn empty_range_read_is_inexact_when_partial_piece_table_start_is_unresolved() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -4404,6 +4552,7 @@ fn incomplete_mmap_nonempty_range_read_past_eof_is_empty_and_inexact() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -4445,6 +4594,7 @@ fn incomplete_mmap_typed_read_uses_exact_start_offset_instead_of_heuristic_line_
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -4946,6 +5096,7 @@ fn selection_replace_promotes_partial_piece_table_before_clamping_unresolved_hea
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -4990,6 +5141,7 @@ fn selection_edit_capability_requires_promotion_for_unresolved_partial_piece_tab
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -5113,6 +5265,7 @@ fn document_status_reports_pending_exact_line_count() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -5150,6 +5303,7 @@ fn wait_for_exact_line_count_observes_background_disk_index_completion() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -5170,7 +5324,14 @@ fn wait_for_exact_line_count_observes_background_disk_index_completion() {
 }
 
 #[test]
-fn preserve_save_preflight_reports_lossy_and_unsupported_contracts() {
+fn preserve_save_preflight_reports_lossy_for_decoded_documents() {
+    // Mmap-only UTF-16 documents are byte-streamable
+    // through preserve-save (no rope, no piece-table — the on-disk bytes
+    // are already in the target encoding), so they no longer surface
+    // `PreserveSaveUnsupported`. Lossy decoding through `Shift_JIS` (which
+    // currently still decodes through a rope) still surfaces
+    // `LossyDecodedPreserve`. The UTF-16 portion of this preflight test
+    // therefore now asserts the positive contract.
     let dir = tempdir().unwrap();
     let lossy_path = dir.path().join("lossy-shift-jis.txt");
     let utf16_path = dir.path().join("utf16le-source.txt");
@@ -5195,15 +5356,12 @@ fn preserve_save_preflight_reports_lossy_and_unsupported_contracts() {
     std::fs::write(&utf16_path, utf16_bytes).unwrap();
 
     let utf16_doc = Document::open_with_auto_encoding_detection(utf16_path).unwrap();
-    assert!(!utf16_doc.can_preserve_save());
-    assert_eq!(
-        utf16_doc.preserve_save_error(),
-        Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
+    assert!(
+        utf16_doc.can_preserve_save(),
+        "mmap-only UTF-16 document must allow preserve-save",
     );
-    assert_eq!(
-        utf16_doc.status().preserve_save_error(),
-        Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
-    );
+    assert_eq!(utf16_doc.preserve_save_error(), None);
+    assert_eq!(utf16_doc.status().preserve_save_error(), None);
 }
 
 #[test]
@@ -5255,7 +5413,7 @@ fn lossy_document_save_conversion_preflight_allows_utf8_salvage() {
 fn preserve_save_preflight_reports_unrepresentable_legacy_edits() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("legacy-cp1251-preflight.txt");
-    let saved = dir.path().join("legacy-cp1251-preflight-saved.txt");
+    let _saved = dir.path().join("legacy-cp1251-preflight-saved.txt");
     let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
     let (bytes, used, had_errors) =
         WINDOWS_1251.encode("\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}\n");
@@ -5264,32 +5422,31 @@ fn preserve_save_preflight_reports_unrepresentable_legacy_edits() {
     std::fs::write(&path, bytes.as_ref()).unwrap();
 
     let mut doc = Document::open_with_encoding(path, encoding).unwrap();
-    let _ = doc.try_insert_text_at(0, 0, "emoji \u{1F642}\n").unwrap();
-
-    assert_eq!(
-        doc.preserve_save_error(),
-        Some(DocumentEncodingErrorKind::UnrepresentableText)
-    );
-    assert!(!doc.can_preserve_save());
-    assert_eq!(
-        doc.save_error_for_options(DocumentSaveOptions::new()),
-        Some(DocumentEncodingErrorKind::UnrepresentableText)
-    );
-    assert_eq!(
-        doc.status().preserve_save_error(),
-        Some(DocumentEncodingErrorKind::UnrepresentableText)
-    );
-
-    let err = doc.save_to(&saved).unwrap_err();
+    // The non-UTF-8 edit path rejects unrepresentable scalars at the
+    // insert itself rather than letting the rope-decode bridge
+    // swallow them and then surfacing the failure only at preserve-save
+    // preflight. The typed
+    // error path is now `try_insert_text_at` directly with the operation
+    // tagged as `"insert"`.
+    let err = doc
+        .try_insert_text_at(0, 0, "emoji \u{1F642}\n")
+        .unwrap_err();
     assert!(matches!(
         err,
         DocumentError::Encoding {
-            path: failed_path,
-            operation: "save",
+            operation: "insert",
             encoding: failed_encoding,
             reason: DocumentEncodingErrorKind::UnrepresentableText,
-        } if failed_path == saved && failed_encoding == encoding
+            ..
+        } if failed_encoding == encoding
     ));
+
+    // The document remained clean and on its native mmap backing because
+    // unrepresentable inserts must not touch the add buffer.
+    assert!(!doc.is_dirty());
+    assert!(!doc.has_piece_table());
+    assert!(!doc.has_rope());
+    assert!(doc.can_preserve_save());
 }
 
 #[test]
@@ -5438,6 +5595,7 @@ fn edit_capability_reports_partial_piece_table_promotion_limits() {
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
         encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
@@ -5675,4 +5833,299 @@ proptest! {
             "clean reopened save must not create a recoverable sidecar"
         );
     }
+}
+// ---------------------------------------------------------------------
+// try_replace_range / try_delete_range for non-UTF-8 documents.
+// Each test opens a document through
+// the Class A / Class B native path, runs an encoded edit, and asserts
+// that `save_to` round-trips the resulting target-encoding bytes
+// byte-identically through `decode_with_bom_removal`.
+// ---------------------------------------------------------------------
+
+#[test]
+fn try_replace_range_encoded_windows_1251_replaces_ascii_substring() {
+    // A windows-1251 document opened through the Class A
+    // native path runs every edit through `try_replace_range_encoded`,
+    // which composes encoded delete and encoded insert. The replacement
+    // bytes land in the piece-tree's add buffer in the target encoding
+    // (single-byte ASCII supersets are byte-identical to ASCII for the
+    // ASCII subset, so the assertion is on the literal cyrillic and
+    // ASCII bytes).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cp1251-replace.txt");
+    let saved = dir.path().join("cp1251-replace-saved.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+
+    let source = "hello мир\n";
+    let (bytes, used, had_errors) = WINDOWS_1251.encode(source);
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    std::fs::write(&path, bytes.as_ref()).unwrap();
+
+    let mut doc = Document::open_with_encoding(path, encoding).unwrap();
+    assert_eq!(doc.encoding(), encoding);
+
+    // Replace "hello" (5 ASCII chars at column 0) with "Привет" — six
+    // cyrillic glyphs, each one byte in windows-1251.
+    let cursor = doc
+        .try_replace_range(0, 0, 5, "Привет")
+        .expect("encoded replace must succeed");
+    assert_eq!(cursor, (0, 6));
+    assert!(doc.is_dirty());
+
+    doc.save_to(&saved).unwrap();
+    let raw = std::fs::read(&saved).unwrap();
+    let (decoded, used, had_errors) = WINDOWS_1251.decode(&raw);
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    assert_eq!(decoded, "Привет мир\n");
+}
+
+#[test]
+fn try_replace_range_encoded_windows_1251_replacing_with_empty_deletes_range() {
+    // A non-UTF-8 replace with an empty replacement string
+    // must be byte-equivalent to a delete. The piece-tree byte range is
+    // aligned through `align_byte_offset` (a no-op for Class A) so the
+    // delete spans exactly five ASCII bytes.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cp1251-delete.txt");
+    let saved = dir.path().join("cp1251-delete-saved.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+
+    let source = "hello мир\n";
+    let (bytes, used, had_errors) = WINDOWS_1251.encode(source);
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    std::fs::write(&path, bytes.as_ref()).unwrap();
+
+    let mut doc = Document::open_with_encoding(path, encoding).unwrap();
+    let cursor = doc
+        .try_replace_range(0, 0, 6, "")
+        .expect("encoded delete via replace must succeed");
+    assert_eq!(cursor, (0, 0));
+    assert!(doc.is_dirty());
+
+    doc.save_to(&saved).unwrap();
+    let raw = std::fs::read(&saved).unwrap();
+    let (decoded, used, had_errors) = WINDOWS_1251.decode(&raw);
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    assert_eq!(decoded, "мир\n");
+}
+
+#[test]
+fn try_replace_range_encoded_utf16_le_replaces_ascii_substring() {
+    // UTF-16 LE replace runs through the encoded
+    // path with `align_byte_offset` rounding the deletion endpoints
+    // onto even byte boundaries before `PieceTable::delete_range` runs.
+    // The encoded insert encodes the replacement via `str::encode_utf16`
+    // and writes the LE bytes verbatim into the piece-tree add buffer.
+    //
+    // `len_chars` is engine-aware: one UTF-16 BMP cell
+    // counts as one text unit (two bytes), so replacing the full "hi"
+    // line content takes `len_chars = 2`. The piece-tree's
+    // `*_with_engine` walkers map (0, 0) → byte 0 and advance two text
+    // units to byte 4, exactly the encoded "hi" range; the encoded
+    // insert then writes "AB" verbatim.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf16le-replace.txt");
+    let saved = dir.path().join("utf16le-replace-saved.txt");
+    let encoding = DocumentEncoding::from_label("UTF-16LE").unwrap();
+
+    // "hi\n" in UTF-16LE: 6 bytes total (h=68 00, i=69 00, \n=0A 00).
+    let source = "hi\n";
+    let mut bytes = Vec::new();
+    for unit in source.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut doc = Document::open_with_encoding(path, encoding).unwrap();
+    assert_eq!(doc.encoding(), encoding);
+
+    // Replace the two BMP cells of "hi" — `len_chars = 2`.
+    let cursor = doc
+        .try_replace_range(0, 0, 2, "AB")
+        .expect("encoded replace must succeed for UTF-16LE");
+    assert!(doc.is_dirty());
+    assert_eq!(cursor, (0, 2));
+
+    doc.save_to(&saved).unwrap();
+    let raw = std::fs::read(&saved).unwrap();
+    let (decoded, had_errors) = encoding_rs::UTF_16LE.decode_with_bom_removal(&raw);
+    assert!(!had_errors);
+    assert_eq!(decoded, "AB\n");
+}
+
+#[test]
+fn try_replace_range_encoded_utf16_le_pure_delete_keeps_alignment() {
+    // Deleting a 2-text-unit range on a UTF-16LE
+    // document removes the four bytes encoding "bc" through
+    // `PieceTable::delete_range`. `align_byte_offset` keeps both
+    // endpoints even-aligned (byte 2 → 2, byte 6 → 6); the engine-
+    // aware text-unit walker advances exactly two BMP cells from byte
+    // 2 to byte 6.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf16le-delete.txt");
+    let saved = dir.path().join("utf16le-delete-saved.txt");
+    let encoding = DocumentEncoding::from_label("UTF-16LE").unwrap();
+
+    let source = "abcd\n";
+    let mut bytes = Vec::new();
+    for unit in source.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut doc = Document::open_with_encoding(path, encoding).unwrap();
+    let cursor = doc
+        .try_replace_range(0, 1, 2, "")
+        .expect("encoded delete via replace must succeed");
+    assert_eq!(cursor, (0, 1));
+    assert!(doc.is_dirty());
+
+    doc.save_to(&saved).unwrap();
+    let raw = std::fs::read(&saved).unwrap();
+    let (decoded, had_errors) = encoding_rs::UTF_16LE.decode_with_bom_removal(&raw);
+    assert!(!had_errors);
+    assert_eq!(decoded, "ad\n");
+}
+
+#[test]
+fn try_backspace_at_encoded_utf16_le_walks_back_one_bmp_cell() {
+    // Backspace on UTF-16 LE removes exactly one
+    // BMP cell (two bytes) through the engine's `step_backward`. The
+    // piece-tree's `delete_range` runs on aligned offsets so adjacent
+    // cells stay intact.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf16le-backspace.txt");
+    let saved = dir.path().join("utf16le-backspace-saved.txt");
+    let encoding = DocumentEncoding::from_label("UTF-16LE").unwrap();
+
+    let source = "abc\n";
+    let mut bytes = Vec::new();
+    for unit in source.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut doc = Document::open_with_encoding(path, encoding).unwrap();
+    let (edited, line0, col0) = doc
+        .try_backspace_at(0, 3)
+        .expect("encoded backspace must succeed for UTF-16LE");
+    assert!(edited);
+    assert_eq!((line0, col0), (0, 2));
+    assert!(doc.is_dirty());
+
+    doc.save_to(&saved).unwrap();
+    let raw = std::fs::read(&saved).unwrap();
+    let (decoded, had_errors) = encoding_rs::UTF_16LE.decode_with_bom_removal(&raw);
+    assert!(!had_errors);
+    assert_eq!(decoded, "ab\n");
+}
+
+#[test]
+fn try_replace_range_encoded_unrepresentable_text_leaves_document_unchanged() {
+    // Replacing a range with text that contains a Unicode scalar
+    // unrepresentable in the document's target encoding must return
+    // `UnrepresentableText` *before* the existing range is removed.
+    // The document must remain dirty-clean and byte-identical to the
+    // original.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cp1251-replace-fail.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+
+    let source = "hello\n";
+    let (bytes, used, had_errors) = WINDOWS_1251.encode(source);
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    let original_bytes = bytes.into_owned();
+    std::fs::write(&path, &original_bytes).unwrap();
+
+    let mut doc = Document::open_with_encoding(&path, encoding).unwrap();
+    let pre_total = doc.file_len();
+    // 「日本」 — Japanese kanji, not representable in windows-1251.
+    let result = doc.try_replace_range(0, 0, 5, "日本");
+    assert!(matches!(
+        result,
+        Err(DocumentError::Encoding {
+            reason: DocumentEncodingErrorKind::UnrepresentableText,
+            ..
+        })
+    ));
+    // No mutation on unrepresentable input.
+    assert!(!doc.is_dirty());
+    assert_eq!(doc.file_len(), pre_total);
+    let saved = dir.path().join("cp1251-replace-fail-saved.txt");
+    doc.save_to(&saved).unwrap();
+    let after = std::fs::read(&saved).unwrap();
+    assert_eq!(after, original_bytes);
+}
+
+#[test]
+fn try_replace_range_encoded_shift_jis_replaces_2byte_kanji_substring() {
+    // Shift_JIS replace runs through
+    // `try_replace_range_encoded`. The encoded delete walks Shift_JIS
+    // 2-byte cells via `MultiByteEngine`, so `len_chars = 2` removes
+    // exactly two characters (four bytes). The encoded insert encodes
+    // ASCII directly into the piece-tree's add buffer.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("shift_jis-replace.txt");
+    let saved = dir.path().join("shift_jis-replace-saved.txt");
+    let encoding = DocumentEncoding::from_label("Shift_JIS").unwrap();
+
+    // 「あい」 — two Hiragana characters in Shift_JIS, two bytes each
+    // (82 A0, 82 A2), followed by LF.
+    let source = "あい\n";
+    let (bytes, used, had_errors) = encoding_rs::SHIFT_JIS.encode(source);
+    assert_eq!(used, encoding_rs::SHIFT_JIS);
+    assert!(!had_errors);
+    std::fs::write(&path, bytes.as_ref()).unwrap();
+
+    let mut doc = Document::open_with_encoding(path, encoding).unwrap();
+    let cursor = doc
+        .try_replace_range(0, 0, 2, "ok")
+        .expect("encoded replace must succeed for Shift_JIS");
+    assert_eq!(cursor, (0, 2));
+    assert!(doc.is_dirty());
+
+    doc.save_to(&saved).unwrap();
+    let raw = std::fs::read(&saved).unwrap();
+    let (decoded, used, had_errors) = encoding_rs::SHIFT_JIS.decode(&raw);
+    assert_eq!(used, encoding_rs::SHIFT_JIS);
+    assert!(!had_errors);
+    assert_eq!(decoded, "ok\n");
+}
+
+#[test]
+fn try_backspace_at_encoded_shift_jis_walks_back_one_kanji_cell() {
+    // Backspace on Shift_JIS walks back one
+    // 2-byte cell through `MultiByteEngine::step_backward` (which
+    // scans forward from the line anchor and reports the last full
+    // character). The deletion removes both bytes of the trailing
+    // Hiragana, leaving the first Hiragana cell intact.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("shift_jis-backspace.txt");
+    let saved = dir.path().join("shift_jis-backspace-saved.txt");
+    let encoding = DocumentEncoding::from_label("Shift_JIS").unwrap();
+
+    let source = "あい\n";
+    let (bytes, used, had_errors) = encoding_rs::SHIFT_JIS.encode(source);
+    assert_eq!(used, encoding_rs::SHIFT_JIS);
+    assert!(!had_errors);
+    std::fs::write(&path, bytes.as_ref()).unwrap();
+
+    let mut doc = Document::open_with_encoding(path, encoding).unwrap();
+    let (edited, line0, col0) = doc
+        .try_backspace_at(0, 2)
+        .expect("encoded backspace must succeed for Shift_JIS");
+    assert!(edited);
+    assert_eq!((line0, col0), (0, 1));
+
+    doc.save_to(&saved).unwrap();
+    let raw = std::fs::read(&saved).unwrap();
+    let (decoded, used, had_errors) = encoding_rs::SHIFT_JIS.decode(&raw);
+    assert_eq!(used, encoding_rs::SHIFT_JIS);
+    assert!(!had_errors);
+    assert_eq!(decoded, "あ\n");
 }

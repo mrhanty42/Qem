@@ -406,7 +406,28 @@ impl Document {
             return rope_text_with_line_endings(rope, self.line_ending);
         }
         if let Some(piece_table) = &self.piece_table {
+            // A non-UTF-8 piece-tree carries raw target-encoding
+            // bytes from the encoded edit path, so naïve UTF-8 decoding via
+            // `piece_table.to_string_lossy()` would corrupt the bytes
+            // before the save-conversion encoder ever ran. Decode
+            // through `encoding_rs` instead so the resulting `String` is
+            // canonical UTF-8 even when the piece-tree is in a Class A
+            // / Class B encoding.
+            if !self.encoding.is_utf8() {
+                let bytes = piece_table.read_range(0, piece_table.total_len());
+                let (decoded, _) = self.encoding.as_encoding().decode_with_bom_removal(&bytes);
+                return decoded.into_owned();
+            }
             return piece_table.to_string_lossy();
+        }
+        // Mmap-only Class A documents: decode through `encoding_rs` so that a
+        // subsequent re-encode round-trips the original bytes.
+        if !self.encoding.is_utf8() {
+            let (decoded, _) = self
+                .encoding
+                .as_encoding()
+                .decode_with_bom_removal(self.mmap_bytes());
+            return decoded.into_owned();
         }
         String::from_utf8_lossy(self.mmap_bytes()).to_string()
     }
@@ -545,7 +566,28 @@ impl Document {
     ) -> Result<PreparedSave, DocumentError> {
         let (encoding, encoding_origin, explicit_conversion) = match options.encoding_policy() {
             SaveEncodingPolicy::Preserve => {
-                if !self.encoding.can_roundtrip_save() {
+                // Encodings whose `output_encoding()` differs from the
+                // input (e.g. `UTF-16LE` redirects through `UTF-8`) cannot
+                // be re-encoded by `encoding_rs` for preserve-save in
+                // general. They are still byte-streamable when the
+                // document is mmap-only with no edit buffer, because the
+                // raw bytes already exist on disk in the target encoding
+                // and the Class A native preserve branch below emits a
+                // `SaveSnapshot::Mmap` without going through encode/decode.
+                // Edited UTF-16 / Class B documents that
+                // landed on the piece-tree edit buffer through the
+                // encoded edit path are equally
+                // byte-streamable: the piece-tree already holds raw
+                // target-encoding bytes and the matching
+                // `SaveSnapshot::PieceTable` branch in
+                // `prepare_save_with_encoding_and_policy` writes them
+                // verbatim.
+                let mmap_only =
+                    self.rope.is_none() && self.piece_table.is_none() && self.storage.is_some();
+                let piece_table_native_non_utf8 =
+                    !self.encoding.is_utf8() && self.piece_table.is_some() && self.rope.is_none();
+                if !self.encoding.can_roundtrip_save() && !mmap_only && !piece_table_native_non_utf8
+                {
                     return Err(save_encoding_error(
                         path,
                         "save",
@@ -597,6 +639,33 @@ impl Document {
                     line_ending: self.line_ending,
                 }
             } else if let Some(storage) = self.storage.as_ref() {
+                SaveSnapshot::Mmap(storage.clone())
+            } else {
+                SaveSnapshot::Empty
+            }
+        } else if !explicit_conversion
+            && encoding == self.encoding
+            && !encoding.is_utf8()
+            && self.rope.is_none()
+        {
+            if let Some(piece_table) = self.piece_table.as_ref() {
+                // Native preserve-save for non-UTF-8
+                // documents that picked up a piece-tree edit buffer
+                // through the encoded edit path. The
+                // piece-tree already holds raw target-encoding bytes —
+                // streaming them verbatim round-trips byte-for-byte and
+                // avoids the decode-then-re-encode bridge that would
+                // otherwise corrupt data because
+                // `piece_table.to_string_lossy()` interprets raw legacy
+                // bytes as UTF-8.
+                SaveSnapshot::PieceTable(PieceTableSnapshot::from_piece_table(piece_table))
+            } else if let Some(storage) = self.storage.as_ref() {
+                // Class A / Class B native preserve-save: the document
+                // is mmap-only with `rope: None` / `piece_table: None`,
+                // so the original bytes are already on disk in the
+                // target encoding. Streaming them straight from the
+                // mmap snapshot avoids a decode/re-encode round-trip
+                // and preserves the source bytes byte-for-byte.
                 SaveSnapshot::Mmap(storage.clone())
             } else {
                 SaveSnapshot::Empty
@@ -653,8 +722,7 @@ impl Document {
             }
             clear_session_sidecar(&path);
             self.path = Some(path);
-            self.encoding = encoding;
-            self.encoding_origin = encoding_origin;
+            self.set_encoding_contract(encoding, encoding_origin);
             self.decoding_had_errors = false;
             self.mark_clean();
             return Ok(());

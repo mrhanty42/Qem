@@ -2045,7 +2045,7 @@ checksum = "b5a041e753da8b807c9255f28de81879c78c876392ff2469cde94799b2896b9d"
 
 [[package]]
 name = "qem"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "crc32fast",
  "criterion",
@@ -2053,6 +2053,8 @@ dependencies = [
  "memchr",
  "memmap2",
  "proptest",
+ "regex",
+ "regex-automata",
  "ropey",
  "tempfile",
 ]

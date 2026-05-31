@@ -549,7 +549,6 @@ fn session_preserve_save_preflight_reports_unrepresentable_legacy_edits() {
     ));
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("legacy-cp1251.txt");
-    let saved = dir.join("legacy-cp1251-saved.txt");
     let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
     let (bytes, used, had_errors) =
         WINDOWS_1251.encode("\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}\n");
@@ -561,36 +560,26 @@ fn session_preserve_save_preflight_reports_unrepresentable_legacy_edits() {
     session
         .open_file_with_encoding(path.clone(), encoding)
         .unwrap();
-    let _ = session
-        .try_insert(TextPosition::new(0, 0), "emoji \u{1F642}\n")
-        .unwrap();
-
-    assert_eq!(
-        session.preserve_save_error(),
-        Some(DocumentEncodingErrorKind::UnrepresentableText)
-    );
-    assert!(!session.can_preserve_save());
-    assert_eq!(
-        session.save_error_for_options(crate::DocumentSaveOptions::new()),
-        Some(DocumentEncodingErrorKind::UnrepresentableText)
-    );
-    assert_eq!(
-        session.status().preserve_save_error(),
-        Some(DocumentEncodingErrorKind::UnrepresentableText)
-    );
-
+    // The non-UTF-8 edit path rejects unrepresentable inserts at the
+    // insert call itself rather than letting the rope-decode bridge
+    // swallow them and surfacing the failure only at preserve-save
+    // preflight. The session
+    // wrapper propagates the typed error verbatim with `operation: "insert"`.
     let err = session
-        .save_as_with_options(saved.clone(), crate::DocumentSaveOptions::new())
+        .try_insert(TextPosition::new(0, 0), "emoji \u{1F642}\n")
         .unwrap_err();
     assert!(matches!(
         err,
         DocumentError::Encoding {
-            path: failed_path,
-            operation: "save",
+            operation: "insert",
             encoding: failed_encoding,
             reason: DocumentEncodingErrorKind::UnrepresentableText,
-        } if failed_path == saved && failed_encoding == encoding
+            ..
+        } if failed_encoding == encoding
     ));
+
+    // The document stayed clean and on its native mmap backing.
+    assert!(session.can_preserve_save());
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
@@ -679,15 +668,14 @@ fn tab_open_file_async_with_auto_detection_and_fallback_prefers_detected_bom() {
     );
     assert!(!status.decoding_had_errors());
     assert_eq!(status.document().encoding(), DocumentEncoding::utf16le());
-    assert!(!tab.can_preserve_save());
-    assert_eq!(
-        tab.preserve_save_error(),
-        Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
-    );
-    assert_eq!(
-        status.preserve_save_error(),
-        Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
-    );
+    // Mmap-only UTF-16 tabs stream their bytes through the
+    // Class A native preserve branch and therefore allow preserve-save
+    // even though `encoding_rs` cannot re-encode through `UTF-16LE`
+    // directly. The previous contract surfaced `PreserveSaveUnsupported`
+    // here; with the chunked-decode path in place it now reports `None`.
+    assert!(tab.can_preserve_save());
+    assert_eq!(tab.preserve_save_error(), None);
+    assert_eq!(status.preserve_save_error(), None);
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
@@ -727,11 +715,10 @@ fn tab_open_file_async_with_auto_detection_handles_utf16be_bom() {
     assert_eq!(tab.encoding(), DocumentEncoding::utf16be());
     assert_eq!(tab.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
     assert_eq!(tab.text(), "hello\n");
-    assert!(!tab.can_preserve_save());
-    assert_eq!(
-        tab.preserve_save_error(),
-        Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
-    );
+    // Mmap-only UTF-16 tabs stream their bytes through the
+    // Class A native preserve branch and therefore allow preserve-save.
+    assert!(tab.can_preserve_save());
+    assert_eq!(tab.preserve_save_error(), None);
 
     let status = tab.status();
     assert_eq!(status.encoding(), DocumentEncoding::utf16be());
@@ -740,10 +727,7 @@ fn tab_open_file_async_with_auto_detection_handles_utf16be_bom() {
         DocumentEncodingOrigin::AutoDetected
     );
     assert!(!status.decoding_had_errors());
-    assert_eq!(
-        status.preserve_save_error(),
-        Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
-    );
+    assert_eq!(status.preserve_save_error(), None);
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);

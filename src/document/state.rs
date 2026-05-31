@@ -372,6 +372,26 @@ impl Document {
         self.preserve_save_error_cache.set(None);
     }
 
+    /// Atomically updates the encoding contract for the document.
+    ///
+    /// Sets `encoding`, `encoding_origin` and `encoding_engine` together so
+    /// the byte-movement engine never lags behind the encoding contract.
+    /// Also invalidates the cached preserve-save validation result
+    /// because that cache is keyed off the current encoding.
+    ///
+    /// All call sites that mutate `self.encoding` should funnel through this
+    /// helper; direct field assignment is intentionally avoided.
+    pub(super) fn set_encoding_contract(
+        &mut self,
+        encoding: DocumentEncoding,
+        origin: DocumentEncodingOrigin,
+    ) {
+        self.encoding = encoding;
+        self.encoding_origin = origin;
+        self.encoding_engine = super::encoding_engine::engine_for_encoding(encoding);
+        self.invalidate_preserve_save_error_cache();
+    }
+
     pub(super) fn mark_dirty(&mut self) {
         self.invalidate_preserve_save_error_cache();
         self.dirty = true;
@@ -436,6 +456,18 @@ impl Document {
         self.encoding
     }
 
+    /// Returns the byte-level engine that drives line and character navigation
+    /// for the document's current encoding.
+    ///
+    /// The engine reference is sticky: it is installed at construction time
+    /// and refreshed atomically with `encoding` and `encoding_origin` through
+    /// [`Document::set_encoding_contract`]. The accessor returns
+    /// the cached field directly, so call sites pay only one indirect call
+    /// per byte-level operation.
+    pub(crate) fn encoding_engine(&self) -> &'static dyn super::encoding_engine::EncodingEngine {
+        self.encoding_engine
+    }
+
     pub(super) fn preserve_save_materializes_lossy_decoded_text(&self) -> bool {
         self.decoding_had_errors && !(self.encoding.is_utf8() && self.rope.is_none())
     }
@@ -457,7 +489,29 @@ impl Document {
             return rope_text_with_line_endings(rope, self.line_ending);
         }
         if let Some(piece_table) = &self.piece_table {
+            // A non-UTF-8 piece-tree carries raw target-encoding
+            // bytes from the encoded edit path. Naïve
+            // UTF-8 decoding via `piece_table.to_string_lossy()` would
+            // corrupt those bytes before the save-conversion validator
+            // ran them through `encode_text_with_encoding`. Decoding
+            // through `encoding_rs` keeps the validation in canonical
+            // UTF-8 and lets the conversion preflight check
+            // representability against the requested target encoding.
+            if !self.encoding.is_utf8() {
+                let bytes = piece_table.read_range(0, piece_table.total_len());
+                let (decoded, _) = self.encoding.as_encoding().decode_with_bom_removal(&bytes);
+                return decoded.into_owned();
+            }
             return piece_table.to_string_lossy();
+        }
+        // Mmap-only Class A documents: decode through `encoding_rs` so the
+        // validation re-encode round-trips the original bytes.
+        if !self.encoding.is_utf8() {
+            let (decoded, _) = self
+                .encoding
+                .as_encoding()
+                .decode_with_bom_removal(self.mmap_bytes());
+            return decoded.into_owned();
         }
         String::from_utf8_lossy(self.mmap_bytes()).to_string()
     }
@@ -468,19 +522,41 @@ impl Document {
             return cached;
         }
 
-        let computed = if !self.encoding.can_roundtrip_save() {
-            Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
-        } else if self.preserve_save_materializes_lossy_decoded_text() {
-            Some(DocumentEncodingErrorKind::LossyDecodedPreserve)
-        } else if self.encoding.is_utf8() {
-            None
-        } else {
-            let rendered = self.rendered_text_for_save_validation();
-            match encode_text_with_encoding(&rendered, self.encoding) {
-                Ok(bytes) => self.save_reopen_size_error(self.encoding, bytes.len()),
-                Err(err) => Some(err),
-            }
-        };
+        let mmap_only = self.rope.is_none() && self.piece_table.is_none() && self.storage.is_some();
+        let piece_table_native_non_utf8 =
+            !self.encoding.is_utf8() && self.piece_table.is_some() && self.rope.is_none();
+        let computed =
+            if !self.encoding.can_roundtrip_save() && !mmap_only && !piece_table_native_non_utf8 {
+                Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
+            } else if self.preserve_save_materializes_lossy_decoded_text() {
+                Some(DocumentEncodingErrorKind::LossyDecodedPreserve)
+            } else if self.encoding.is_utf8() {
+                None
+            } else if !self.encoding.can_roundtrip_save() && mmap_only {
+                // Mmap-only document whose encoding is not roundtrippable
+                // through `encoding_rs` (e.g. `UTF-16LE/BE`). The Class A
+                // native preserve branch in `prepare_save_with_encoding_and_policy`
+                // streams the original bytes verbatim, so the save is valid
+                // even though we cannot re-encode through `encoding_rs`.
+                self.save_reopen_size_error(self.encoding, self.file_len())
+            } else if piece_table_native_non_utf8 {
+                // Piece-tree-backed non-UTF-8 documents
+                // hold raw target-encoding bytes in
+                // the piece-tree add buffer. Preserve-save streams those
+                // bytes verbatim through the matching SaveSnapshot::PieceTable
+                // branch in `prepare_save_with_encoding_and_policy`, so the
+                // validation just needs the byte budget check — running the
+                // input through `to_string_lossy() + encode_text_with_encoding`
+                // would corrupt the bytes because the piece-tree contents
+                // are not valid UTF-8.
+                self.save_reopen_size_error(self.encoding, self.file_len())
+            } else {
+                let rendered = self.rendered_text_for_save_validation();
+                match encode_text_with_encoding(&rendered, self.encoding) {
+                    Ok(bytes) => self.save_reopen_size_error(self.encoding, bytes.len()),
+                    Err(err) => Some(err),
+                }
+            };
 
         self.preserve_save_error_cache.set(Some(computed));
         computed
@@ -550,7 +626,30 @@ impl Document {
             return rope.to_string();
         }
         if let Some(piece_table) = &self.piece_table {
+            // A non-UTF-8 piece-tree holds raw target-encoding
+            // bytes from the encoded edit path. Decode
+            // them through `encoding_rs` instead of `from_utf8_lossy`
+            // so the returned `String` reflects the document's logical
+            // text rather than mojibake of the legacy bytes.
+            if !self.encoding.is_utf8() {
+                let bytes = piece_table.read_range(0, piece_table.total_len());
+                let (decoded, _) = self.encoding.as_encoding().decode_with_bom_removal(&bytes);
+                return decoded.into_owned();
+            }
             return piece_table.to_string_lossy();
+        }
+        // Class A native open path: documents whose encoding is not UTF-8 are
+        // mmap-only with `rope: None` / `piece_table: None`, so the raw mmap
+        // bytes must be decoded through `encoding_rs` before they can be
+        // exposed as a Rust `String`. UTF-8 documents keep the
+        // existing `String::from_utf8_lossy` path so the byte sequence is
+        // preserved verbatim under valid UTF-8 input.
+        if !self.encoding.is_utf8() {
+            let (decoded, _) = self
+                .encoding
+                .as_encoding()
+                .decode_with_bom_removal(self.mmap_bytes());
+            return decoded.into_owned();
         }
         String::from_utf8_lossy(self.mmap_bytes()).to_string()
     }

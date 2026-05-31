@@ -299,8 +299,9 @@ pub use document::{
     DocumentError, DocumentMaintenanceStatus, DocumentOpenOptions, DocumentSaveOptions,
     DocumentStatus, EditCapability, EditResult, FragmentationStats, IdleCompactionOutcome,
     LineCount, LineEnding, LineSlice, LiteralSearchIter, LiteralSearchQuery, MaintenanceAction,
-    OpenEncodingPolicy, SaveEncodingPolicy, SearchMatch, TextPosition, TextRange, TextSelection,
-    TextSlice, Viewport, ViewportRequest, ViewportRow,
+    OpenEncodingPolicy, RegexCompileError, RegexSearchIter, RegexSearchQuery, SaveEncodingPolicy,
+    SearchMatch, TextPosition, TextRange, TextSelection, TextSlice, Viewport, ViewportRequest,
+    ViewportRow,
 };
 #[cfg(feature = "editor")]
 pub use editor::{

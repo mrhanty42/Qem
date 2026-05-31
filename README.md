@@ -52,14 +52,14 @@ If Qem is useful to you and you want to support the project:
 
 ```toml
 [dependencies]
-qem = "0.7.1"
+qem = "0.8.0"
 ```
 
 To disable the editor/session wrapper and use only the document/storage layer:
 
 ```toml
 [dependencies]
-qem = { version = "0.7.1", default-features = false }
+qem = { version = "0.8.0", default-features = false }
 ```
 
 ## Cargo features
@@ -76,7 +76,7 @@ Example:
 
 ```toml
 [dependencies]
-qem = { version = "0.7.1", default-features = false, features = ["editor", "tmp-exe-dir"] }
+qem = { version = "0.8.0", default-features = false, features = ["editor", "tmp-exe-dir"] }
 ```
 
 Runtime override is also available:
@@ -213,28 +213,19 @@ cargo run --example frontend_session --features editor -- input.txt output.txt
 
 ## Roadmap
 
-Current focus is `0.7.0` as an integration release, not a feature-expansion
-release.
-
-- `0.7.0`: integration release. Ship official frontend entry examples, tighten
-  only the API surface that real integrations actually need, and make the
-  README/support contract usable without reading half the source.
-- `0.8.0`: regex + fast search + encoding stabilization. Add a typed regex
-  search surface alongside literal search, push literal and regex search to
-  practical real-file speed on `mmap`, `piece_table`, and `rope` backings,
-  and widen the encoding contract with full `LossyDecodedPreserve` semantics.
-- `0.9.0`: stability hardening. Make backing transitions, sidecar recovery,
-  and huge-file edit rejection explicit and predictable, complete the
-  "truth after error" test matrix, and land regression benches.
-- `1.0.0`: public API freeze. Stabilize the typed surface, publish migration
-  guidance, and keep internal storage/layout details explicitly out of the
-  stable API promise.
+- `0.8.0` (current): encoding-aware native byte engine for non-UTF-8
+  documents (UTF-16 LE/BE, single-byte ASCII supersets, CJK multibyte),
+  reverse-DFA regex on all backings, and the typed regex search surface
+  alongside literal search.
+- `0.9.0`: replace the `ropey` dependency with a Qem-native edited-buffer
+  structure so the engine owns its full storage stack end to end.
+- `1.0.0`: public API freeze, small refactors, and removal of non-critical
+  `unsafe` blocks. Stabilize the typed surface, publish migration guidance,
+  and keep internal storage/layout details explicitly out of the stable
+  API promise.
 
 The detailed release gates, non-goals, and exit criteria live in
 [`ROADMAP.md`](ROADMAP.md).
-
-Draft migration notes for the upcoming integration release live in
-[`MIGRATION-0.7.md`](MIGRATION-0.7.md).
 
 ## Examples
 
@@ -417,6 +408,5 @@ cargo bench --bench document_perf -- session_layer
 ## Project Links
 
 - Benchmark methodology lives in [`BENCHMARKS.md`](BENCHMARKS.md).
-- The current in-repo `0.7.0` seed perf matrix lives in [`PERF-BASELINE-0.7.md`](PERF-BASELINE-0.7.md).
 - Cross-platform CI and Linux stress coverage live in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 - Repository: <https://github.com/mrhanty42/Qem>

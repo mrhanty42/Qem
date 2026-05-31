@@ -60,7 +60,7 @@ fn scan_position_bytes(bytes: &[u8], state: &mut PositionScanState) {
     }
 }
 
-fn search_text_units(text: &str) -> usize {
+pub(super) fn search_text_units(text: &str) -> usize {
     let bytes = text.as_bytes();
     let mut units = 0usize;
     let mut i = 0usize;
@@ -86,7 +86,7 @@ fn search_text_units(text: &str) -> usize {
     units
 }
 
-fn advance_position_by_bytes(start: TextPosition, bytes: &[u8]) -> TextPosition {
+pub(super) fn advance_position_by_bytes(start: TextPosition, bytes: &[u8]) -> TextPosition {
     let mut state = PositionScanState::new(start.line0(), start.col0());
     scan_position_bytes(bytes, &mut state);
     state.position()
@@ -1132,8 +1132,9 @@ impl Document {
             line_start = line_start.min(file_len);
         }
 
+        let engine = self.encoding_engine();
         while line0 < target_line0 && line_start < file_len {
-            let next = next_line_start_exact(bytes, file_len, line_start);
+            let next = engine.next_line_start(bytes, file_len, line_start);
             if next <= line_start {
                 break;
             }
@@ -1179,7 +1180,9 @@ impl Document {
         }
 
         while line0 < position.line0() && line_start < file_len {
-            let next = next_line_start_exact(bytes, file_len, line_start);
+            let next = self
+                .encoding_engine()
+                .next_line_start(bytes, file_len, line_start);
             if next <= line_start {
                 break;
             }
@@ -1187,7 +1190,9 @@ impl Document {
             line0 += 1;
         }
 
-        let line_end = next_line_start_exact(bytes, file_len, line_start);
+        let line_end = self
+            .encoding_engine()
+            .next_line_start(bytes, file_len, line_start);
         byte_offset_for_text_col_in_bytes(bytes, (line_start, line_end), position.col0())
             .min(file_len)
     }
@@ -1210,6 +1215,65 @@ impl Document {
         let mut state = PositionScanState::new(line0, 0);
         scan_position_bytes(&bytes[line_start..target], &mut state);
         state.position()
+    }
+
+    /// Encoding-aware mapping from a raw byte offset to a `TextPosition`
+    /// for Class B documents (UTF-16LE / UTF-16BE and the multibyte CJK
+    /// encodings).
+    ///
+    /// Walks the underlying byte storage through the document's encoding
+    /// engine: line breaks are counted by repeatedly calling
+    /// `engine.next_line_start` from the nearest known line anchor, and
+    /// the column on the partial trailing line is the engine's
+    /// `count_columns_exact` over the partial-line byte window. This
+    /// produces a `TextPosition` whose `line0()` and `col0()` honour the
+    /// document's encoding-aware text-unit semantics rather
+    /// than treating the bytes as if they were UTF-8.
+    ///
+    /// Falls back to `mmap_position_for_byte_offset` semantics for
+    /// rope/piece-table backings, where this helper is currently unused.
+    pub(super) fn position_for_byte_offset_in_class_b(&self, byte_offset: usize) -> TextPosition {
+        let bytes = self.mmap_bytes();
+        let file_len = self.file_len.min(bytes.len());
+        let target = byte_offset.min(file_len);
+        if target == 0 {
+            return TextPosition::new(0, 0);
+        }
+
+        let engine = self.encoding_engine();
+
+        // Start from the nearest indexed line-start anchor at or before
+        // `target` so we never have to scan from offset 0 on a multi-MiB
+        // file. The anchor line0 is exact (built by the engine in
+        // `from_storage_class_b_native`).
+        let (mut line0, mut line_start) = if let Ok(offsets) = self.line_offsets.read() {
+            line_offsets_anchor_for_byte(&offsets, target)
+        } else {
+            (0usize, 0usize)
+        };
+        line_start = line_start.min(target);
+
+        // Walk forward line-by-line through the engine until the next
+        // line-start would land past `target`. CRLF is collapsed into a
+        // single line boundary by the engine, so this loop counts logical
+        // lines, not raw `\n` bytes.
+        loop {
+            let next = engine.next_line_start(bytes, file_len, line_start);
+            if next > target || next <= line_start {
+                break;
+            }
+            line0 = line0.saturating_add(1);
+            line_start = next;
+        }
+
+        // Column within the partial trailing line: the engine's exact
+        // column counter over `[line_start..target]`. For UTF-16 a
+        // supplementary surrogate pair counts as 1 column (4 bytes); a
+        // misaligned byte at the very end of the slice is left untouched
+        // because `count_columns_exact` walks via `step` which stops at
+        // the last full code-unit cell.
+        let col0 = engine.count_columns_exact(&bytes[line_start..target]);
+        TextPosition::new(line0, col0)
     }
 
     fn mmap_position_for_byte_offset_from(
@@ -1239,6 +1303,7 @@ impl Document {
             return start;
         }
 
+        let engine = self.encoding_engine();
         let mut remaining = text_units;
         let mut offset = start;
         let mut pending_cr = false;
@@ -1267,7 +1332,7 @@ impl Document {
                 }
                 _ => {
                     remaining = remaining.saturating_sub(1);
-                    let step = utf8_step(bytes, i, file_len);
+                    let step = engine.step(bytes, i, file_len);
                     i += step;
                     offset = offset.saturating_add(step);
                 }
@@ -1276,7 +1341,7 @@ impl Document {
         offset.min(file_len)
     }
 
-    fn search_byte_offset_for_position(&self, position: TextPosition) -> usize {
+    pub(super) fn search_byte_offset_for_position(&self, position: TextPosition) -> usize {
         let position = self.clamp_position(position);
         if let Some(rope) = &self.rope {
             let char_index = Self::line_col_to_char_index(rope, position.line0(), position.col0());
@@ -1291,7 +1356,11 @@ impl Document {
         self.mmap_byte_offset_for_position(position)
     }
 
-    fn buffered_literal_range(&self, start_offset: usize, end_offset: usize) -> Option<Vec<u8>> {
+    pub(super) fn buffered_literal_range(
+        &self,
+        start_offset: usize,
+        end_offset: usize,
+    ) -> Option<Vec<u8>> {
         if start_offset >= end_offset {
             return Some(Vec::new());
         }
@@ -1313,6 +1382,43 @@ impl Document {
         let start = start_offset.min(file_len);
         let end = end_offset.min(file_len).max(start);
         Some(bytes[start..end].to_vec())
+    }
+
+    /// Returns a zero-copy mmap byte slice for the requested range.
+    ///
+    /// Used by streaming regex search on clean file-backed documents to avoid
+    /// the buffered-range copy and the `BUFFERED_LITERAL_RANGE_MAX_BYTES` cap.
+    /// Returns `None` for rope or piece-table backings, where the bytes are
+    /// not exposed as one contiguous mmap region.
+    pub(super) fn mmap_search_slice(
+        &self,
+        start_offset: usize,
+        end_offset: usize,
+    ) -> Option<&[u8]> {
+        if self.rope.is_some() || self.piece_table.is_some() {
+            return None;
+        }
+        let bytes = self.mmap_bytes();
+        let file_len = self.file_len.min(bytes.len());
+        let start = start_offset.min(file_len);
+        let end = end_offset.min(file_len).max(start);
+        Some(&bytes[start..end])
+    }
+
+    /// Reads a piece-table byte range without the literal-search 8 MiB cap.
+    ///
+    /// Used by chunked streaming regex search on edited documents. Returns
+    /// `None` for backings other than piece-table.
+    pub(super) fn piece_table_uncapped_range(
+        &self,
+        start_offset: usize,
+        end_offset: usize,
+    ) -> Option<Vec<u8>> {
+        let piece_table = self.piece_table.as_ref()?;
+        if start_offset >= end_offset {
+            return Some(Vec::new());
+        }
+        Some(piece_table.read_range(start_offset, end_offset))
     }
 
     fn find_prev_in_rope(

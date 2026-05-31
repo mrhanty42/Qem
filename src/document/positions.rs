@@ -197,10 +197,11 @@ impl Document {
                         break;
                     }
                 }
+                let engine = self.encoding_engine();
                 return if scanned.exact {
-                    count_text_columns_exact(&bytes[..end])
+                    engine.count_columns_exact(&bytes[..end])
                 } else {
-                    count_text_columns(&bytes[..end], MAX_LINE_SCAN_CHARS)
+                    engine.count_columns_bounded(&bytes[..end], MAX_LINE_SCAN_CHARS)
                 };
             }
             return 0;
@@ -218,7 +219,10 @@ impl Document {
         let Some(start) = self.mmap_line_start_offset_exact(line0) else {
             return 0;
         };
-        let mut end = super::search::next_line_start_exact(bytes, file_len, start).min(file_len);
+        let mut end = self
+            .encoding_engine()
+            .next_line_start(bytes, file_len, start)
+            .min(file_len);
         while end > start {
             let b = bytes[end - 1];
             if b == b'\n' || b == b'\r' {
@@ -227,7 +231,8 @@ impl Document {
                 break;
             }
         }
-        count_text_columns_exact(&bytes[start..end])
+        self.encoding_engine()
+            .count_columns_exact(&bytes[start..end])
     }
 
     /// Clamps a typed position into the currently known document bounds.

@@ -2,7 +2,8 @@ use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
 use qem::{
-    CompactionPolicy, Document, LiteralSearchQuery, TextPosition, TextSelection, ViewportRequest,
+    CompactionPolicy, Document, LiteralSearchQuery, RegexSearchQuery, TextPosition, TextSelection,
+    ViewportRequest,
 };
 #[cfg(feature = "editor")]
 use qem::{DocumentSession, EditorTab};
@@ -907,6 +908,182 @@ fn bench_literal_search(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_regex_search(c: &mut Criterion) {
+    let mmap_fixture = scroll_fixture();
+    let piece_table_fixture = piece_table_edit_fixture();
+    let mmap_doc = open_and_wait(&mmap_fixture.path);
+    let piece_table_case = build_edited_document_case(piece_table_fixture);
+
+    // Bench against the same anchored line patterns the literal-search
+    // benches use, but expressed as regex. This keeps the regex bench
+    // comparable to literal numbers on the same fixtures.
+    let needle = needle_for_fixture(mmap_fixture.label);
+    let pattern = format!(r"{}\s+{}", regex_escape(&needle), regex_escape(&needle));
+    let pattern_simple = regex_escape(&needle);
+    let missing_pattern = "ZzZ_NEVER_MATCHES_42";
+
+    let query = RegexSearchQuery::new(&pattern_simple).expect("compile bench regex query");
+    let dense_query = RegexSearchQuery::new(r"00").expect("compile dense regex query");
+    let alt_pattern = format!(r"({})", regex_escape(&needle));
+    let alt_query = RegexSearchQuery::new(&alt_pattern).expect("compile alt regex query");
+    let missing_query =
+        RegexSearchQuery::new(missing_pattern).expect("compile missing regex query");
+
+    let mut group = c.benchmark_group("regex_search");
+    group.measurement_time(Duration::from_secs(4));
+
+    group.bench_function(
+        BenchmarkId::new("mmap_find_next", mmap_fixture.label),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    mmap_doc
+                        .find_next_regex(black_box(&pattern_simple), TextPosition::new(0, 0))
+                        .ok(),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new("mmap_query_find_next", mmap_fixture.label),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    mmap_doc.find_next_regex_query(black_box(&query), TextPosition::new(0, 0)),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new("mmap_query_find_prev", mmap_fixture.label),
+        |b| {
+            b.iter(|| {
+                black_box(mmap_doc.find_prev_regex_query(
+                    black_box(&query),
+                    TextPosition::new(usize::MAX, usize::MAX),
+                ))
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new("mmap_query_find_next_no_match", mmap_fixture.label),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    mmap_doc
+                        .find_next_regex_query(black_box(&missing_query), TextPosition::new(0, 0)),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new("mmap_alt_query_find_next", mmap_fixture.label),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    mmap_doc.find_next_regex_query(black_box(&alt_query), TextPosition::new(0, 0)),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new("mmap_query_find_all_first_512", mmap_fixture.label),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    mmap_doc
+                        .find_all_regex_query(black_box(&dense_query))
+                        .take(DENSE_SEARCH_ITER_LIMIT)
+                        .count(),
+                )
+            })
+        },
+    );
+
+    group.bench_function(
+        BenchmarkId::new("piece_table_query_find_next", piece_table_fixture.label),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    piece_table_case
+                        .doc
+                        .find_next_regex_query(black_box(&query), TextPosition::new(0, 0)),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new("piece_table_query_find_prev", piece_table_fixture.label),
+        |b| {
+            b.iter(|| {
+                black_box(piece_table_case.doc.find_prev_regex_query(
+                    black_box(&query),
+                    TextPosition::new(usize::MAX, usize::MAX),
+                ))
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "piece_table_query_find_next_no_match",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    piece_table_case
+                        .doc
+                        .find_next_regex_query(black_box(&missing_query), TextPosition::new(0, 0)),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "piece_table_query_find_all_first_512",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    piece_table_case
+                        .doc
+                        .find_all_regex_query(black_box(&dense_query))
+                        .take(DENSE_SEARCH_ITER_LIMIT)
+                        .count(),
+                )
+            })
+        },
+    );
+
+    let _ = pattern;
+    group.finish();
+}
+
+fn regex_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 4);
+    for ch in value.chars() {
+        match ch {
+            '.' | '\\' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+            | '#' | '&' | '-' | '~' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn needle_for_fixture(label: &str) -> String {
+    // The existing fixtures put deterministic per-line content, so a
+    // realistic needle is a per-line tag substring. Keep this consistent
+    // with the literal-search bench needles so the two benchmarks compare
+    // like-for-like work.
+    let _ = label;
+    "L00".to_owned()
+}
+
 fn bench_text_materialization(c: &mut Criterion) {
     let small_fixture = small_open_fixture();
     let large_fixture = scroll_fixture();
@@ -1123,6 +1300,6 @@ criterion_group! {
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_secs(3))
         .sample_size(10);
-    targets = bench_small_open, bench_open, bench_scroll, bench_session_layer_reads, bench_edited_scroll, bench_typed_reads, bench_literal_search, bench_text_materialization, bench_typed_edits, bench_piece_table_compaction, bench_save
+    targets = bench_small_open, bench_open, bench_scroll, bench_session_layer_reads, bench_edited_scroll, bench_typed_reads, bench_literal_search, bench_regex_search, bench_text_materialization, bench_typed_edits, bench_piece_table_compaction, bench_save
 }
 criterion_main!(benches);

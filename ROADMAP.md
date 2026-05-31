@@ -2,10 +2,9 @@
 
 This roadmap is a release plan, not a wish list.
 
-The immediate goal is not to add more subsystems before `0.7.0`. The goal is
-to make Qem coherent for real frontend integration, then ship a fast and
-complete search/encoding contract, then harden the rest, then freeze the
-public API at `1.0.0`.
+The path is: ship a fast and complete search/encoding contract, then replace
+the rope dependency with our own structure, then freeze the public API at
+`1.0.0` after a small round of clean-up.
 
 ## Planning Rules
 
@@ -26,195 +25,186 @@ public API at `1.0.0`.
 
 ## Current Release Line
 
-Current published release: `0.7.1`
-
 Current target: `0.8.0`
-
-## 0.7.0
-
-`0.7.0` is the integration release.
-
-### Goal
-
-A frontend developer should be able to open the README, run the official
-examples, and integrate Qem into an `egui`-style application without reading
-through internal modules first.
-
-### Release Gates
-
-Before shipping `0.7.0`, Qem should have all of the following:
-
-- A cleaned-up public integration story around `Document`, `DocumentSession`,
-  and `EditorTab`, with only the API changes that real examples actually
-  require.
-- Two official frontend-oriented examples:
-  - a minimal viewer/editor
-  - a large-file editor with viewport, gutter, caret, open/save, and visible
-    load/save status
-- README and rustdoc rewritten around integration workflow:
-  - what Qem owns
-  - what the application owns
-  - basic lifecycle
-  - viewport rendering
-  - open/save flow
-  - huge-file editing boundaries
-  - when backing may change
-- A support matrix written as a contract instead of general prose:
-  - UTF-8 stable guarantees
-  - invalid UTF-8 behavior
-  - large-file guarantees
-  - `EditUnsupported` boundaries
-  - sidecar behavior
-  - public behavior vs internal format
-- Scenario coverage for real workflows:
-  - async open -> viewport -> edit -> save
-  - large-file open with background indexing while UI stays usable
-  - reopen from `.qem.editlog`
-  - truthful rejection near huge-file edit limits
-  - CRLF behavior
-  - invalid UTF-8 behavior
-  - very long lines
-  - save failure with truthful post-error state
-- Release hygiene:
-  - changelog
-  - migration notes
-  - explicit breaking vs non-breaking summary
-  - examples built in CI
-  - at least one example smoke run in CI
-- A baseline real-file perf matrix recorded in-repo so later regressions are
-  visible.
-
-### Non-Goals
-
-Do not do these before `0.7.0`:
-
-- regex search (planned for `0.8.0`)
-- broader encoding stabilization beyond the current contract (planned for `0.8.0`)
-- GUI code inside `qem` core
-- speculative refactors "for the future"
-- broad abstractions without a demonstrated integration use case
-
-### Exit Criteria
-
-`0.7.0` is ready when:
-
-- the examples are the official frontend entry point
-- the API changes are justified by those examples
-- the README/support matrix match the actual runtime behavior
-- examples and scenario tests make the integration path reproducible
-- `cargo test --all-features --workspace` is green on all CI targets
 
 ## 0.8.0
 
-`0.8.0` is the search and encoding release. It is the first half of the
-larger "fast, full search + stable encodings + general stability" block.
+`0.8.0` is the search and encoding release. Encoding handling is **native**
+instead of a transcode-to-UTF-8 pipeline: every encoding moves through its
+own byte movement engine.
 
 ### Focus
 
-- **Regex search.** Add a typed regex search surface alongside the existing
-  literal search:
-  - `find_next` / `find_prev` / `find_all` analogues for regex
-  - reusable compiled `RegexSearchQuery` mirroring `LiteralSearchQuery`
-  - bounded `_in_range` / `_between` variants
-  - typed `SearchMatch` results so frontends keep one shape across literal
-    and regex search
-- **Search performance.** Make literal and regex search practically the
-  fastest path on `mmap`, `piece_table`, and `rope` backings:
-  - real numbers on 1 GiB / 10 GiB / 50 GiB files, not just synthetic
-    Criterion microbenches
-  - dense-match throughput stays usable when matches are everywhere
-  - bounded search must not pay for work outside its bounds
-- **Encoding stabilization.**
-  - lift the current "non-UTF8 must be rope" limitation where it is safe to do so
-  - widen auto-detect beyond BOM-backed UTF-16 where the result is unambiguous
-  - finish the `LossyDecodedPreserve` story so frontends never have to guess
-    whether preserve-save is allowed
-  - tighten `decoding_had_errors` vs `LossyDecodedPreserve` separation in the
-    public docs
-- **Stability work that lands with the above.**
-  - regex semantics tests (Unicode-aware behavior, anchors, line semantics
-    across CRLF, bounded vs unbounded)
-  - encoding regression tests (legacy reinterpret, save round-trips, lossy
-    preserve, conversion preflight)
-  - additional "truth after error" tests for the new search and encoding
-    surfaces
+#### Regex search
+
+- Typed `RegexSearchQuery` / `RegexCompileError` / `RegexSearchIter` mirroring
+  the literal-search surface.
+- `find_next_regex`, `find_prev_regex`, `find_all_regex` plus reusable
+  `_query`, bounded `_in_range`, and `_between` variants.
+- `DocumentSession` and `EditorTab` expose the same regex surface.
+- Mmap zero-copy regex path (no 8 MiB cap, finds matches at 64 MiB+
+  offsets), piece-table chunked streaming with 1 MiB overlap, rope chunked
+  streaming via `Rope::chunks()` over the byte engine — no `String`
+  materialization on the rope hot path.
+- Reverse regex via reverse-DFA built from `regex_automata::dfa::dense`,
+  routed across all three backings (rope, mmap slice, piece-tree chunked
+  walker) and bounded by a typed size-limit error rather than panic on
+  pathological patterns.
+- Dense-vs-sparse ratio is gated by a deterministic perf test.
+
+#### UTF-8 BOM auto-detect
+
+- `auto_detect_open_encoding` recognizes the UTF-8 BOM. Files opened with
+  the auto-detect policy and a leading `EF BB BF` go through the rope
+  decode path (which strips the BOM via `decode_with_bom_removal`).
+- Default `Document::open()` does not strip BOM; only the explicit
+  auto-detect path does.
+
+#### Encoding-aware byte movement engine
+
+The "transcode every non-UTF-8 file into a UTF-8 rope" approach is treated
+as a workaround, not a target. `0.8.0` introduces a dedicated byte-movement
+engine per encoding so every encoding can run natively over its own bytes:
+
+- `Utf8Engine` for UTF-8 (the default).
+- `SingleByteEngine` for ASCII supersets: `windows-1250`..`-1258`,
+  `windows-874`, `ISO-8859-2`..`-16`, `KOI8-R`, `KOI8-U`, `IBM866`,
+  `macintosh`, `x-mac-cyrillic`. Step is always one byte; line scanning
+  reuses memchr; CRLF collapses identically to UTF-8.
+- `Utf16Engine<Endian>` for UTF-16 LE / BE. Newline finder looks for
+  2-byte aligned `0x0A 0x00` / `0x0D 0x00`. Char step is 2 bytes (4 for
+  surrogate pairs). Edit boundaries align on 2 bytes.
+- `MultiByteEngine` for `Shift_JIS`, `GB18030`, `EUC-KR`. Each kind has
+  its own leading-byte detector and a false-positive-aware newline finder
+  for `0x0A` / `0x0D` (some trailing bytes can be these values).
+
+Engines are cached per encoding via `OnceLock<Mutex<HashMap>>`, so the
+dispatch cost is one pointer compare on the hot path.
+
+Non-UTF-8 documents never build a UTF-8 rope. Open dispatches to the
+mmap fast path with the appropriate engine. Viewport reads decode only
+the requested window via `encoding_rs`. Edit goes through the piece tree
+directly: incoming `&str` is encoded to the target encoding via
+`encoding_rs`; non-representable code points return a typed error
+without mutating state.
+
+#### Encoding-aware alignment
+
+`Document::align_byte_offset` lands every byte offset on a character
+boundary of the document's current encoding before it reaches the edit /
+regex paths:
+
+- UTF-8 walks back to the nearest UTF-8 char boundary.
+- Class A is a no-op clamp.
+- UTF-16 rounds to a 2-byte cell.
+- Class B (CJK multibyte) walks forward from the nearest line anchor via
+  the engine's `step` and picks the closest reachable boundary.
+
+This is the surface that fixes the historic piece-boundary truncation
+bug where reverse search across an internal piece break could land on
+the trail byte of a multi-byte character and corrupt downstream byte
+offsets.
+
+#### Search performance
+
+- Literal and regex search are the fastest path on mmap, piece-table, and
+  rope backings.
+- Real numbers on 1 GiB / 10 GiB / 50 GiB files, recorded next to the
+  existing perf baseline.
 
 ### Non-Goals
 
-- LSP, syntax highlighting, grapheme clustering, display-cell width — these
-  remain frontend concerns.
-- New session/job mechanics beyond what the search/encoding work needs.
+- Removing ropey. That is `0.9.0`.
+- Refactoring `piece_tree`, splitting history/persistence, or eliminating
+  every `unwrap` / `expect`. That is `1.0.0`.
+- LSP, syntax highlighting, grapheme clustering, display-cell width.
 
 ### Exit Criteria
 
 `0.8.0` is ready when:
 
-- regex and literal search share one typed surface and one set of guarantees
-- search performance numbers on real huge files are recorded next to the
-  existing perf baseline
-- the encoding contract is widened with new tests instead of new prose
-- `cargo test --all-features --workspace` is green on all CI targets
+- The encoding-engine work is shipped end to end (open, viewport, search,
+  edit, save) for UTF-8, every Class A encoding, UTF-16 LE / BE, and the
+  three Class B CJK encodings.
+- Regex and literal search share one typed surface and one set of
+  guarantees on every backing.
+- Reverse regex is reverse-DFA based and bounded by a typed size limit.
+- Search performance numbers on real huge files are recorded next to the
+  existing perf baseline.
+- The encoding contract is widened with new tests instead of new prose.
+- `cargo test --all-features --workspace` is green on all CI targets.
 
 ## 0.9.0
 
-`0.9.0` is the stability release. It is the second half of the
-search/encoding/stability block, focused on locking down the contract rather
-than adding new features.
+`0.9.0` is the rope replacement release.
 
 ### Focus
 
-- **Backing transitions are explicit.** `mmap → piece_table → rope`
-  promotions surface through typed status/event so frontends can react
-  instead of guessing.
-- **Predictable rejection on huge files.** `edit_capability_*` is the single
-  preflight surface; rejection reasons are typed and stable.
-- **Sidecar recovery.** `.qem.lineidx` and `.qem.editlog` failure modes
-  resolve through typed outcomes (`Rebuild`, `Discard`, `ReopenClean`)
-  instead of best-effort heuristics. Version mismatch, corrupt sidecar, and
-  stale identity are explicit.
-- **Truth after error, completed.** Failed save, failed open, discarded stale
-  worker, deferred close, `set_path` / `document_mut` while busy — every one
-  of these has at least one regression test that asserts the post-error
-  session state.
-- **Regression benches in CI.** Open, first viewport, first edit on huge
-  files, edited save, literal search, and regex search each get a short
-  regression bench tied to the perf baseline.
-- **Escape hatch cleanup.** Final pass on `document_mut`, `set_path`, and
-  unconditional `compact_piece_table` so the rules around them are
-  documented and enforced by tests.
+- Replace the `ropey` dependency with a Qem-native edited-buffer structure.
+  The new structure must:
+  - support large-file editing with predictable memory.
+  - keep `O(log N)` line / column lookup.
+  - integrate cleanly with the existing piece tree so a single backing can
+    own both unedited mmap-anchored pieces and edited add-buffer pieces.
+- Keep the public contract behavior-stable. The replacement is internal:
+  open / save / edit / viewport behavior must not change for users of the
+  library.
+- Add property-based tests comparing the new structure against a reference
+  implementation across randomized edit sequences.
 
 ### Non-Goals
 
-- New API surface beyond what is needed to make existing behavior
-  predictable.
+- New API surface that was deferred to the rope-replacement work
+  specifically for that work.
 - Domain expansion beyond text.
 
 ### Exit Criteria
 
 `0.9.0` is ready when:
 
-- backing transitions, sidecar recovery, and rejection paths are typed and
-  observable
-- the "truth after error" matrix is fully covered by tests
-- regression benches catch performance drops in CI on at least one platform
-- `cargo test --all-features --workspace` is green on all CI targets
+- `ropey` is removed from `Cargo.toml`.
+- The new edited-buffer structure passes property-based parity tests
+  against a reference oracle.
+- All existing scenario tests stay green without behavior change.
+- Real-file perf numbers on edited buffers stay within the established
+  baseline (no regression).
 
 ## 1.0.0
 
-`1.0.0` is the API freeze.
+`1.0.0` is the small-cleanup + freeze release.
 
 ### Focus
 
-- freeze the public contract
-- separate stable API from internal implementation details
-- publish a migration guide
-- define semver discipline going forward
-- verify that examples, docs, tests, and benches all tell the same story
+- **Small refactors for clarity**, not a rewrite. Split overgrown modules
+  into focused units (history, persistence, fragmentation, core data
+  structure for `piece_tree`; named lifecycle helpers around inspection,
+  indexing, sidecar recovery, and final state construction). Reduce
+  duplication between `DocumentSession` and `EditorTab` through
+  composition without breaking the public surface.
+- **Drop non-critical `unsafe` blocks** where a safe equivalent exists at
+  the same performance tier. Keep `unsafe` only on hot paths where it is
+  load-bearing for the documented performance contract, and document why
+  in-place at each remaining site.
+- **Reduce `unwrap` / `expect` on recoverable paths**. Replace remaining
+  patterns like `unwrap_or([0; 8])` with explicit `?`-driven error
+  propagation backed by typed errors.
+- **Sidecar recovery is typed.** `.qem.lineidx` and `.qem.editlog` failure
+  modes resolve through typed outcomes (`Rebuild`, `Discard`,
+  `ReopenClean`) instead of best-effort heuristics. Version mismatch,
+  corrupt sidecar, and stale identity are explicit.
+- **Backing transitions surface as events.** `mmap → piece_table → rope-
+  replacement` promotions are observable through typed status so frontends
+  can react instead of guessing.
+- **Regression benches in CI.** Open, first viewport, first edit on huge
+  files, edited save, literal search, and regex search each get a short
+  regression bench tied to the perf baseline.
+- **Public API freeze.** Stable surface vs internal implementation details
+  is labeled in rustdoc; semver discipline is documented.
 
 ### Must Be Stable
 
 - typed API surface
-- open/save lifecycle
+- open / save lifecycle
 - background job semantics
 - huge-file support contract
 - error model
@@ -226,23 +216,29 @@ than adding new features.
 ### May Stay Unstable
 
 - sidecar on-disk format
-- low-level cache/layout choices
+- low-level cache / layout choices
 - internal storage details
 
 ### Exit Criteria
 
 `1.0.0` is ready when:
 
-- the public contract is frozen and labeled as stable in rustdoc
-- `MIGRATION-1.0.md` lists every breaking, non-breaking, and deprecated change
-  since `0.7.0`
-- semver rules for the post-`1.0` line are written down
-- downstream applications can build products on top of Qem without expecting
-  recurring redesign of the basic contract
+- the small refactors leave the public surface unchanged but the
+  internals are smaller and easier to reason about.
+- non-critical `unsafe` blocks are gone; remaining `unsafe` is documented
+  in-place.
+- `unwrap` / `expect` no longer appears on hot or recoverable paths.
+- the public contract is frozen and labeled as stable in rustdoc.
+- semver rules for the post-`1.0` line are written down.
+- downstream applications can build products on top of Qem without
+  expecting recurring redesign of the basic contract.
 
 ## Short Version
 
-- `0.7.0`: integration release
-- `0.8.0`: regex + fast search + encoding stabilization
-- `0.9.0`: stability hardening, "truth after error", regression benches
-- `1.0.0`: public API freeze
+- `0.8.0` (current): regex + fast search + encoding-aware native byte
+  engine + UTF-8 BOM
+- `0.9.0`: replace `ropey` with a Qem-native edited-buffer structure
+- `1.0.0`: small cleanup (module splits, drop non-critical `unsafe`,
+  remove `unwrap` / `expect` on recoverable paths, sidecar typed
+  outcomes, backing transition events, regression benches in CI) +
+  public API freeze

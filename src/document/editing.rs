@@ -86,7 +86,19 @@ impl Document {
             return EditBufferPlan::KeepCurrent;
         }
 
-        let use_piece_table = self.storage.is_some() && self.file_len >= PIECE_TABLE_MIN_BYTES;
+        // Promote non-UTF-8 storage-backed documents to the
+        // piece-tree edit buffer so the new `try_insert_text_at_encoded`
+        // path can append target-encoding bytes verbatim into
+        // `add` without ever transcoding the document into UTF-8.
+        // UTF-8 documents keep the existing size gate so small
+        // files continue to use the cheaper rope edit buffer; non-UTF-8
+        // documents drop the size gate because the rope-decode bridge
+        // is no longer the default fallback for them.
+        let use_piece_table = if self.encoding.is_utf8() {
+            self.storage.is_some() && self.file_len >= PIECE_TABLE_MIN_BYTES
+        } else {
+            self.storage.is_some()
+        };
         if use_piece_table {
             if let Some((line_lengths, full_index)) = self.piece_table_line_lengths_for_edit(line0)
             {
@@ -165,9 +177,19 @@ impl Document {
                 "document is too large to materialize into a rope; editing this region is disabled",
             ));
         }
-        let (rope, had_errors) = {
+        let (rope, had_errors) = if self.encoding.is_utf8() {
             let bytes = self.mmap_bytes();
             build_rope_from_bytes(bytes)
+        } else {
+            // Class A native open path leaves the document with `rope: None`
+            // and `piece_table: None`, so the first edit lands here against
+            // the raw mmap bytes. Decoding through `encoding_rs` mirrors the
+            // rope-decoding branch in `from_storage_with_encoding`: it keeps
+            // the rope text in canonical UTF-8 instead of treating the legacy
+            // bytes as garbage UTF-8.
+            let bytes = self.mmap_bytes();
+            let (decoded, decoding_had_errors) = decode_text_with_encoding(bytes, self.encoding);
+            (build_rope_from_decoded_text(&decoded), decoding_had_errors)
         };
         if had_errors && !self.decoding_had_errors {
             self.decoding_had_errors = true;
@@ -193,7 +215,16 @@ impl Document {
             ));
         }
         let bytes = piece_table.read_range(0, piece_table.total_len());
-        let (rope, had_errors) = build_rope_from_bytes(&bytes);
+        let (rope, had_errors) = if self.encoding.is_utf8() {
+            build_rope_from_bytes(&bytes)
+        } else {
+            // Mirror `ensure_rope`: when the document is in a legacy encoding
+            // the piece-tree bytes are still in that encoding, so they must
+            // be decoded through `encoding_rs` before being placed into a
+            // UTF-8 rope.
+            let (decoded, decoding_had_errors) = decode_text_with_encoding(&bytes, self.encoding);
+            (build_rope_from_decoded_text(&decoded), decoding_had_errors)
+        };
         if had_errors && !self.decoding_had_errors {
             self.decoding_had_errors = true;
             self.invalidate_preserve_save_error_cache();

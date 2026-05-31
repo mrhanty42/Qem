@@ -1,6 +1,81 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
+
+### Added
+
+- Encoding-aware byte movement engine that drives line and character
+  navigation per encoding instead of assuming UTF-8 across the document
+  layer. The `EncodingEngine` trait is implemented by `Utf8Engine`,
+  `SingleByteEngine`, `Utf16Engine<Endian>`, and `MultiByteEngine`, each
+  cached per encoding via a process-wide `OnceLock<Mutex<HashMap>>` so
+  dispatch is one pointer compare on the hot path.
+- `Document::encoding_engine()` accessor and a stored
+  `encoding_engine` field that always reflects the document's current
+  encoding. The hot mmap navigation methods
+  (`mmap_line_start_offset_exact`, `mmap_byte_offset_for_position`,
+  `mmap_advance_offset_by_text_units`, `read_text_from_mmap_backing`,
+  and the mmap fallback in `line_len_chars`) route through the engine.
+- `SingleByteEngine` for ASCII-superset single-byte encodings
+  (`windows-1250`..`-1258`, `windows-874`, `ISO-8859-2`..`-16`,
+  `KOI8-R`, `KOI8-U`, `IBM866`, `macintosh`, `x-mac-cyrillic`). Each
+  character is one byte, line scanning reuses memchr, and CRLF collapses
+  identically to UTF-8.
+- `Utf16Engine<LittleEndian>` and `Utf16Engine<BigEndian>` for
+  UTF-16 LE / BE. Newline finding looks for 2-byte aligned `0x0A 0x00` /
+  `0x0D 0x00`. Char step is 2 bytes (4 for surrogate pairs). Edit
+  boundaries always align on 2 bytes.
+- `MultiByteEngine` for `Shift_JIS`, `GB18030`, and `EUC-KR`. Each kind
+  has its own leading-byte detector and a false-positive-aware newline
+  finder for `0x0A` / `0x0D`, since some trailing bytes can take those
+  values.
+- Native open dispatch for non-UTF-8 documents (`from_storage_class_a_native`
+  and `from_storage_class_b_native`). Class A and Class B encodings now
+  open mmap-backed without ever building a UTF-8 rope; viewport reads
+  decode only the requested window via `encoding_rs`.
+- Encoded edit path. `try_insert_text_at`, `try_replace_range`, and
+  `try_delete_range` for non-UTF-8 documents go through the piece tree
+  directly: the incoming `&str` is encoded via `encoding_rs`; characters
+  not representable in the target encoding return a typed
+  `UnrepresentableText` error before any state mutation.
+- `Document::align_byte_offset(offset, AlignDirection)` and the
+  supporting `bytes_for_alignment` helper. Every byte offset that
+  reaches the edit / regex paths is clamped to a character boundary of
+  the document's current encoding: UTF-8 walks back to the nearest char
+  boundary, Class A is a no-op clamp, UTF-16 rounds to a 2-byte cell,
+  and Class B walks forward from the nearest line anchor through the
+  engine's `step`. This is the surface that prevents reverse search and
+  multibyte edits from landing on the trail byte of a multi-byte
+  character at an internal piece boundary.
+- Reverse-DFA regex via `regex_automata::dfa::dense::Builder`. All
+  `find_prev_regex*` paths (rope, mmap slice, piece-tree chunked) route
+  through the reverse DFA and are bounded by a typed
+  `RegexCompileError` on a 32 MiB size limit instead of panicking on
+  pathological patterns.
+- Updated `ROADMAP.md`: `0.8.0` ships the encoding-aware engine, native
+  non-UTF-8 mmap path, and reverse-DFA regex; `0.9.0` replaces the
+  `ropey` dependency with a Qem-native edited-buffer structure; `1.0.0`
+  is the small-cleanup + public-API-freeze release.
+
+### Changed
+
+- `Document::encoding_engine` is now a stored field initialised by every
+  constructor. Encoding mutations go through the internal
+  `set_encoding_contract` helper which atomically updates encoding,
+  origin, and engine, and invalidates the preserve-save cache.
+- Non-UTF-8 documents never build a UTF-8 rope. The previous
+  rope-decode fallback for legacy encodings is removed in favour of the
+  native mmap + engine path.
+- `find_prev_regex*` now uses the reverse-DFA backend instead of the
+  chunked-from-end forward-scan fallback. Match coordinates and
+  ordering follow leftmost-first reverse semantics.
+
+### Removed
+
+- The `find_prev_regex_via_forward_scan` chunked-from-end fallback and
+  its supporting helpers (`find_prev_regex_in_bytes_bounded`,
+  `find_prev_regex_in_byte_slice`, `find_prev_regex_in_rope_bounded`).
+- The historical 8 MiB cap on the mmap regex slice path.
 
 ## 0.7.1
 
@@ -18,8 +93,7 @@
 ## 0.7.0
 
 `0.7.0` is the integration release. There are no breaking API changes
-between `0.6.x` and `0.7.0`; see [`MIGRATION-0.7.md`](MIGRATION-0.7.md) for
-a full upgrade summary.
+between `0.6.x` and `0.7.0`.
 
 ### Fixed
 

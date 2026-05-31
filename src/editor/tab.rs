@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     CompactionPolicy, CompactionRecommendation, DocumentEncodingErrorKind,
     DocumentMaintenanceStatus, FragmentationStats, IdleCompactionOutcome, LiteralSearchIter,
-    MaintenanceAction,
+    MaintenanceAction, RegexCompileError, RegexSearchIter, RegexSearchQuery,
 };
 use std::time::Duration;
 
@@ -592,6 +592,186 @@ impl EditorTab {
         self.core
             .document()
             .find_prev_query_between(query, start, end)
+    }
+
+    /// Finds the next regex match starting at `from`.
+    pub fn find_next_regex(
+        &self,
+        pattern: &str,
+        from: TextPosition,
+    ) -> Result<Option<SearchMatch>, RegexCompileError> {
+        self.core.document().find_next_regex(pattern, from)
+    }
+
+    /// Finds the previous regex match whose end is at or before `before`.
+    pub fn find_prev_regex(
+        &self,
+        pattern: &str,
+        before: TextPosition,
+    ) -> Result<Option<SearchMatch>, RegexCompileError> {
+        self.core.document().find_prev_regex(pattern, before)
+    }
+
+    /// Finds the next regex match using a reusable compiled query.
+    pub fn find_next_regex_query(
+        &self,
+        query: &RegexSearchQuery,
+        from: TextPosition,
+    ) -> Option<SearchMatch> {
+        self.core.document().find_next_regex_query(query, from)
+    }
+
+    /// Finds the previous regex match using a reusable compiled query.
+    pub fn find_prev_regex_query(
+        &self,
+        query: &RegexSearchQuery,
+        before: TextPosition,
+    ) -> Option<SearchMatch> {
+        self.core.document().find_prev_regex_query(query, before)
+    }
+
+    /// Finds the first regex match fully contained within `range`.
+    pub fn find_next_regex_in_range(
+        &self,
+        pattern: &str,
+        range: TextRange,
+    ) -> Result<Option<SearchMatch>, RegexCompileError> {
+        self.core
+            .document()
+            .find_next_regex_in_range(pattern, range)
+    }
+
+    /// Finds the first regex match fully contained between two positions.
+    pub fn find_next_regex_between(
+        &self,
+        pattern: &str,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> Result<Option<SearchMatch>, RegexCompileError> {
+        self.core
+            .document()
+            .find_next_regex_between(pattern, start, end)
+    }
+
+    /// Finds the first compiled-query regex match fully contained within `range`.
+    pub fn find_next_regex_query_in_range(
+        &self,
+        query: &RegexSearchQuery,
+        range: TextRange,
+    ) -> Option<SearchMatch> {
+        self.core
+            .document()
+            .find_next_regex_query_in_range(query, range)
+    }
+
+    /// Finds the first compiled-query regex match between two positions.
+    pub fn find_next_regex_query_between(
+        &self,
+        query: &RegexSearchQuery,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> Option<SearchMatch> {
+        self.core
+            .document()
+            .find_next_regex_query_between(query, start, end)
+    }
+
+    /// Finds the last compiled-query regex match fully contained within `range`.
+    pub fn find_prev_regex_query_in_range(
+        &self,
+        query: &RegexSearchQuery,
+        range: TextRange,
+    ) -> Option<SearchMatch> {
+        self.core
+            .document()
+            .find_prev_regex_query_in_range(query, range)
+    }
+
+    /// Finds the last compiled-query regex match between two positions.
+    pub fn find_prev_regex_query_between(
+        &self,
+        query: &RegexSearchQuery,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> Option<SearchMatch> {
+        self.core
+            .document()
+            .find_prev_regex_query_between(query, start, end)
+    }
+
+    /// Iterates non-overlapping regex matches over the whole document.
+    pub fn find_all_regex(&self, pattern: &str) -> Result<RegexSearchIter<'_>, RegexCompileError> {
+        self.core.document().find_all_regex(pattern)
+    }
+
+    /// Iterates non-overlapping regex matches from `from` onward.
+    pub fn find_all_regex_from(
+        &self,
+        pattern: &str,
+        from: TextPosition,
+    ) -> Result<RegexSearchIter<'_>, RegexCompileError> {
+        self.core.document().find_all_regex_from(pattern, from)
+    }
+
+    /// Iterates non-overlapping regex matches over the whole document using a
+    /// reusable compiled query.
+    pub fn find_all_regex_query(&self, query: &RegexSearchQuery) -> RegexSearchIter<'_> {
+        self.core.document().find_all_regex_query(query)
+    }
+
+    /// Iterates non-overlapping regex matches from `from` onward using a
+    /// reusable compiled query.
+    pub fn find_all_regex_query_from(
+        &self,
+        query: &RegexSearchQuery,
+        from: TextPosition,
+    ) -> RegexSearchIter<'_> {
+        self.core.document().find_all_regex_query_from(query, from)
+    }
+
+    /// Iterates non-overlapping regex matches fully contained within `range`.
+    pub fn find_all_regex_in_range(
+        &self,
+        pattern: &str,
+        range: TextRange,
+    ) -> Result<RegexSearchIter<'_>, RegexCompileError> {
+        self.core.document().find_all_regex_in_range(pattern, range)
+    }
+
+    /// Iterates non-overlapping regex matches between two typed positions.
+    pub fn find_all_regex_between(
+        &self,
+        pattern: &str,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> Result<RegexSearchIter<'_>, RegexCompileError> {
+        self.core
+            .document()
+            .find_all_regex_between(pattern, start, end)
+    }
+
+    /// Iterates non-overlapping regex matches in `range` using a compiled query.
+    pub fn find_all_regex_query_in_range(
+        &self,
+        query: &RegexSearchQuery,
+        range: TextRange,
+    ) -> RegexSearchIter<'_> {
+        self.core
+            .document()
+            .find_all_regex_query_in_range(query, range)
+    }
+
+    /// Iterates non-overlapping regex matches between two positions using a
+    /// compiled query.
+    pub fn find_all_regex_query_between(
+        &self,
+        query: &RegexSearchQuery,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> RegexSearchIter<'_> {
+        self.core
+            .document()
+            .find_all_regex_query_between(query, start, end)
     }
 
     /// Compacts the current piece-table document if one is active.

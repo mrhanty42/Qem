@@ -12,13 +12,16 @@ use super::storage::{FileStorage, StorageOpenError};
 use crate::index::DiskLineIndex;
 use crate::piece_tree::{editlog_path, Piece, PieceSource, PieceTree, SessionMeta};
 
+mod alignment;
 mod commands;
 mod compaction;
 mod editing;
+mod encoding_engine;
 mod lifecycle;
 mod persistence;
 mod positions;
 mod reads;
+mod regex_search;
 mod search;
 mod state;
 mod types;
@@ -31,6 +34,7 @@ pub use compaction::{
 pub(crate) use lifecycle::OpenProgressPhase;
 #[cfg(feature = "editor")]
 pub(crate) use persistence::{PreparedSave, SaveCompletion};
+pub use regex_search::{RegexCompileError, RegexSearchIter, RegexSearchQuery};
 pub use search::{LiteralSearchIter, LiteralSearchQuery};
 pub use types::{
     ByteProgress, CutResult, DocumentBacking, DocumentEncoding, DocumentEncodingErrorKind,
@@ -39,6 +43,87 @@ pub use types::{
     MaintenanceAction, OpenEncodingPolicy, SaveEncodingPolicy, SearchMatch, TextPosition,
     TextRange, TextSelection, TextSlice, Viewport, ViewportRequest, ViewportRow,
 };
+
+/// Hidden re-exports used by integration tests under `tests/encoding_engine/`.
+///
+/// The encoding-aware engine lives at `pub(crate)` visibility because it is
+/// not part of the stable public API surface; public API stability is
+/// reserved for `1.0.0`. Integration tests live in their own crates and
+/// would otherwise be unable to reach the engine surface, so we expose a
+/// tightly scoped re-export module here. The `#[doc(hidden)]` attribute
+/// keeps these symbols out of rustdoc and IDE completion for library
+/// consumers; the only legitimate consumers are the property tests under
+/// `tests/encoding_engine/`.
+#[doc(hidden)]
+pub mod __test_support {
+    pub use super::encoding_engine::{
+        engine_for_encoding, EncodingEngine, SingleByteEngine, Utf8Engine, UTF8_ENGINE,
+    };
+
+    /// Aligns `offset` to the largest character-boundary offset of
+    /// `doc.encoding()` that is `<= offset` (the `AlignDirection::Floor`
+    /// / `Backward` contract used by the encoded edit and regex paths).
+    /// Wraps the crate-internal `Document::align_byte_offset` so the
+    /// integration property tests under `tests/encoding_engine/` can
+    /// validate Property 14 without exposing `AlignDirection` outside
+    /// the crate.
+    pub fn align_byte_offset_floor(doc: &super::Document, offset: usize) -> usize {
+        doc.align_byte_offset(offset, super::alignment::AlignDirection::Backward)
+    }
+
+    /// Returns a snapshot of the document's current bytes for the
+    /// alignment scan. Mirrors the crate-internal helper used by
+    /// `Document::align_byte_offset`; required by Property 14 so the
+    /// test can enumerate per-line and per-character boundaries
+    /// without re-deriving the backing-resolution logic.
+    pub fn bytes_for_alignment(doc: &super::Document) -> Vec<u8> {
+        doc.bytes_for_alignment()
+    }
+
+    /// Resolves a typed `TextPosition` to the byte offset the public
+    /// search APIs use internally.
+    ///
+    /// Used by the alignment property test: every public API that
+    /// surfaces a `TextPosition` (regex / literal search match
+    /// endpoints, viewport row starts, line bounds) must land on a
+    /// character boundary of `doc.encoding()` once converted to its
+    /// byte representation. The conversion here matches the one
+    /// `Document::find_next_regex_query`,
+    /// `Document::find_next_query`, `find_*_in_range` and friends use
+    /// to clamp endpoints onto valid byte ranges, so the property test
+    /// is checking the same offsets the search backends compute and
+    /// hand back to callers — no parallel reimplementation.
+    pub fn byte_offset_for_text_position(
+        doc: &super::Document,
+        position: super::TextPosition,
+    ) -> usize {
+        doc.search_byte_offset_for_position(position)
+    }
+
+    /// Test-only escape hatch for the reverse-DFA size-limit overflow
+    /// property test.
+    ///
+    /// Drives the same `regex_automata` reverse-DFA build used by
+    /// [`super::regex_search::RegexSearchQuery::ensure_reverse`] but
+    /// under a caller-chosen `dfa_size_limit` /
+    /// `determinize_size_limit`. The integration property test under
+    /// `tests/encoding_engine/prop_reverse_dfa_overflow.rs` cannot
+    /// reach the `pub(crate)` builder directly, so it goes through
+    /// this thin wrapper. Production code paths still go through
+    /// `RegexSearchQuery::ensure_reverse` with the project-wide
+    /// 32 MiB limit and never touch this helper.
+    ///
+    /// The DFA itself is dropped before returning so the integration
+    /// crate does not need to depend on `regex_automata` types; the
+    /// only shape the test cares about is whether the build returns
+    /// the typed error and that the diagnostic is non-empty.
+    pub fn build_reverse_dfa_with_limit(
+        pattern: &str,
+        limit_bytes: usize,
+    ) -> Result<(), crate::RegexCompileError> {
+        super::regex_search::build_reverse_dfa_with_limit(pattern, limit_bytes).map(|_| ())
+    }
+}
 
 // Hard limits to keep mmap indexing bounded for huge files.
 // We still fully index "reasonable" files, but cap the work for truly huge inputs.
@@ -941,6 +1026,12 @@ pub struct Document {
     line_ending: LineEnding,
     encoding: DocumentEncoding,
     encoding_origin: DocumentEncodingOrigin,
+    /// Sticky reference to the encoding-aware byte engine for the current
+    /// `encoding`. The accessor [`Document::encoding_engine`] returns this
+    /// field directly; the field is always updated atomically with
+    /// `encoding` and `encoding_origin` through
+    /// [`Document::set_encoding_contract`].
+    encoding_engine: &'static dyn encoding_engine::EncodingEngine,
     decoding_had_errors: bool,
     preserve_save_error_cache: Cell<Option<Option<DocumentEncodingErrorKind>>>,
 
@@ -1228,6 +1319,32 @@ impl PieceTable {
         col
     }
 
+    /// Encoding-aware variant of [`PieceTable::line_len_chars`].
+    ///
+    /// Counts text-unit columns of `line0` by walking the line's contiguous
+    /// byte range through the encoding engine instead of `utf8_step`. The
+    /// piece-tree may split a single line across multiple `Piece`s, so we
+    /// materialize the line bytes into a contiguous buffer once and then
+    /// drive the engine's `count_columns_exact` (which already stops at
+    /// the first line-ending cell of the engine's encoding).
+    ///
+    /// Used by the non-UTF-8 edit paths (`try_replace_range`,
+    /// `try_delete_range_at_encoded`, `try_backspace_at`) so column /
+    /// text-unit arithmetic over piece-tree storage matches the
+    /// document's target encoding.
+    pub(crate) fn line_len_chars_with_engine(
+        &self,
+        line0: usize,
+        engine: &dyn encoding_engine::EncodingEngine,
+    ) -> usize {
+        let (start, end) = self.line_range(line0);
+        if start >= end {
+            return 0;
+        }
+        let bytes = self.read_range(start, end);
+        engine.count_columns_exact(&bytes)
+    }
+
     pub(crate) fn line_visible_segment(
         &self,
         line0: usize,
@@ -1344,6 +1461,100 @@ impl PieceTable {
             (line0.saturating_add(added_lines), last_col)
         };
         Ok(EditOutcome::new(!bytes.is_empty(), cursor))
+    }
+
+    /// Inserts raw `encoded` bytes into the piece-tree add buffer at
+    /// `byte_offset` without any UTF-8 validation or normalization.
+    ///
+    /// This is the non-UTF-8 edit path. The caller is expected to have
+    /// already encoded the user's `&str` into the document's target
+    /// encoding (Class A bytes, UTF-16 code units, or CJK multibyte
+    /// sequences) and to have aligned `byte_offset` to a character
+    /// boundary of that encoding — this method itself performs no
+    /// alignment and no encoding checks.
+    ///
+    /// Line breaks inside `encoded` are counted by raw `0x0A` / `0x0D`
+    /// scans. For ASCII-superset encodings (Class A, UTF-8) this is exact;
+    /// for UTF-16 LE/BE the count is approximate (a `0x0A` byte landing at
+    /// an odd position within a 2-byte code unit is not a real line break),
+    /// but the engine-aware read paths use the document's `LineOffsets`
+    /// cache rather than this internal counter to compute logical
+    /// line/column positions.
+    ///
+    /// Returns an [`EditOutcome`] whose `cursor` is currently a stub
+    /// `(0, 0)`; computing the post-edit cursor in the document's target
+    /// encoding is the caller's responsibility.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn insert_encoded_bytes_at(
+        &mut self,
+        byte_offset: usize,
+        encoded: &[u8],
+    ) -> io::Result<EditOutcome> {
+        if encoded.is_empty() {
+            return Ok(EditOutcome::new(false, (0, 0)));
+        }
+
+        let insert_at = byte_offset.min(self.total_len);
+        self.insert_bytes(insert_at, encoded)?;
+        if insert_at <= self.known_byte_len {
+            self.known_byte_len = self.known_byte_len.saturating_add(encoded.len());
+        }
+        self.refresh_known_line_count();
+
+        Ok(EditOutcome::new(true, (0, 0)))
+    }
+
+    /// Single-transaction replace: deletes the byte range
+    /// `[start, end)` and inserts `encoded` at `start`, batching both
+    /// edits so the session flush sees one transaction.
+    ///
+    /// Returns `true` when the document state changed (the existing
+    /// bytes differed from `encoded` or the range was non-empty).
+    /// Like [`PieceTable::insert_encoded_bytes_at`], no UTF-8
+    /// validation or normalization is performed; the caller is
+    /// responsible for aligning `start` / `end` onto character
+    /// boundaries of the document's target encoding and for encoding
+    /// `encoded` in that encoding.
+    pub(crate) fn replace_encoded_bytes_at(
+        &mut self,
+        start: usize,
+        end: usize,
+        encoded: &[u8],
+    ) -> io::Result<bool> {
+        let start = start.min(self.total_len);
+        let end = end.min(self.total_len).max(start);
+        if start == end && encoded.is_empty() {
+            return Ok(false);
+        }
+        // Short-circuit no-op replace: the byte range is already equal
+        // to `encoded`. This keeps `dirty` clean for round-trip edits
+        // that do not actually change content.
+        if end > start {
+            let existing = self.read_range(start, end);
+            if existing == encoded {
+                return Ok(false);
+            }
+        }
+
+        self.begin_edit_batch();
+        let result = (|| -> io::Result<()> {
+            if end > start {
+                self.delete_range(start, end - start)?;
+            }
+            if !encoded.is_empty() {
+                let insert_at = start.min(self.total_len);
+                self.insert_bytes(insert_at, encoded)?;
+                if insert_at <= self.known_byte_len {
+                    self.known_byte_len = self.known_byte_len.saturating_add(encoded.len());
+                }
+                self.refresh_known_line_count();
+            }
+            Ok(())
+        })();
+        let end_batch = self.end_edit_batch();
+        result?;
+        end_batch?;
+        Ok(true)
     }
 
     pub(crate) fn replace_range_at(
@@ -1543,6 +1754,48 @@ impl PieceTable {
         offset.min(end)
     }
 
+    /// Encoding-aware variant of [`PieceTable::byte_offset_for_col`].
+    ///
+    /// Walks the requested line's bytes through the engine's `step`
+    /// instead of `utf8_step`, so multi-byte cells of the document's
+    /// target encoding (UTF-16 code units, CJK multi-byte sequences) are
+    /// counted as single text units. The line bytes are read into a
+    /// contiguous buffer once because the piece-tree may store a single
+    /// logical line across several `Piece`s and the encoding engine's
+    /// step contract assumes a flat byte slice.
+    ///
+    /// Returns a byte offset within `self.total_len()`. The returned
+    /// offset sits on a character boundary of the engine's encoding by
+    /// construction (every `step` advance lands on one).
+    pub(crate) fn byte_offset_for_col_with_engine(
+        &self,
+        line0: usize,
+        col0: usize,
+        engine: &dyn encoding_engine::EncodingEngine,
+    ) -> usize {
+        let (start, end) = self.line_range(line0);
+        if col0 == 0 || start >= end {
+            return start;
+        }
+        let bytes = self.read_range(start, end);
+        let bytes_len = bytes.len();
+        let mut col = 0usize;
+        let mut local = 0usize;
+        while local < bytes_len && col < col0 {
+            let b = bytes[local];
+            if b == b'\n' || b == b'\r' {
+                break;
+            }
+            let step = engine.step(&bytes, local, bytes_len);
+            if step == 0 {
+                break;
+            }
+            local += step;
+            col += 1;
+        }
+        start.saturating_add(local).min(end)
+    }
+
     fn advance_offset_by_text_units(&self, start: usize, text_units: usize) -> usize {
         let start = start.min(self.total_len);
         if text_units == 0 || start >= self.total_len {
@@ -1596,6 +1849,84 @@ impl PieceTable {
                 }
             });
         offset.min(self.total_len)
+    }
+
+    /// Encoding-aware variant of
+    /// [`PieceTable::advance_offset_by_text_units`].
+    ///
+    /// Walks `text_units` text-unit cells forward from `start`, counting
+    /// each `engine.step` advance as one cell and treating `\r\n` as a
+    /// single CRLF cell when the engine reports `0x0D` and `0x0A` as
+    /// 1-byte cells. The piece-tree contents are read into a contiguous
+    /// buffer (from `start` to `total_len`) so the engine's flat-slice
+    /// `step` contract holds.
+    ///
+    /// Used by the non-UTF-8 edit paths so `try_replace_range` /
+    /// `try_delete_range_at_encoded` compute deletion endpoints on
+    /// character boundaries of the document's target encoding instead
+    /// of on UTF-8 stepping that would mis-count multi-byte cells of
+    /// UTF-16 / Class B encodings.
+    pub(crate) fn advance_offset_by_text_units_with_engine(
+        &self,
+        start: usize,
+        text_units: usize,
+        engine: &dyn encoding_engine::EncodingEngine,
+    ) -> usize {
+        let start = start.min(self.total_len);
+        if text_units == 0 || start >= self.total_len {
+            return start;
+        }
+        let bytes = self.read_range(start, self.total_len);
+        let bytes_len = bytes.len();
+        let mut local = 0usize;
+        let mut remaining = text_units;
+        let mut pending_cr = false;
+        while local < bytes_len && (remaining > 0 || pending_cr) {
+            let next_step = engine.step(&bytes, local, bytes_len);
+            if pending_cr {
+                pending_cr = false;
+                // CRLF collapses to a single text unit when the engine
+                // recognises both halves as 1-byte ASCII cells.
+                if next_step == 1 && bytes[local] == b'\n' {
+                    local += 1;
+                    continue;
+                }
+            }
+            if remaining == 0 {
+                break;
+            }
+            if next_step == 0 {
+                break;
+            }
+            if next_step == 1 && bytes[local] == b'\r' {
+                pending_cr = true;
+            }
+            local += next_step;
+            remaining -= 1;
+        }
+        start.saturating_add(local).min(self.total_len)
+    }
+
+    /// Returns the byte range `[start, end)` covering line `line0` in the
+    /// piece-tree backing.
+    ///
+    /// Line offsets are tracked through raw `0x0A` / `0x0D` byte scans,
+    /// which are encoding-aware-correct for every supported encoding:
+    /// line-ending bytes never appear inside a multi-byte cell (UTF-8
+    /// continuation bytes are `0b10xx_xxxx`, UTF-16 keeps line endings
+    /// on even offsets, and CJK trail bytes never include `0x0A` or
+    /// `0x0D`).
+    pub(crate) fn line_byte_range(&self, line0: usize) -> (usize, usize) {
+        self.line_range(line0)
+    }
+
+    /// Reads `total_len` bytes (or a sub-range) from the piece-tree.
+    ///
+    /// Marked `pub(crate)` so the encoded edit path in
+    /// `commands.rs` can drive `step_backward` over a contiguous byte
+    /// slice for backspace alignment.
+    pub(crate) fn read_byte_range(&self, start: usize, end: usize) -> Vec<u8> {
+        self.read_range(start, end)
     }
 
     fn insert_bytes(&mut self, pos: usize, bytes: &[u8]) -> io::Result<()> {
@@ -1955,5 +2286,7 @@ fn clear_session_sidecar(path: &Path) {
     persistence::clear_session_sidecar(path);
 }
 
+#[cfg(test)]
+mod regex_tests;
 #[cfg(test)]
 mod tests;

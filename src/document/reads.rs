@@ -1,7 +1,13 @@
+use super::encoding_engine::EncodingEngine;
 use super::*;
 use std::iter::FusedIterator;
 
-fn visible_column_byte_range(bytes: &[u8], start_col: usize, max_cols: usize) -> (usize, usize) {
+fn visible_column_byte_range(
+    engine: &dyn EncodingEngine,
+    bytes: &[u8],
+    start_col: usize,
+    max_cols: usize,
+) -> (usize, usize) {
     if max_cols == 0 || bytes.is_empty() {
         return (0, 0);
     }
@@ -25,19 +31,20 @@ fn visible_column_byte_range(bytes: &[u8], start_col: usize, max_cols: usize) ->
         if col >= start_col && col.saturating_sub(start_col) >= max_cols {
             break;
         }
-        i += utf8_step(bytes, i, bytes.len());
+        i += engine.step(bytes, i, bytes.len());
         col += 1;
     }
 
     (start.unwrap_or(i), i)
 }
 
-fn mmap_line_visible_bytes(
-    bytes: &[u8],
+fn mmap_line_visible_bytes<'a>(
+    engine: &dyn EncodingEngine,
+    bytes: &'a [u8],
     line_range: Option<(usize, usize)>,
     start_col: usize,
     max_cols: usize,
-) -> &[u8] {
+) -> &'a [u8] {
     if bytes.is_empty() || max_cols == 0 {
         return &[];
     }
@@ -53,22 +60,18 @@ fn mmap_line_visible_bytes(
         return &[];
     }
 
-    if bytes[end0 - 1] == b'\n' {
-        end0 = end0.saturating_sub(1);
-    }
-    if end0 > start0 && bytes[end0 - 1] == b'\r' {
-        end0 = end0.saturating_sub(1);
-    }
+    end0 = engine.trim_trailing_line_break(bytes, start0, end0);
     if start0 >= end0 {
         return &[];
     }
 
     let line_bytes = &bytes[start0..end0];
-    let (start, end) = visible_column_byte_range(line_bytes, start_col, max_cols);
+    let (start, end) = visible_column_byte_range(engine, line_bytes, start_col, max_cols);
     &line_bytes[start..end]
 }
 
 fn trimmed_line_byte_range(
+    engine: &dyn EncodingEngine,
     bytes: &[u8],
     line_range: Option<(usize, usize)>,
 ) -> Option<(usize, usize)> {
@@ -79,16 +82,12 @@ fn trimmed_line_byte_range(
     if start0 >= end0 {
         return None;
     }
-    if bytes[end0 - 1] == b'\n' {
-        end0 = end0.saturating_sub(1);
-    }
-    if end0 > start0 && bytes[end0 - 1] == b'\r' {
-        end0 = end0.saturating_sub(1);
-    }
+    end0 = engine.trim_trailing_line_break(bytes, start0, end0);
     (start0 < end0).then_some((start0, end0))
 }
 
 fn scanned_line_slice_is_exact(
+    engine: &dyn EncodingEngine,
     bytes: &[u8],
     line_range: (usize, usize),
     start_col: usize,
@@ -98,27 +97,46 @@ fn scanned_line_slice_is_exact(
     if line_complete {
         return true;
     }
-    let Some((start0, end0)) = trimmed_line_byte_range(bytes, Some(line_range)) else {
+    let Some((start0, end0)) = trimmed_line_byte_range(engine, bytes, Some(line_range)) else {
         return start_col == 0 && max_cols == 0;
     };
-    let available_cols = count_text_columns_exact(&bytes[start0..end0]);
+    let available_cols = engine.count_columns_exact(&bytes[start0..end0]);
     start_col <= available_cols && start_col.saturating_add(max_cols) <= available_cols
 }
 
 fn line_slice_from_bytes(
+    engine: &dyn EncodingEngine,
     bytes: &[u8],
     line_range: Option<(usize, usize)>,
     start_col: usize,
     max_cols: usize,
     exact: bool,
 ) -> LineSlice {
-    let line_bytes = mmap_line_visible_bytes(bytes, line_range, start_col, max_cols);
-    let text = match std::str::from_utf8(line_bytes) {
-        Ok(text) => text.to_owned(),
-        Err(_) => String::from_utf8_lossy(line_bytes).into_owned(),
-    };
+    let line_bytes = mmap_line_visible_bytes(engine, bytes, line_range, start_col, max_cols);
+    let text = decode_window_for_engine(engine, line_bytes);
 
     LineSlice::new(text, exact && line_range.is_some())
+}
+
+/// Decodes a byte window that came directly from raw (mmap-backed) storage
+/// using the engine's current encoding.
+///
+/// For UTF-8 documents this preserves the historical byte-identical behavior
+/// of `std::str::from_utf8` / `String::from_utf8_lossy`; for any other
+/// encoding (Class A and beyond) the bytes are decoded through
+/// `encoding_rs::Encoding::decode_with_bom_removal`, which is the per-window
+/// path mandated by the encoding-aware engine design.
+fn decode_window_for_engine(engine: &dyn EncodingEngine, bytes: &[u8]) -> String {
+    let encoding = engine.encoding();
+    if encoding.is_utf8() {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => text.to_owned(),
+            Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+        }
+    } else {
+        let (decoded, _had_errors) = encoding.as_encoding().decode_with_bom_removal(bytes);
+        decoded.into_owned()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -150,6 +168,7 @@ struct LineSliceBatchRequest {
 }
 
 pub(super) fn next_mmap_line_range(
+    engine: &dyn EncodingEngine,
     bytes: &[u8],
     file_len: usize,
     start0: usize,
@@ -161,20 +180,17 @@ pub(super) fn next_mmap_line_range(
     }
 
     let scan_end = start0.saturating_add(max_scan_bytes).min(file_len);
-    let slice = &bytes[start0..scan_end];
-    let end0 = if let Some(rel) = memchr::memchr2(b'\n', b'\r', slice) {
-        let idx = start0 + rel;
-        if bytes[idx] == b'\r' && idx + 1 < file_len && bytes[idx + 1] == b'\n' {
-            idx + 2
-        } else {
-            idx + 1
-        }
-    } else {
-        scan_end
-    };
+    // Use the engine's encoding-aware `next_line_start` so UTF-16 stays
+    // 2-byte aligned and stray `0x0A` / `0x0D`
+    // bytes inside non-line-ending UTF-16 code units are not mistaken
+    // for line breaks. For Class A / UTF-8 backings this delegates to
+    // the same `memchr2` walk as before, so byte-identical behavior is
+    // preserved.
+    let next = engine.next_line_start(bytes, scan_end, start0);
+    let end0 = next.max(start0).min(scan_end);
 
     Some(MmapLineScan {
-        range: (start0, end0.max(start0)),
+        range: (start0, end0),
         complete: end0 < scan_end || scan_end == file_len,
     })
 }
@@ -373,6 +389,7 @@ impl Document {
     }
 
     fn line_slice_from_piece_table_backing(
+        engine: &dyn EncodingEngine,
         piece_table: &PieceTable,
         line0: usize,
         start_col: usize,
@@ -385,6 +402,7 @@ impl Document {
             ));
         }
         Self::line_slices_from_partial_piece_table_backing(
+            engine,
             piece_table,
             line0,
             1,
@@ -434,15 +452,21 @@ impl Document {
                 LineSlice::default()
             };
         }
+        let engine = self.encoding_engine();
         if let Some(start0) = self.mmap_line_start_offset_exact(line0) {
             if start0 >= file_len {
                 return LineSlice::new(String::new(), true);
             }
-            if let Some(scanned) =
-                next_mmap_line_range(bytes, file_len, start0, FALLBACK_NEXT_LINE_SCAN_BYTES)
-            {
+            if let Some(scanned) = next_mmap_line_range(
+                engine,
+                bytes,
+                file_len,
+                start0,
+                FALLBACK_NEXT_LINE_SCAN_BYTES,
+            ) {
                 if scanned.complete {
                     return line_slice_from_bytes(
+                        engine,
                         bytes,
                         Some(scanned.range),
                         start_col,
@@ -463,6 +487,7 @@ impl Document {
         };
 
         line_slice_from_bytes(
+            engine,
             bytes,
             Some(resolved.range),
             start_col,
@@ -517,6 +542,7 @@ impl Document {
         if remaining > 0 {
             let scan_start_line0 = first_line0.saturating_add(slices.len());
             if let Some(mut scanned) = Self::line_slices_from_partial_piece_table_backing(
+                self.encoding_engine(),
                 piece_table,
                 scan_start_line0,
                 remaining,
@@ -532,6 +558,7 @@ impl Document {
     }
 
     fn line_slices_from_partial_piece_table_backing(
+        engine: &dyn EncodingEngine,
         piece_table: &PieceTable,
         first_line0: usize,
         line_count: usize,
@@ -580,11 +607,13 @@ impl Document {
                 break;
             }
             slices.push(line_slice_from_bytes(
+                engine,
                 &bytes,
                 Some(scanned.range),
                 start_col,
                 max_cols,
                 scanned_line_slice_is_exact(
+                    engine,
                     &bytes,
                     scanned.range,
                     start_col,
@@ -624,10 +653,12 @@ impl Document {
             request.line_count,
             TAIL_FAST_PATH_MAX_BACKSCAN_BYTES,
         )?;
+        let engine = self.encoding_engine();
         let mut slices: Vec<LineSlice> = ranges
             .into_iter()
             .map(|range| {
                 line_slice_from_bytes(
+                    engine,
                     ctx.bytes,
                     Some(range),
                     request.start_col,
@@ -648,6 +679,7 @@ impl Document {
         let mut slices = Vec::with_capacity(request.line_count);
         let mut next_line0 = request.first_line0;
         let mut scan_start = None;
+        let engine = self.encoding_engine();
 
         while slices.len() < request.line_count {
             let Some(range) =
@@ -657,6 +689,7 @@ impl Document {
             };
             scan_start = Some(range.1);
             slices.push(line_slice_from_bytes(
+                engine,
                 ctx.bytes,
                 Some(range),
                 request.start_col,
@@ -679,12 +712,14 @@ impl Document {
     ) {
         let mut scan_start =
             scan_start.or_else(|| self.estimated_mmap_line_byte_range(next_line0).map(|r| r.0));
+        let engine = self.encoding_engine();
 
         while slices.len() < request.line_count {
             let Some(start0) = scan_start else {
                 break;
             };
             let Some(scanned) = next_mmap_line_range(
+                engine,
                 ctx.bytes,
                 ctx.file_len,
                 start0,
@@ -694,6 +729,7 @@ impl Document {
             };
             let range = scanned.range;
             slices.push(line_slice_from_bytes(
+                engine,
                 ctx.bytes,
                 Some(range),
                 request.start_col,
@@ -814,9 +850,10 @@ impl Document {
             return TextSlice::new(String::new(), exact_start);
         }
 
+        let engine = self.encoding_engine();
         let end_offset =
-            advance_offset_by_text_units_in_bytes(bytes, file_len, precise_start_offset, len_chars);
-        let text = String::from_utf8_lossy(&bytes[precise_start_offset..end_offset]).into_owned();
+            engine.advance_offset_by_text_units(bytes, file_len, precise_start_offset, len_chars);
+        let text = decode_window_for_engine(engine, &bytes[precise_start_offset..end_offset]);
         TextSlice::new(text, exact_start)
     }
 
@@ -843,9 +880,13 @@ impl Document {
         }
 
         if let Some(piece_table) = &self.piece_table {
-            if let Some(slice) =
-                Self::line_slice_from_piece_table_backing(piece_table, line0, start_col, max_cols)
-            {
+            if let Some(slice) = Self::line_slice_from_piece_table_backing(
+                self.encoding_engine(),
+                piece_table,
+                line0,
+                start_col,
+                max_cols,
+            ) {
                 return slice;
             }
             return LineSlice::default();
