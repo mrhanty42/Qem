@@ -250,7 +250,9 @@ fn scanned_piece_table_offset_for_position(
     let mut skip_lines = position.line0().saturating_sub(piece_table.line_count());
     while skip_lines > 0 {
         let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
-        (scanned.range.1 > rel_start && scanned.complete).then_some(())?;
+        if scanned.range.1 <= rel_start || !scanned.complete {
+            return None;
+        }
         rel_start = scanned.range.1;
         skip_lines -= 1;
     }
