@@ -1190,11 +1190,10 @@ impl Document {
             line0 += 1;
         }
 
-        let line_end = self
+        let target = self
             .encoding_engine()
-            .next_line_start(bytes, file_len, line_start);
-        byte_offset_for_text_col_in_bytes(bytes, (line_start, line_end), position.col0())
-            .min(file_len)
+            .advance_offset_by_text_units(bytes, file_len, line_start, position.col0());
+        target.min(file_len)
     }
 
     pub(super) fn mmap_position_for_byte_offset(&self, byte_offset: usize) -> TextPosition {

@@ -1556,10 +1556,8 @@ fn find_next_regex_in_class_b_chunked(
         // the rest of the loop body shares one code path.
         let window: Vec<u8> = if let Some(slice) = doc.mmap_search_slice(chunk_start, chunk_end) {
             slice.to_vec()
-        } else if let Some(buf) = doc.piece_table_uncapped_range(chunk_start, chunk_end) {
-            buf
         } else {
-            return None;
+            doc.piece_table_uncapped_range(chunk_start, chunk_end)?
         };
 
         // Decode the window into a Cow<str>. `decode_without_bom_handling`
