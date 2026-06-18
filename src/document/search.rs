@@ -1204,16 +1204,25 @@ impl Document {
             return TextPosition::new(0, 0);
         }
 
-        let mut line0 = 0usize;
-        let mut line_start = 0usize;
-        if let Ok(offsets) = self.line_offsets.read() {
-            (line0, line_start) = line_offsets_anchor_for_byte(&offsets, target);
-            line_start = line_start.min(target);
+        let engine = self.encoding_engine();
+        let (mut line0, mut line_start) = if let Ok(offsets) = self.line_offsets.read() {
+            line_offsets_anchor_for_byte(&offsets, target)
+        } else {
+            (0usize, 0usize)
+        };
+        line_start = line_start.min(target);
+
+        loop {
+            let next = engine.next_line_start(bytes, file_len, line_start);
+            if next > target || next <= line_start {
+                break;
+            }
+            line0 = line0.saturating_add(1);
+            line_start = next;
         }
 
-        let mut state = PositionScanState::new(line0, 0);
-        scan_position_bytes(&bytes[line_start..target], &mut state);
-        state.position()
+        let col0 = engine.count_columns_exact(&bytes[line_start..target]);
+        TextPosition::new(line0, col0)
     }
 
     /// Encoding-aware mapping from a raw byte offset to a `TextPosition`
@@ -1297,47 +1306,8 @@ impl Document {
     fn mmap_advance_offset_by_text_units(&self, start: usize, text_units: usize) -> usize {
         let bytes = self.mmap_bytes();
         let file_len = self.file_len.min(bytes.len());
-        let start = start.min(file_len);
-        if text_units == 0 || start >= file_len {
-            return start;
-        }
-
-        let engine = self.encoding_engine();
-        let mut remaining = text_units;
-        let mut offset = start;
-        let mut pending_cr = false;
-        let mut i = start;
-        while i < file_len && (remaining > 0 || pending_cr) {
-            if pending_cr {
-                pending_cr = false;
-                if bytes[i] == b'\n' {
-                    i += 1;
-                    offset = offset.saturating_add(1);
-                    continue;
-                }
-            }
-
-            match bytes[i] {
-                b'\n' => {
-                    remaining = remaining.saturating_sub(1);
-                    i += 1;
-                    offset = offset.saturating_add(1);
-                }
-                b'\r' => {
-                    remaining = remaining.saturating_sub(1);
-                    pending_cr = true;
-                    i += 1;
-                    offset = offset.saturating_add(1);
-                }
-                _ => {
-                    remaining = remaining.saturating_sub(1);
-                    let step = engine.step(bytes, i, file_len);
-                    i += step;
-                    offset = offset.saturating_add(step);
-                }
-            }
-        }
-        offset.min(file_len)
+        self.encoding_engine()
+            .advance_offset_by_text_units(bytes, file_len, start, text_units)
     }
 
     pub(super) fn search_byte_offset_for_position(&self, position: TextPosition) -> usize {
