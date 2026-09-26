@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.8.1
+
+### Fixed
+
+- Encoding-aware text-column conversion. Column-based movement and
+  search anchoring in non-UTF-8 documents now map text columns to byte
+  offsets through the document's `EncodingEngine`
+  (`byte_offset_for_text_col_with_engine`) instead of assuming UTF-8,
+  keeping line/column navigation correct for UTF-16, single-byte, and
+  multi-byte encodings.
+- Open-ended search ranges over UTF-16 storage no longer loop forever
+  when the file ends on a truncated (odd) final byte. The scanner now
+  always advances even when the engine reports a zero-byte step at the
+  tail.
+- Reverse regex search no longer re-yields the same zero-width match
+  at EOF after the start offset is clamped back by one text unit.
+
+### Changed
+
+- Reverse regex search over small byte-backed and rope ranges runs a
+  single forward scan instead of determinizing a reverse DFA. The
+  threshold is deliberately small, so larger ranges keep the cached
+  DFA path.
+- Search position scanning routes through the document's encoding
+  engine instead of assuming UTF-8.
+- README rewritten around the on-disk line index, page cache, and
+  piece-tree promotion architecture.
+- Expanded encoding-engine test coverage: alignment, step, newline,
+  endianness, reverse-regex property suites, and per-encoding cases.
+
+### Added
+
+- The egui demo opens documents through native file dialogs (`rfd`),
+  with a reworked main window and an updated `large_file` viewer.
+- Internal background-completion notifier so demo UI state refreshes
+  when async open, save, and indexing work finishes.
+
 ## 0.8.0
 
 ### Added
