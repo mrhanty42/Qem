@@ -30,7 +30,9 @@ param(
 
     [switch]$KeepSaveOutputs,
 
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+
+    [switch]$Release
 )
 
 $ErrorActionPreference = "Stop"
@@ -151,7 +153,8 @@ if (Test-Path $outputPath) {
     Remove-Item -Force $outputPath
 }
 
-$perfProbeExe = Join-Path $repoRoot "target\debug\examples\perf_probe.exe"
+$perfProfile = if ($Release) { "release" } else { "debug" }
+$perfProbeExe = Join-Path $repoRoot "target\$perfProfile\examples\perf_probe.exe"
 $saveRoot = Join-Path $repoRoot $SaveDir
 
 if ($MeasureSave -and -not (Test-Path $saveRoot)) {
@@ -161,7 +164,11 @@ if ($MeasureSave -and -not (Test-Path $saveRoot)) {
 Push-Location $repoRoot
 try {
     if (-not $SkipBuild -or -not (Test-Path $perfProbeExe)) {
-        cargo build --example perf_probe
+        if ($Release) {
+            cargo build --release --example perf_probe
+        } else {
+            cargo build --example perf_probe
+        }
         if ($LASTEXITCODE -ne 0) {
             throw "cargo build --example perf_probe failed."
         }
