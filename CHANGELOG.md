@@ -25,8 +25,9 @@
   DFA path.
 - Search position scanning routes through the document's encoding
   engine instead of assuming UTF-8.
-- README rewritten around the on-disk line index, page cache, and
-  piece-tree promotion architecture.
+- README rewritten in a shorter form limited to documented behavior;
+  architecture claims that did not match the implementation (B-tree
+  line index, LRU page cache) were removed.
 - Expanded encoding-engine test coverage: alignment, step, newline,
   endianness, reverse-regex property suites, and per-encoding cases.
 
