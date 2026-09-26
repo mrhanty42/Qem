@@ -7,10 +7,13 @@
 //!
 //! The alignment strategy is dispatched by encoding family:
 //!
-//! - **UTF-8** delegates to the existing `align_utf8_boundary_backward` /
-//!   `align_utf8_boundary_forward` helpers in `src/document.rs`. Backward
-//!   walks back to the nearest UTF-8 char boundary; forward walks forward
-//!   to the next one.
+//! - **UTF-8** walks continuation bytes inside a small byte window
+//!   around the offset (see `align_utf8_window_backward` /
+//!   `align_utf8_window_forward`). Backward lands on the nearest UTF-8
+//!   char boundary at or before the offset; forward lands on the next
+//!   one. The window is required because the document's backing may be
+//!   mmap-backed and multi-GB; copying it per alignment call is not
+//!   survivable.
 //! - **Class A** (single-byte ASCII supersets driven by
 //!   [`super::encoding_engine::SingleByteEngine`]) is a no-op: every byte
 //!   position is already a character boundary, so the function clamps to
@@ -35,7 +38,7 @@
 #![allow(dead_code)]
 
 use super::encoding_engine::{EncodingEngine, SingleByteEngine};
-use super::{align_utf8_boundary_backward, align_utf8_boundary_forward, Document};
+use super::Document;
 
 /// Direction in which a byte offset is rounded to the nearest character
 /// boundary of the document's current encoding.
@@ -88,14 +91,17 @@ impl Document {
         let encoding = self.encoding();
         let name = encoding.name();
 
-        // UTF-8: delegate to the existing UTF-8 boundary walkers. They
-        // consult `is_char_boundary` on the decoded text, so they
-        // already cover the multi-byte continuation rules.
+        // UTF-8: delegate to the UTF-8 boundary walkers over a small
+        // window around `offset`. A UTF-8 continuation run never
+        // extends more than 3 bytes past its lead byte, so 8 bytes on
+        // each side cover the walk without materializing the document.
         if encoding.is_utf8() {
-            let bytes = self.bytes_for_alignment();
+            let back = offset.saturating_sub(8);
+            let window = self.alignment_window(back, offset.saturating_add(8).min(file_len));
+            let rel = offset - back;
             return match dir {
-                AlignDirection::Backward => align_utf8_boundary_backward(&bytes, offset),
-                AlignDirection::Forward => align_utf8_boundary_forward(&bytes, offset),
+                AlignDirection::Backward => back + align_utf8_window_backward(&window, rel),
+                AlignDirection::Forward => back + align_utf8_window_forward(&window, rel),
             };
         }
 
@@ -124,21 +130,55 @@ impl Document {
         // Class A / UTF-16 have already been handled above, and the
         // unknown-encoding fallback in `engine_for_encoding` returns
         // `Utf8Engine`, which is also captured by the UTF-8 branch.
-        let bytes = self.bytes_for_alignment();
-        let bytes_len = bytes.len();
-        let target = offset.min(bytes_len);
-        if target == 0 || target == bytes_len {
-            return target;
-        }
+        //
+        // The window must cover the whole Class B walk: the anchor scan
+        // backtracks up to `APPROX_LINE_BACKTRACK_BYTES` behind the
+        // target and the forward walk overshoots the target by at most
+        // one character, so doubling the backtrack plus a small forward
+        // margin bounds everything the scan can touch.
+        let lo = offset.saturating_sub(super::APPROX_LINE_BACKTRACK_BYTES * 2);
+        let window = self.alignment_window(lo, offset.saturating_add(4096).min(file_len));
+        let target = offset - lo;
 
         let engine = self.encoding_engine();
-        align_class_b(
-            engine,
-            &bytes,
-            &self.line_anchor_before(target, &bytes),
-            target,
-            dir,
-        )
+        let anchor = self.line_anchor_before(target, &window);
+        lo + align_class_b(engine, &window, &anchor, target, dir)
+    }
+
+    /// Reads the bounded byte window `[lo, hi)` from the document's
+    /// current backing for alignment scans.
+    ///
+    /// Alignment only ever consults a small region around `offset`:
+    /// UTF-8 continuation walks stay within a few bytes and the Class B
+    /// anchor scan is bounded by [`super::APPROX_LINE_BACKTRACK_BYTES`].
+    /// Copying the whole document per alignment call — multi-GB for the
+    /// mmap and piece-tree backings this engine targets — is therefore
+    /// neither necessary nor survivable on huge files.
+    fn alignment_window(&self, lo: usize, hi: usize) -> Vec<u8> {
+        debug_assert!(lo < hi);
+        if let Some(piece_table) = &self.piece_table {
+            return piece_table.read_range(lo, hi);
+        }
+        if let Some(rope) = &self.rope {
+            // Rope bytes are already in memory; slice the window out.
+            // `lo` / `hi` may land mid-character, so snap them outward
+            // onto character boundaries first (`get_byte_slice`
+            // requires boundary-aligned endpoints).
+            let rope_len = rope.len_bytes();
+            let mut lo = lo.min(rope_len);
+            while lo > 0 && rope.get_byte_slice(lo..lo + 1).is_none() {
+                lo -= 1;
+            }
+            let mut hi = hi.min(rope_len);
+            while hi < rope_len && rope.get_byte_slice(hi..hi + 1).is_none() {
+                hi += 1;
+            }
+            return match rope.get_byte_slice(lo..hi) {
+                Some(slice) => slice.bytes().collect(),
+                None => Vec::new(),
+            };
+        }
+        self.mmap_bytes()[lo..hi].to_vec()
     }
 
     /// Reads the document's current bytes into an owned `Vec<u8>` for
@@ -214,6 +254,32 @@ impl Document {
 /// The walk is progress-safe even if an engine violates its contract:
 /// a zero or non-advancing step consumes one byte as malformed input rather
 /// than returning a repeated cursor to its caller.
+/// UTF-8 boundary walks over a bounded window of a UTF-8 document.
+///
+/// The window passed by `align_byte_offset` comes from a document whose
+/// encoding is UTF-8, so scanning continuation bytes directly is exact.
+/// The whole-slice `align_utf8_boundary_backward` / `_forward` helpers in
+/// `src/document.rs` cannot be reused here: their `from_utf8` validation
+/// contract also guards piece-level callers that may hold non-UTF-8
+/// encodings, and a window edge may legitimately split a character.
+fn align_utf8_window_backward(bytes: &[u8], offset: usize) -> usize {
+    let mut aligned = offset.min(bytes.len());
+    let mut steps = 0;
+    while aligned > 0 && bytes[aligned] & 0b1100_0000 == 0b1000_0000 && steps < 3 {
+        aligned -= 1;
+        steps += 1;
+    }
+    aligned
+}
+
+fn align_utf8_window_forward(bytes: &[u8], offset: usize) -> usize {
+    let mut aligned = offset.min(bytes.len());
+    while aligned < bytes.len() && bytes[aligned] & 0b1100_0000 == 0b1000_0000 {
+        aligned += 1;
+    }
+    aligned
+}
+
 fn align_class_b(
     engine: &dyn EncodingEngine,
     bytes: &[u8],
