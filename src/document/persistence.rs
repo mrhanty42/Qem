@@ -243,7 +243,15 @@ fn write_snapshot(
         SaveSnapshot::Empty => Ok(()),
         SaveSnapshot::Bytes(bytes) => write_bytes_chunked(out, bytes, written, total),
         SaveSnapshot::Mmap(storage) => {
-            write_bytes_chunked(out, storage.read_range(0, storage.len()), written, total)
+            let mut start = 0usize;
+            let len = storage.len();
+            while start < len {
+                let chunk_end = start.saturating_add(SAVE_STREAM_CHUNK_BYTES).min(len);
+                out.write_all(storage.read_range(start, chunk_end))?;
+                start = chunk_end;
+                written.store((start as u64).min(total), Ordering::Relaxed);
+            }
+            Ok(())
         }
         SaveSnapshot::Rope { rope, line_ending } => {
             write_rope_snapshot(out, rope, *line_ending, written, total)
