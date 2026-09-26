@@ -81,13 +81,13 @@ fn line_without_line_endings_strategy() -> impl Strategy<Value = Vec<u8>> {
 /// or a CRLF separator. Each token represents exactly one text unit.
 #[derive(Debug, Clone)]
 enum Token {
- /// A plain byte that is neither `\n` nor `\r`. Encodes to 1 byte
- /// and counts as 1 text unit.
+    /// A plain byte that is neither `\n` nor `\r`. Encodes to 1 byte
+    /// and counts as 1 text unit.
     Byte(u8),
- /// A `\r\n` pair. Encodes to 2 bytes (`0x0D 0x0A`) and counts as
- /// 1 text unit per the line-ending semantics shared by every
- /// `EncodingEngine` (see CRLF handling in
- /// `SingleByteEngine::advance_offset_by_text_units`).
+    /// A `\r\n` pair. Encodes to 2 bytes (`0x0D 0x0A`) and counts as
+    /// 1 text unit per the line-ending semantics shared by every
+    /// `EncodingEngine` (see CRLF handling in
+    /// `SingleByteEngine::advance_offset_by_text_units`).
     Crlf,
 }
 
@@ -98,14 +98,14 @@ enum Token {
 /// real Class A text.
 fn token_strategy() -> impl Strategy<Value = Token> {
     prop_oneof![
-        5 => prop_oneof![
- // High bytes: Cyrillic / Latin-1 glyph range in Class A.
-            3 => 0xC0u8..=0xFE,
- // Printable ASCII (excludes 0x0A and 0x0D by construction).
-            3 => b' '..=b'~',
-        ].prop_map(Token::Byte),
-        1 => Just(Token::Crlf),
-    ]
+           5 => prop_oneof![
+    // High bytes: Cyrillic / Latin-1 glyph range in Class A.
+               3 => 0xC0u8..=0xFE,
+    // Printable ASCII (excludes 0x0A and 0x0D by construction).
+               3 => b' '..=b'~',
+           ].prop_map(Token::Byte),
+           1 => Just(Token::Crlf),
+       ]
 }
 
 /// Generates `(bytes, byte_prefix_lengths)`: the encoded byte sequence

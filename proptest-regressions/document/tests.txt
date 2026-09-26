@@ -5,3 +5,7 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 61bf3bffbb53925a8e882f9934e3846dd8e9cf4654e363523de419b99710bbad # shrinks to initial = "", ops = [Insert { line_hint: 0, col0: 0, text: "" }]
+cc 7a729bbc693ef09b95882a254b6ca03fa1f5c750b535941d11d0777048f1eb32 # shrinks to initial = "", ops = [Insert { line_hint: 0, col0: 0, text: "\na" }, Backspace { line_hint: 1, col0: 0 }]
+cc e5c5270c9457e6430d346dc27730d190ec8cfe450a2f871114097ef8f0fbaaa2 # shrinks to initial = "", use_crlf = false, ops = [Replace { line_hint: 0, col0: 0, len_chars: 0, text: "\na" }, Backspace { line_hint: 1, col0: 0 }]
+cc d2c5454fbeb44eb90884c394792611ca8da95a07776ae6a4fb8b2a0e2ec5abe4 # shrinks to ops = [Backspace { line_hint: 1, col0: 0 }]
+cc 7fcf65b11f605d6e73563c6fa1001687c7ad1abae8b9f6c8c4e1d9dffc977852 # shrinks to ops = [Backspace { line_hint: 1, col0: 0 }]

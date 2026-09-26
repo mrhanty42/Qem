@@ -1921,6 +1921,45 @@ fn cursor_position_roundtrips_with_text_position() {
 }
 
 #[test]
+fn open_file_async_invokes_completion_notifier_before_poll() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-open-notifier-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("open.txt");
+    fs::write(&path, b"alpha\nbeta\n").unwrap();
+
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&wakes);
+    let mut tab = EditorTab::new(70);
+    tab.set_completion_notifier(Some(Arc::new(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+    })));
+    tab.open_file_async(path.clone()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while wakes.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "async load did not notify completion"
+        );
+        std::thread::yield_now();
+    }
+    assert!(tab.is_loading());
+    tab.poll_background_job().unwrap().unwrap();
+    assert!(!tab.is_loading());
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn open_file_async_completes_and_exposes_progress() {
     let dir = std::env::temp_dir().join(format!("qem-editor-open-{}", std::process::id()));
     let _ = fs::create_dir_all(&dir);

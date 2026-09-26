@@ -66,6 +66,18 @@ const REGEX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 /// streaming-regex limit on huge files.
 const REGEX_CHUNK_OVERLAP_BYTES: usize = 1024 * 1024;
 
+/// Small byte-backed ranges are cheaper to scan through the already compiled
+/// byte regex than to determinize a reverse DFA. Repeated calls rescan shrinking
+/// prefixes, but the range remains capped and the path avoids the much larger
+/// fixed reverse-DFA cost for tiny encoded documents.
+const SMALL_REVERSE_REGEX_SCAN_BYTES: usize = 1024 * 1024;
+
+/// Tiny rope ranges are cheaper to scan through the already compiled text
+/// regex than to determinize a reverse DFA. Keep this threshold deliberately
+/// small: the fallback materializes the rope range and repeated `find_prev`
+/// calls rescan shrinking prefixes, so larger ranges must use the cached DFA.
+const SMALL_REVERSE_REGEX_ROPE_SCAN_BYTES: usize = 4 * 1024;
+
 /// Hard ceiling on the in-memory size of a compiled reverse DFA used by
 /// the reverse-regex search path.
 ///
@@ -363,9 +375,17 @@ impl Iterator for RegexSearchIter<'_> {
 
         let advanced = if found.end() <= from {
             // Empty or zero-width match at the same position: nudge forward
-            // by one text unit so the next iteration cannot return the same
-            // match again.
-            advance_one_text_unit(self.doc, from)
+            // by one text unit. At EOF, clamping that nudge returns `from`
+            // again; finish there instead of repeatedly yielding the same
+            // zero-width match.
+            let advanced = self
+                .doc
+                .clamp_position(advance_one_text_unit(self.doc, from));
+            if advanced <= from {
+                self.finished = true;
+                return Some(found);
+            }
+            advanced
         } else {
             found.end()
         };
@@ -945,6 +965,23 @@ fn find_prev_regex_via_reverse_dfa(
     bound_end: TextPosition,
 ) -> Option<SearchMatch> {
     if let Some(rope) = &doc.rope {
+        let start_char = doc.char_index_for_position(bound_start);
+        let end_char = doc
+            .char_index_for_position(bound_end)
+            .max(start_char)
+            .min(rope.len_chars());
+        let start_byte = rope.char_to_byte(start_char.min(rope.len_chars()));
+        let end_byte = rope.char_to_byte(end_char);
+        if end_byte.saturating_sub(start_byte) <= SMALL_REVERSE_REGEX_ROPE_SCAN_BYTES {
+            return forward_regex_search_last_in_rope(
+                doc,
+                rope,
+                query.text_regex(),
+                start_char,
+                end_char,
+                bound_end,
+            );
+        }
         return reverse_dfa_search_in_rope(doc, rope, query, bound_start, bound_end);
     }
     let start_off = doc.search_byte_offset_for_position(bound_start);
@@ -952,10 +989,93 @@ fn find_prev_regex_via_reverse_dfa(
     if start_off >= end_off {
         return None;
     }
+    let span = end_off.saturating_sub(start_off);
+    if span <= SMALL_REVERSE_REGEX_SCAN_BYTES {
+        if let Some(bytes) = doc.piece_table_uncapped_range(start_off, end_off) {
+            return forward_regex_search_last_in_slice(
+                doc,
+                query.bytes_regex(),
+                bound_start,
+                start_off,
+                &bytes,
+            );
+        }
+    }
     if let Some(slice) = doc.mmap_search_slice(start_off, end_off) {
+        if slice.len() <= SMALL_REVERSE_REGEX_SCAN_BYTES {
+            return forward_regex_search_last_in_slice(
+                doc,
+                query.bytes_regex(),
+                bound_start,
+                start_off,
+                slice,
+            );
+        }
         return reverse_dfa_search_in_slice(doc, query, bound_start, start_off, slice);
     }
     reverse_dfa_search_in_piece_tree(doc, query, bound_start, bound_end)
+}
+
+/// Finds the last match in a small contiguous byte range by one forward scan.
+/// For short inputs this avoids the much larger fixed cost of building a
+/// reverse DFA while preserving the same alignment and typed-position rules.
+fn forward_regex_search_last_in_slice(
+    doc: &Document,
+    regex: &ByteRegex,
+    bound_start: TextPosition,
+    slice_start_off: usize,
+    slice: &[u8],
+) -> Option<SearchMatch> {
+    let matched = regex.find_iter(slice).last()?;
+    let absolute_start = slice_start_off.saturating_add(matched.start());
+    let absolute_end = slice_start_off.saturating_add(matched.end());
+    let aligned_start = doc.align_byte_offset(absolute_start, AlignDirection::Backward);
+    let aligned_end = doc.align_byte_offset(absolute_end, AlignDirection::Forward);
+    if aligned_end < aligned_start || (aligned_end == aligned_start && !matched.is_empty()) {
+        return None;
+    }
+
+    let rebased_start = aligned_start
+        .saturating_sub(slice_start_off)
+        .min(slice.len());
+    let rebased_end = aligned_end.saturating_sub(slice_start_off).min(slice.len());
+    finalize_byte_match(
+        bound_start,
+        &slice[..rebased_start],
+        &slice[rebased_start..rebased_end],
+        None,
+    )
+}
+
+/// Finds the last match in a tiny rope range without compiling a reverse DFA.
+/// The text regex preserves rope/UTF-8 semantics, and absolute char indices are
+/// converted directly to typed positions without rebuilding reverse windows.
+fn forward_regex_search_last_in_rope(
+    doc: &Document,
+    rope: &Rope,
+    regex: &TextRegex,
+    start_char: usize,
+    end_char: usize,
+    bound_end: TextPosition,
+) -> Option<SearchMatch> {
+    if start_char >= end_char {
+        return None;
+    }
+    let text = rope.slice(start_char..end_char).to_string();
+    let matched = regex.find_iter(&text).last()?;
+    let relative_start_chars = text[..matched.start()].chars().count();
+    let match_units = text[matched.start()..matched.end()].chars().count();
+    let absolute_start_char = start_char.saturating_add(relative_start_chars);
+    let absolute_end_char = absolute_start_char.saturating_add(match_units);
+    let start_pos = doc.position_for_char_index(absolute_start_char);
+    let end_pos = doc.position_for_char_index(absolute_end_char);
+    if end_pos > bound_end {
+        return None;
+    }
+    Some(SearchMatch::new(
+        TextRange::new(start_pos, match_units),
+        end_pos,
+    ))
 }
 
 fn collect_rope_chunks_with_offsets(rope: &Rope) -> Vec<(usize, &str)> {
@@ -1556,10 +1676,8 @@ fn find_next_regex_in_class_b_chunked(
         // the rest of the loop body shares one code path.
         let window: Vec<u8> = if let Some(slice) = doc.mmap_search_slice(chunk_start, chunk_end) {
             slice.to_vec()
-        } else if let Some(buf) = doc.piece_table_uncapped_range(chunk_start, chunk_end) {
-            buf
         } else {
-            return None;
+            doc.piece_table_uncapped_range(chunk_start, chunk_end)?
         };
 
         // Decode the window into a Cow<str>. `decode_without_bom_handling`

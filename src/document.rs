@@ -954,6 +954,32 @@ fn byte_offset_for_text_col_in_bytes(
     offset.min(end)
 }
 
+fn byte_offset_for_text_col_with_engine(
+    bytes: &[u8],
+    line_range: (usize, usize),
+    col0: usize,
+    engine: &dyn encoding_engine::EncodingEngine,
+) -> usize {
+    let (start, end) = line_range;
+    if col0 == 0 || start >= end {
+        return start.min(end);
+    }
+    let mut col = 0;
+    let mut i = start;
+    while i < end && col < col0 {
+        if matches!(bytes[i], b'\n' | b'\r') {
+            break;
+        }
+        let step = engine.step(bytes, i, end);
+        if step == 0 {
+            break;
+        }
+        i = i.saturating_add(step);
+        col += 1;
+    }
+    i.min(end)
+}
+
 fn advance_offset_by_text_units_in_bytes(
     bytes: &[u8],
     file_len: usize,
@@ -1636,9 +1662,9 @@ impl PieceTable {
             return Ok((false, line0, col0));
         }
         let del_start = line_start.saturating_sub(newline_len);
-        self.delete_range(del_start, newline_len)?;
         let new_line0 = line0.saturating_sub(1);
         let new_col0 = self.line_len_chars(new_line0);
+        self.delete_range(del_start, newline_len)?;
         Ok((true, new_line0, new_col0))
     }
 

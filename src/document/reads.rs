@@ -223,6 +223,7 @@ fn next_piece_table_scan_line_range(
 }
 
 fn scanned_piece_table_offset_for_position(
+    doc: &Document,
     piece_table: &PieceTable,
     position: TextPosition,
 ) -> Option<(usize, bool)> {
@@ -259,7 +260,7 @@ fn scanned_piece_table_offset_for_position(
     let offset = byte_offset_for_text_col_in_bytes(&bytes, scanned.range, position.col0());
     Some((
         scan_start.saturating_add(offset),
-        Document::piece_table_position_is_representable(piece_table, position),
+        doc.piece_table_position_is_representable(piece_table, position),
     ))
 }
 
@@ -339,7 +340,7 @@ impl Document {
         }
 
         if let Some(piece_table) = &self.piece_table {
-            return Self::piece_table_position_is_representable(piece_table, position);
+            return self.piece_table_position_is_representable(piece_table, position);
         }
 
         let bytes = self.mmap_bytes();
@@ -821,7 +822,7 @@ impl Document {
         len_chars: usize,
     ) -> TextSlice {
         let Some((start_offset, exact_start)) =
-            scanned_piece_table_offset_for_position(piece_table, start)
+            scanned_piece_table_offset_for_position(self, piece_table, start)
         else {
             return TextSlice::new(String::new(), false);
         };

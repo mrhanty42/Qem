@@ -211,9 +211,9 @@ impl Document {
 ///   previous position is the largest boundary `<= target` (the
 ///   `Backward` answer).
 ///
-/// `step` returning `0` before reaching `target` means the slice is
-/// truncated mid-character; in that case the function returns the cursor
-/// (it is the closest reachable boundary).
+/// The walk is progress-safe even if an engine violates its contract:
+/// a zero or non-advancing step consumes one byte as malformed input rather
+/// than returning a repeated cursor to its caller.
 fn align_class_b(
     engine: &dyn EncodingEngine,
     bytes: &[u8],
@@ -226,13 +226,12 @@ fn align_class_b(
     let mut cursor = (*anchor).min(target);
 
     while cursor < target {
-        let step = engine.step(bytes, cursor, bytes_len);
-        if step == 0 {
-            // Mid-character truncation; closest reachable boundary is
-            // the current cursor.
-            return cursor;
-        }
-        let next = cursor.saturating_add(step).min(bytes_len);
+        let step = engine.step(bytes, cursor, bytes_len).max(1);
+        let next = cursor
+            .checked_add(step)
+            .filter(|&next| next > cursor)
+            .unwrap_or_else(|| cursor.saturating_add(1))
+            .min(bytes_len);
         if next == target {
             return target;
         }

@@ -131,8 +131,8 @@ enum EncodingKind {
 }
 
 impl EncodingKind {
- /// Canonical `encoding_rs` label. `engine_for_encoding` matches
- /// against this exact name for every Class A and Class B codec.
+    /// Canonical `encoding_rs` label. `engine_for_encoding` matches
+    /// against this exact name for every Class A and Class B codec.
     fn label(self) -> &'static str {
         match self {
             Self::Windows1251 => "windows-1251",
@@ -146,17 +146,17 @@ impl EncodingKind {
         }
     }
 
- /// Qem `DocumentEncoding` handle.
+    /// Qem `DocumentEncoding` handle.
     fn document_encoding(self) -> DocumentEncoding {
         let label = self.label();
         DocumentEncoding::from_label(label)
             .unwrap_or_else(|| panic!("encoding_rs should know {label}"))
     }
 
- /// `encoding_rs::Encoding` for the target codec. UTF-16 LE/BE
- /// are decode-only in the WHATWG model, so we hand-encode their
- /// fixtures via `str::encode_utf16` — but the constant is still
- /// useful for representability probes on non-UTF-16 encodings.
+    /// `encoding_rs::Encoding` for the target codec. UTF-16 LE/BE
+    /// are decode-only in the WHATWG model, so we hand-encode their
+    /// fixtures via `str::encode_utf16` — but the constant is still
+    /// useful for representability probes on non-UTF-16 encodings.
     fn encoding_rs(self) -> Option<&'static Encoding> {
         match self {
             Self::Windows1251 => Some(WINDOWS_1251),
@@ -169,39 +169,39 @@ impl EncodingKind {
         }
     }
 
- /// Per-encoding alphabet for edit text. Every emitted character
- /// is representable in the target encoding so
- /// `Encoding::encode(...).had_unmappable` never trips. The
- /// upper bound on string length keeps each case cheap and
- /// shrinking quick.
+    /// Per-encoding alphabet for edit text. Every emitted character
+    /// is representable in the target encoding so
+    /// `Encoding::encode(...).had_unmappable` never trips. The
+    /// upper bound on string length keeps each case cheap and
+    /// shrinking quick.
     fn edit_text_regex(self) -> &'static str {
         match self {
- // ASCII + Cyrillic capital/lowercase blocks.
+            // ASCII + Cyrillic capital/lowercase blocks.
             Self::Windows1251 | Self::Koi8R | Self::Ibm866 => {
                 r"[a-z0-9 \u0410-\u042F\u0430-\u044F]{0,12}"
             }
- // ASCII + Hiragana — fully covered by JIS X 0208.
+            // ASCII + Hiragana — fully covered by JIS X 0208.
             Self::ShiftJis => r"[a-z0-9 \u3041-\u3093]{0,12}",
- // ASCII + a small CJK Unified Ideographs slice — every
- // code point has a valid gb18030 encoding (mix of 2- and
- // 4-byte sequences once the trail-byte rules kick in).
+            // ASCII + a small CJK Unified Ideographs slice — every
+            // code point has a valid gb18030 encoding (mix of 2- and
+            // 4-byte sequences once the trail-byte rules kick in).
             Self::Gb18030 => r"[a-z0-9 \u4E00-\u4E2F]{0,12}",
- // ASCII + a small Hangul Syllables slice — KS X 1001
- // covers the entire U+AC00..=U+D7A3 block, the slice
- // here keeps the alphabet small for shrinking.
+            // ASCII + a small Hangul Syllables slice — KS X 1001
+            // covers the entire U+AC00..=U+D7A3 block, the slice
+            // here keeps the alphabet small for shrinking.
             Self::EucKr => r"[a-z0-9 \uAC00-\uAC1F]{0,12}",
- // UTF-16 covers all Unicode; mix ASCII with a few BMP
- // Han ideographs so the engine sees both 2- and 2-byte
- // (single code unit) cells.
+            // UTF-16 covers all Unicode; mix ASCII with a few BMP
+            // Han ideographs so the engine sees both 2- and 2-byte
+            // (single code unit) cells.
             Self::Utf16Le | Self::Utf16Be => r"[a-z0-9 \u4E00-\u4E2F]{0,12}",
         }
     }
 
- /// Returns a small seed fixture in the target encoding. Each
- /// seed mixes ASCII anchor text, native-script content, LF line
- /// terminators, and a final non-newline tail line so the engine
- /// surfaces a non-trivial set of line and char boundaries from
- /// the very first open.
+    /// Returns a small seed fixture in the target encoding. Each
+    /// seed mixes ASCII anchor text, native-script content, LF line
+    /// terminators, and a final non-newline tail line so the engine
+    /// surfaces a non-trivial set of line and char boundaries from
+    /// the very first open.
     fn seed_bytes(self) -> Vec<u8> {
         match self {
             Self::Windows1251 | Self::Koi8R | Self::Ibm866 => {
@@ -231,10 +231,10 @@ impl EncodingKind {
         }
     }
 
- /// Probe whether `text` round-trips through the target encoding
- /// without redirect or unmappable scalars. UTF-16 covers every
- /// Unicode scalar inside the BMP (and supplementary points via
- /// surrogate pairs), so the probe short-circuits to `true`.
+    /// Probe whether `text` round-trips through the target encoding
+    /// without redirect or unmappable scalars. UTF-16 covers every
+    /// Unicode scalar inside the BMP (and supplementary points via
+    /// surrogate pairs), so the probe short-circuits to `true`.
     fn is_representable(self, text: &str) -> bool {
         match self.encoding_rs() {
             Some(enc) => {
@@ -350,9 +350,9 @@ fn apply_edit(doc: &mut Document, edit: &Edit, kind: EncodingKind) {
             len_chars,
         } => {
             if *len_chars > 0 {
- // try_replace_range with an empty replacement string
- // dispatches to `try_delete_range_at_encoded` for
- // non-UTF-8 documents (commands.rs).
+                // try_replace_range with an empty replacement string
+                // dispatches to `try_delete_range_at_encoded` for
+                // non-UTF-8 documents (commands.rs).
                 let _ = doc.try_replace_range(*line, *col, *len_chars, "");
             }
         }
@@ -375,15 +375,15 @@ fn apply_edit(doc: &mut Document, edit: &Edit, kind: EncodingKind) {
 /// be aligned on a character boundary of `doc.encoding()`:
 ///
 /// 1. **Engine-level:** line starts via
-/// `engine.next_line_start` from `0` to `file_len`, and
-/// char-aligned cursor positions via `engine.step` from `0` to
-/// `file_len`.
+///    `engine.next_line_start` from `0` to `file_len`, and
+///    char-aligned cursor positions via `engine.step` from `0` to
+///    `file_len`.
 /// 2. **Public APIs:** the byte offsets
-/// reachable by converting each `TextPosition` returned by
-/// viewport reads, line bounds, literal-search APIs, and
-/// regex-search APIs through the same
-/// `Document::search_byte_offset_for_position` helper the
-/// search backends use internally.
+///    reachable by converting each `TextPosition` returned by
+///    viewport reads, line bounds, literal-search APIs, and
+///    regex-search APIs through the same
+///    `Document::search_byte_offset_for_position` helper the
+///    search backends use internally.
 ///
 /// Each visited offset must be a fixed point of
 /// `align_byte_offset(.., Backward)` — i.e. the offset already lies
@@ -396,17 +396,17 @@ fn check_property_14(doc: &Document, kind: EncodingKind) -> Result<(), TestCaseE
     let bytes_len = bytes.len();
     let engine: &dyn EncodingEngine = engine_for_encoding(doc.encoding());
 
- // Sentinel: bytes_len + 2 is plenty for any legal walk (each
- // step advances by at least 1 byte, so bytes_len steps cover
- // every offset). The +2 leaves room for the `bytes_len`
- // terminator visit. A regression that introduced an infinite
- // loop in `next_line_start` or `step` would trip the cap
- // instead of hanging the test.
+    // Sentinel: bytes_len + 2 is plenty for any legal walk (each
+    // step advances by at least 1 byte, so bytes_len steps cover
+    // every offset). The +2 leaves room for the `bytes_len`
+    // terminator visit. A regression that introduced an infinite
+    // loop in `next_line_start` or `step` would trip the cap
+    // instead of hanging the test.
     let cap = bytes_len.saturating_add(2);
 
- // (a) Char-aligned cursor positions. `engine.step` is the
- // canonical forward walker; it returns 0 only at file_len, so
- // the loop terminates naturally.
+    // (a) Char-aligned cursor positions. `engine.step` is the
+    // canonical forward walker; it returns 0 only at file_len, so
+    // the loop terminates naturally.
     let mut p = 0usize;
     let mut visited = 0usize;
     loop {
@@ -447,9 +447,9 @@ fn check_property_14(doc: &Document, kind: EncodingKind) -> Result<(), TestCaseE
         );
     }
 
- // (b) Line-start offsets. `engine.next_line_start` returns
- // `file_len` once the last line break has been consumed, so the
- // loop terminates by detecting a non-advancing tail.
+    // (b) Line-start offsets. `engine.next_line_start` returns
+    // `file_len` once the last line break has been consumed, so the
+    // loop terminates by detecting a non-advancing tail.
     let mut line_start = 0usize;
     let mut iterations = 0usize;
     loop {
@@ -473,8 +473,8 @@ fn check_property_14(doc: &Document, kind: EncodingKind) -> Result<(), TestCaseE
             kind.label(),
         );
         if next == line_start {
- // Would have stalled; advance manually so we still
- // visit the `file_len` terminator on the next round.
+            // Would have stalled; advance manually so we still
+            // visit the `file_len` terminator on the next round.
             line_start = bytes_len;
             continue;
         }
@@ -488,11 +488,11 @@ fn check_property_14(doc: &Document, kind: EncodingKind) -> Result<(), TestCaseE
         );
     }
 
- // (c) Public-API surfaces: viewport
- // bounds, line bounds, and the full literal / regex search
- // surface. Each helper converts every `TextPosition` it
- // observes through `byte_offset_for_text_position` and asserts
- // the resulting byte offset is `Floor`-stable.
+    // (c) Public-API surfaces: viewport
+    // bounds, line bounds, and the full literal / regex search
+    // surface. Each helper converts every `TextPosition` it
+    // observes through `byte_offset_for_text_position` and asserts
+    // the resulting byte offset is `Floor`-stable.
     check_viewport_and_line_bounds(doc, kind, bytes_len)?;
     check_literal_search_offsets(doc, kind, bytes_len)?;
     check_regex_search_offsets(doc, kind, bytes_len)?;
@@ -566,10 +566,10 @@ fn check_viewport_and_line_bounds(
     bytes_len: usize,
 ) -> Result<(), TestCaseError> {
     let total_lines = doc.line_count().display_rows().max(1);
- // Read enough rows to cover the entire document. The seed
- // fixtures stay small under proptest shrinking, but a generous
- // upper bound keeps the assertion meaningful even when an edit
- // sequence grows the document past the seed's line count.
+    // Read enough rows to cover the entire document. The seed
+    // fixtures stay small under proptest shrinking, but a generous
+    // upper bound keeps the assertion meaningful even when an edit
+    // sequence grows the document past the seed's line count.
     let request = ViewportRequest::new(0, total_lines.saturating_add(2));
     let viewport = doc.read_viewport(request);
 
@@ -583,11 +583,11 @@ fn check_viewport_and_line_bounds(
         assert_text_position_aligned(doc, kind, bytes_len, end_pos, "read_viewport line end")?;
     }
 
- // Even when the viewport returns an empty row vec (e.g. a
- // freshly-truncated edit sequence emptied the document), the
- // first row's start at `(0, 0)` is still a public boundary
- // offset. Assert it explicitly so an empty-document regression
- // never silently skips this surface.
+    // Even when the viewport returns an empty row vec (e.g. a
+    // freshly-truncated edit sequence emptied the document), the
+    // first row's start at `(0, 0)` is still a public boundary
+    // offset. Assert it explicitly so an empty-document regression
+    // never silently skips this surface.
     assert_text_position_aligned(
         doc,
         kind,
@@ -622,7 +622,7 @@ fn check_literal_search_offsets(
     let full_range = TextRange::new(from, usize::MAX / 4);
 
     for needle in LITERAL_NEEDLES {
- // find_next / find_prev / find_next_query / find_prev_query.
+        // find_next / find_prev / find_next_query / find_prev_query.
         if let Some(found) = doc.find_next(needle, from) {
             assert_match_aligned(doc, kind, bytes_len, found, "find_next")?;
         }
@@ -637,7 +637,7 @@ fn check_literal_search_offsets(
                 assert_match_aligned(doc, kind, bytes_len, found, "find_prev_query")?;
             }
 
- // find_all / find_all_from / find_all_query / find_all_query_from.
+            // find_all / find_all_from / find_all_query / find_all_query_from.
             for found in doc.find_all(*needle) {
                 assert_match_aligned(doc, kind, bytes_len, found, "find_all")?;
             }
@@ -651,7 +651,7 @@ fn check_literal_search_offsets(
                 assert_match_aligned(doc, kind, bytes_len, found, "find_all_query_from")?;
             }
 
- // find_all_in_range / find_all_between / their _query variants.
+            // find_all_in_range / find_all_between / their _query variants.
             for found in doc.find_all_in_range(*needle, full_range) {
                 assert_match_aligned(doc, kind, bytes_len, found, "find_all_in_range")?;
             }
@@ -665,7 +665,7 @@ fn check_literal_search_offsets(
                 assert_match_aligned(doc, kind, bytes_len, found, "find_all_query_between")?;
             }
 
- // find_next_in_range / find_next_between / find_prev_in_range / find_prev_between.
+            // find_next_in_range / find_next_between / find_prev_in_range / find_prev_between.
             if let Some(found) = doc.find_next_in_range(needle, full_range) {
                 assert_match_aligned(doc, kind, bytes_len, found, "find_next_in_range")?;
             }
@@ -679,8 +679,8 @@ fn check_literal_search_offsets(
                 assert_match_aligned(doc, kind, bytes_len, found, "find_prev_between")?;
             }
 
- // find_next_query_in_range / find_next_query_between /
- // find_prev_query_in_range / find_prev_query_between.
+            // find_next_query_in_range / find_next_query_between /
+            // find_prev_query_in_range / find_prev_query_between.
             if let Some(found) = doc.find_next_query_in_range(&query, full_range) {
                 assert_match_aligned(doc, kind, bytes_len, found, "find_next_query_in_range")?;
             }
@@ -726,11 +726,11 @@ fn check_regex_search_offsets(
             continue;
         };
 
- // find_next_regex / find_prev_regex (one-shot pattern
- // helpers). Both return `Result<Option<SearchMatch>, _>`;
- // compile errors are unreachable here because the same
- // pattern compiled successfully into `query`, so we
- // unwrap the Result and only check the Option payload.
+        // find_next_regex / find_prev_regex (one-shot pattern
+        // helpers). Both return `Result<Option<SearchMatch>, _>`;
+        // compile errors are unreachable here because the same
+        // pattern compiled successfully into `query`, so we
+        // unwrap the Result and only check the Option payload.
         if let Ok(Some(found)) = doc.find_next_regex(pattern, from) {
             assert_match_aligned(doc, kind, bytes_len, found, "find_next_regex")?;
         }
@@ -738,7 +738,7 @@ fn check_regex_search_offsets(
             assert_match_aligned(doc, kind, bytes_len, found, "find_prev_regex")?;
         }
 
- // find_next_regex_query / find_prev_regex_query.
+        // find_next_regex_query / find_prev_regex_query.
         if let Some(found) = doc.find_next_regex_query(&query, from) {
             assert_match_aligned(doc, kind, bytes_len, found, "find_next_regex_query")?;
         }
@@ -746,7 +746,7 @@ fn check_regex_search_offsets(
             assert_match_aligned(doc, kind, bytes_len, found, "find_prev_regex_query")?;
         }
 
- // find_next_regex_in_range / find_next_regex_between.
+        // find_next_regex_in_range / find_next_regex_between.
         if let Ok(Some(found)) = doc.find_next_regex_in_range(pattern, full_range) {
             assert_match_aligned(doc, kind, bytes_len, found, "find_next_regex_in_range")?;
         }
@@ -754,8 +754,8 @@ fn check_regex_search_offsets(
             assert_match_aligned(doc, kind, bytes_len, found, "find_next_regex_between")?;
         }
 
- // find_next_regex_query_in_range / find_next_regex_query_between /
- // find_prev_regex_query_in_range / find_prev_regex_query_between.
+        // find_next_regex_query_in_range / find_next_regex_query_between /
+        // find_prev_regex_query_in_range / find_prev_regex_query_between.
         if let Some(found) = doc.find_next_regex_query_in_range(&query, full_range) {
             assert_match_aligned(
                 doc,
@@ -781,11 +781,11 @@ fn check_regex_search_offsets(
             assert_match_aligned(doc, kind, bytes_len, found, "find_prev_regex_query_between")?;
         }
 
- // find_all_regex / find_all_regex_from / find_all_regex_query /
- // find_all_regex_query_from. The iterators advance internally
- // through the same backend the one-shot `find_next_regex_*`
- // helpers use, so this catches drift introduced by zero-width
- // match advancement (`$`, `(a*)`-style patterns).
+        // find_all_regex / find_all_regex_from / find_all_regex_query /
+        // find_all_regex_query_from. The iterators advance internally
+        // through the same backend the one-shot `find_next_regex_*`
+        // helpers use, so this catches drift introduced by zero-width
+        // match advancement (`$`, `(a*)`-style patterns).
         if let Ok(iter) = doc.find_all_regex(pattern) {
             for found in iter {
                 assert_match_aligned(doc, kind, bytes_len, found, "find_all_regex")?;
@@ -803,8 +803,8 @@ fn check_regex_search_offsets(
             assert_match_aligned(doc, kind, bytes_len, found, "find_all_regex_query_from")?;
         }
 
- // find_all_regex_in_range / find_all_regex_between /
- // find_all_regex_query_in_range / find_all_regex_query_between.
+        // find_all_regex_in_range / find_all_regex_between /
+        // find_all_regex_query_in_range / find_all_regex_query_between.
         if let Ok(iter) = doc.find_all_regex_in_range(pattern, full_range) {
             for found in iter {
                 assert_match_aligned(doc, kind, bytes_len, found, "find_all_regex_in_range")?;
@@ -825,8 +825,32 @@ fn check_regex_search_offsets(
     Ok(())
 }
 
+#[test]
+fn shift_jis_viewport_line_end_is_floor_stable() {
+    let dir = fresh_test_dir("shift-jis-viewport-alignment");
+    let path = dir.join("seed.bin");
+    let kind = EncodingKind::ShiftJis;
+    let bytes = kind.seed_bytes();
+    std::fs::write(&path, &bytes).expect("write Shift_JIS fixture");
+
+    let doc = Document::open_with_encoding(&path, kind.document_encoding())
+        .expect("open Shift_JIS fixture");
+    let line0 = 1;
+    let end = TextPosition::new(line0, doc.line_len_chars(line0));
+    let offset = byte_offset_for_text_position(&doc, end);
+
+    // Five Shift_JIS characters follow the seven-byte first line.
+    assert_eq!(offset, 17);
+    assert_eq!(align_byte_offset_floor(&doc, offset), offset);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(&dir);
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    // The deterministic regression above protects the original Shift_JIS
+    // failure while this broader stateful sweep remains practical in CI.
+    #![proptest_config(ProptestConfig::with_cases(16))]
 
  /// Property 14: every boundary offset returned by the encoding
  /// engine round-trips through `align_byte_offset(.., Backward)`

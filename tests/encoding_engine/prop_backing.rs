@@ -92,20 +92,20 @@ enum Atom {
 
 fn atom_strategy() -> impl Strategy<Value = Atom> {
     prop_oneof![
-        2 => Just(Atom::Lf),
-        2 => Just(Atom::Cr),
-        2 => Just(Atom::Crlf),
- // High-byte glyph range used by every Class A encoding.
-        3 => (0xC0u8..=0xFE).prop_map(Atom::Filler),
- // Printable ASCII; excludes 0x0A / 0x0D by construction.
-        3 => (b' '..=b'~').prop_map(Atom::Filler),
-    ]
+           2 => Just(Atom::Lf),
+           2 => Just(Atom::Cr),
+           2 => Just(Atom::Crlf),
+    // High-byte glyph range used by every Class A encoding.
+           3 => (0xC0u8..=0xFE).prop_map(Atom::Filler),
+    // Printable ASCII; excludes 0x0A / 0x0D by construction.
+           3 => (b' '..=b'~').prop_map(Atom::Filler),
+       ]
 }
 
 fn bytes_strategy() -> impl Strategy<Value = Vec<u8>> {
- // 0..=64 atoms turns into byte slices up to ~128 bytes. Large
- // enough to span multiple lines and exercise the line-offsets
- // index without inflating per-case cost.
+    // 0..=64 atoms turns into byte slices up to ~128 bytes. Large
+    // enough to span multiple lines and exercise the line-offsets
+    // index without inflating per-case cost.
     prop::collection::vec(atom_strategy(), 0..=64).prop_map(|atoms| {
         let mut bytes = Vec::with_capacity(128);
         for atom in atoms {
@@ -364,7 +364,7 @@ fn drive_op(doc: &Document, op: &Op) {
         } => {
             let line0 = pick_in_range(*from_line0_seed, line_count_hint.saturating_sub(1));
             let col0 = pick_in_range(*from_col_seed, 64);
- // Compile-error or match miss are both fine for Property 6.
+            // Compile-error or match miss are both fine for Property 6.
             if let Ok(query) = RegexSearchQuery::new(pattern) {
                 let _ = doc.find_next_regex_query(&query, TextPosition::new(line0, col0));
             }

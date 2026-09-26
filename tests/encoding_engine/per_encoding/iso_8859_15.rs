@@ -140,12 +140,12 @@ const NON_ASCII_INSERT: &str = "café €";
 
 #[test]
 fn edit_and_save_round_trip() {
- // — fifth contract. Validates (edit + save
- // round-trip) and (save fidelity) for `ISO-8859-15` through
- // the encoded edit path: insert ASCII, insert representable
- // non-ASCII (including the euro sign), delete a range, save
- // reopen, and assert the decoded text round-trips byte-identically
- // against the in-memory document.
+    // — fifth contract. Validates (edit + save
+    // round-trip) and (save fidelity) for `ISO-8859-15` through
+    // the encoded edit path: insert ASCII, insert representable
+    // non-ASCII (including the euro sign), delete a range, save
+    // reopen, and assert the decoded text round-trips byte-identically
+    // against the in-memory document.
     let dir = fresh_test_dir("per_encoding_iso_8859_15_edit");
     let path = dir.join("fixture.txt");
     let saved = dir.join("fixture.saved.txt");

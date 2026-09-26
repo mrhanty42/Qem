@@ -54,15 +54,15 @@ const PROP10_MAX_CELLS: usize = 128;
 /// cell whose layout is the wrong endianness for the engine under test.
 #[derive(Debug, Clone, Copy)]
 enum WrongEndianCell {
- /// LF cell laid out for the *opposite* endianness:
- ///
- /// - For the LE engine: BE LF = `[0x00, 0x0A]`.
- /// - For the BE engine: LE LF = `[0x0A, 0x00]`.
+    /// LF cell laid out for the *opposite* endianness:
+    ///
+    /// - For the LE engine: BE LF = `[0x00, 0x0A]`.
+    /// - For the BE engine: LE LF = `[0x0A, 0x00]`.
     Lf,
- /// CR cell laid out for the *opposite* endianness:
- ///
- /// - For the LE engine: BE CR = `[0x00, 0x0D]`.
- /// - For the BE engine: LE CR = `[0x0D, 0x00]`.
+    /// CR cell laid out for the *opposite* endianness:
+    ///
+    /// - For the LE engine: BE CR = `[0x00, 0x0D]`.
+    /// - For the BE engine: LE CR = `[0x0D, 0x00]`.
     Cr,
 }
 
@@ -180,10 +180,10 @@ proptest! {
 
 #[test]
 fn property_10_le_engine_ignores_be_lf_cell() {
- // BE LF = [0x00, 0x0A]. An LE engine that mistakenly treated this
- // as LF would return 2 (the byte just past the cell). The correct
- // behaviour is to walk past the cell and return bytes.len()=2 as
- // the "no terminator found" sentinel.
+    // BE LF = [0x00, 0x0A]. An LE engine that mistakenly treated this
+    // as LF would return 2 (the byte just past the cell). The correct
+    // behaviour is to walk past the cell and return bytes.len()=2 as
+    // the "no terminator found" sentinel.
     let engine: &dyn EncodingEngine = engine_for_encoding(DocumentEncoding::utf16le());
     let bytes: [u8; 2] = [0x00, 0x0A];
     let result = engine.next_line_start(&bytes, bytes.len(), 0);
@@ -198,7 +198,7 @@ fn property_10_le_engine_ignores_be_lf_cell() {
 
 #[test]
 fn property_10_le_engine_ignores_be_cr_cell() {
- // BE CR = [0x00, 0x0D]. Same shape as the LF case.
+    // BE CR = [0x00, 0x0D]. Same shape as the LF case.
     let engine: &dyn EncodingEngine = engine_for_encoding(DocumentEncoding::utf16le());
     let bytes: [u8; 2] = [0x00, 0x0D];
     let result = engine.next_line_start(&bytes, bytes.len(), 0);
@@ -213,9 +213,9 @@ fn property_10_le_engine_ignores_be_cr_cell() {
 
 #[test]
 fn property_10_be_engine_ignores_le_lf_cell() {
- // LE LF = [0x0A, 0x00]. A BE engine that mistakenly treated this
- // as LF would return 2 instead of bytes.len()=2 as the "no
- // terminator" sentinel.
+    // LE LF = [0x0A, 0x00]. A BE engine that mistakenly treated this
+    // as LF would return 2 instead of bytes.len()=2 as the "no
+    // terminator" sentinel.
     let engine: &dyn EncodingEngine = engine_for_encoding(DocumentEncoding::utf16be());
     let bytes: [u8; 2] = [0x0A, 0x00];
     let result = engine.next_line_start(&bytes, bytes.len(), 0);
@@ -230,7 +230,7 @@ fn property_10_be_engine_ignores_le_lf_cell() {
 
 #[test]
 fn property_10_be_engine_ignores_le_cr_cell() {
- // LE CR = [0x0D, 0x00]. Same shape as the LF case.
+    // LE CR = [0x0D, 0x00]. Same shape as the LF case.
     let engine: &dyn EncodingEngine = engine_for_encoding(DocumentEncoding::utf16be());
     let bytes: [u8; 2] = [0x0D, 0x00];
     let result = engine.next_line_start(&bytes, bytes.len(), 0);
@@ -245,8 +245,8 @@ fn property_10_be_engine_ignores_le_cr_cell() {
 
 #[test]
 fn property_10_le_engine_walks_past_runs_of_wrong_endian_cells() {
- // A long alternating run of BE-form LF / CR cells. The LE engine
- // must walk past every cell and report no terminator.
+    // A long alternating run of BE-form LF / CR cells. The LE engine
+    // must walk past every cell and report no terminator.
     let engine: &dyn EncodingEngine = engine_for_encoding(DocumentEncoding::utf16le());
     let mut bytes = Vec::with_capacity(16);
     for i in 0..8 {
@@ -268,8 +268,8 @@ fn property_10_le_engine_walks_past_runs_of_wrong_endian_cells() {
 
 #[test]
 fn property_10_be_engine_walks_past_runs_of_wrong_endian_cells() {
- // Symmetric to the LE case: a long alternating run of LE-form
- // LF / CR cells fed to the BE engine must report no terminator.
+    // Symmetric to the LE case: a long alternating run of LE-form
+    // LF / CR cells fed to the BE engine must report no terminator.
     let engine: &dyn EncodingEngine = engine_for_encoding(DocumentEncoding::utf16be());
     let mut bytes = Vec::with_capacity(16);
     for i in 0..8 {

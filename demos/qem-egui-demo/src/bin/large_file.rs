@@ -1,9 +1,24 @@
 use eframe::egui::{
-    self, Color32, DragValue, Key, ProgressBar, RichText, ScrollArea, Sense, TextEdit, TextStyle,
+    self, Align, Color32, CornerRadius, DragValue, FontFamily, FontId, Key, Layout, Margin,
+    ProgressBar, Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, Vec2,
 };
 use qem::{DocumentSession, EditCapability, TextPosition, ViewportRequest};
 use std::path::PathBuf;
 use std::time::Duration;
+
+const BG: Color32 = Color32::from_rgb(15, 17, 21);
+const PANEL: Color32 = Color32::from_rgb(20, 23, 28);
+const EDITOR_BG: Color32 = Color32::from_rgb(18, 20, 25);
+const ACTIVE_LINE: Color32 = Color32::from_rgb(28, 33, 42);
+const CARD: Color32 = Color32::from_rgb(24, 28, 35);
+const BORDER: Color32 = Color32::from_rgb(42, 47, 57);
+const TEXT: Color32 = Color32::from_rgb(215, 220, 230);
+const MUTED: Color32 = Color32::from_rgb(126, 135, 151);
+const ACCENT: Color32 = Color32::from_rgb(104, 160, 255);
+const WARNING: Color32 = Color32::from_rgb(232, 179, 92);
+const SAVED: Color32 = Color32::from_rgb(94, 203, 172);
+const GUTTER_WIDTH: f32 = 76.0;
+const ROW_HEIGHT: f32 = 23.0;
 
 fn main() -> Result<(), eframe::Error> {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
@@ -15,16 +30,17 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     eframe::run_native(
-        "Qem large-file egui demo",
+        "Qem Large File",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(LargeFileDemo::new(initial_path.clone())))),
+        Box::new(move |cc| {
+            install_theme(&cc.egui_ctx);
+            Ok(Box::new(LargeFileDemo::new(initial_path.clone())))
+        }),
     )
 }
 
 struct LargeFileDemo {
     session: DocumentSession,
-    open_path: String,
-    save_path: String,
     goto_line: String,
     caret: TextPosition,
     desired_col: usize,
@@ -39,15 +55,8 @@ struct LargeFileDemo {
 
 impl LargeFileDemo {
     fn new(initial_path: Option<PathBuf>) -> Self {
-        let path_text = initial_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default();
-
         Self {
             session: DocumentSession::new(),
-            open_path: path_text.clone(),
-            save_path: path_text,
             goto_line: String::from("1"),
             caret: TextPosition::new(0, 0),
             desired_col: 0,
@@ -69,7 +78,6 @@ impl LargeFileDemo {
         if let Some(result) = self.session.poll_background_job() {
             match result {
                 Ok(()) => {
-                    self.sync_paths_from_session();
                     self.clamp_state();
                     self.notice = String::from("Background operation completed.");
                 }
@@ -77,14 +85,6 @@ impl LargeFileDemo {
                     self.notice = format!("Background operation failed: {err}");
                 }
             }
-        }
-    }
-
-    fn sync_paths_from_session(&mut self) {
-        if let Some(path) = self.session.current_path() {
-            let path_text = path.display().to_string();
-            self.open_path = path_text.clone();
-            self.save_path = path_text;
         }
     }
 
@@ -140,14 +140,10 @@ impl LargeFileDemo {
         }
     }
 
-    fn open_from_field(&mut self) {
-        let path = self.open_path.trim();
-        if path.is_empty() {
-            self.notice = String::from("Open path is empty.");
-            return;
+    fn open_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().pick_file() {
+            self.open_document(path);
         }
-
-        self.open_document(PathBuf::from(path));
     }
 
     fn close_document(&mut self) {
@@ -174,16 +170,24 @@ impl LargeFileDemo {
         }
     }
 
-    fn save_as_from_field(&mut self) {
-        let path = self.save_path.trim();
-        if path.is_empty() {
-            self.notice = String::from("Save path is empty.");
-            return;
+    fn save_as_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(path) = self.session.current_path() {
+            if let Some(parent) = path.parent() {
+                dialog = dialog.set_directory(parent);
+            }
+            if let Some(file_name) = path.file_name() {
+                dialog = dialog.set_file_name(file_name.to_string_lossy());
+            }
         }
 
-        match self.session.save_as_async(PathBuf::from(path)) {
+        let Some(path) = dialog.save_file() else {
+            return;
+        };
+        let display_path = path.display().to_string();
+        match self.session.save_as_async(path) {
             Ok(true) => {
-                self.notice = format!("Saving to {path}");
+                self.notice = format!("Saving to {display_path}");
             }
             Ok(false) => {
                 self.notice = String::from("Save-as skipped: current document is already clean.");
@@ -384,50 +388,58 @@ impl LargeFileDemo {
     fn render_toolbar(&mut self, ctx: &egui::Context) {
         let busy = self.session.is_busy();
         let has_path = self.session.current_path().is_some();
+        let dirty = self.session.status().is_dirty();
+        let title = self
+            .session
+            .current_path()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| String::from("No document"));
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Open");
-                let open_response =
-                    ui.add(TextEdit::singleline(&mut self.open_path).desired_width(360.0));
-                if open_response.has_focus() {
-                    self.editor_has_focus = false;
-                }
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Open async"))
-                    .clicked()
-                {
-                    self.open_from_field();
-                }
+        egui::TopBottomPanel::top("toolbar")
+            .exact_height(52.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .inner_margin(Margin::symmetric(16, 10)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Qem").size(20.0).strong().color(ACCENT));
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(title).size(15.0).color(TEXT));
+                    if dirty {
+                        ui.label(RichText::new("Modified").color(WARNING));
+                    } else if has_path {
+                        ui.label(RichText::new("Saved").color(SAVED));
+                    }
 
-                if ui
-                    .add_enabled(has_path, egui::Button::new("Close"))
-                    .clicked()
-                {
-                    self.close_document();
-                }
-
-                ui.separator();
-                ui.label("Save as");
-                let save_response =
-                    ui.add(TextEdit::singleline(&mut self.save_path).desired_width(360.0));
-                if save_response.has_focus() {
-                    self.editor_has_focus = false;
-                }
-                if ui
-                    .add_enabled(has_path && !busy, egui::Button::new("Save"))
-                    .clicked()
-                {
-                    self.save_current();
-                }
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Save as"))
-                    .clicked()
-                {
-                    self.save_as_from_field();
-                }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(has_path, egui::Button::new("Close"))
+                            .clicked()
+                        {
+                            self.close_document();
+                        }
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Save As"))
+                            .clicked()
+                        {
+                            self.save_as_dialog();
+                        }
+                        if ui
+                            .add_enabled(has_path && !busy, egui::Button::new("Save"))
+                            .clicked()
+                        {
+                            self.save_current();
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("Open")).clicked() {
+                            self.open_dialog();
+                        }
+                    });
+                });
             });
-        });
     }
 
     fn render_sidebar(&mut self, ctx: &egui::Context) {
@@ -441,11 +453,26 @@ impl LargeFileDemo {
 
         egui::SidePanel::left("status")
             .resizable(true)
-            .default_width(320.0)
+            .default_width(304.0)
+            .min_width(260.0)
+            .max_width(380.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .inner_margin(Margin::same(14)),
+            )
             .show(ctx, |ui| {
-                ui.heading("Qem");
-                ui.label("Large-file viewport editor on top of DocumentSession.");
-                ui.separator();
+                ui.label(RichText::new("INSPECTOR").small().strong().color(ACCENT));
+                ui.label(
+                    RichText::new("Large-file controls")
+                        .size(18.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.label(RichText::new("Bounded viewport and document state").color(MUTED));
+                ui.add_space(10.0);
+                section_title(ui, "DOCUMENT");
 
                 ui.monospace(format!(
                     "path: {}",
@@ -474,8 +501,8 @@ impl LargeFileDemo {
                 ui.monospace(format!("line ending: {:?}", status.line_ending()));
                 ui.monospace(format!("encoding: {}", status.encoding().name()));
 
-                ui.separator();
-                ui.label("Viewport");
+                ui.add_space(10.0);
+                section_title(ui, "VIEWPORT");
                 ui.monospace(format!(
                     "window: {}..{}",
                     self.first_line0 + 1,
@@ -565,8 +592,8 @@ impl LargeFileDemo {
                     }
                 });
 
-                ui.separator();
-                ui.label("Caret");
+                ui.add_space(10.0);
+                section_title(ui, "CARET");
                 ui.monospace(format!(
                     "line {}, col {}",
                     self.caret.line0() + 1,
@@ -622,14 +649,72 @@ impl LargeFileDemo {
                     );
                 }
 
-                ui.separator();
-                ui.label("Notice");
-                ui.label(&self.notice);
+                ui.add_space(10.0);
+                section_title(ui, "ACTIVITY");
+                ui.label(RichText::new(&self.notice).color(MUTED));
+            });
+    }
+
+    fn render_status_bar(&self, ctx: &egui::Context) {
+        let status = self.session.status();
+        let state = if self.session.is_busy() {
+            "Working"
+        } else if self.session.is_indexing() {
+            "Indexing"
+        } else {
+            "Ready"
+        };
+        let state_color = if self.session.is_busy() || self.session.is_indexing() {
+            WARNING
+        } else {
+            SAVED
+        };
+
+        egui::TopBottomPanel::bottom("status_bar")
+            .exact_height(30.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .inner_margin(Margin::symmetric(12, 5)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(state).color(state_color).strong());
+                    ui.separator();
+                    ui.label(RichText::new(&self.notice).color(MUTED));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Ln {}, Col {}",
+                                self.caret.line0() + 1,
+                                self.caret.col0() + 1
+                            ))
+                            .color(TEXT),
+                        );
+                        ui.separator();
+                        ui.label(RichText::new(status.encoding().name()).color(MUTED));
+                        ui.separator();
+                        ui.label(RichText::new(status.backing().as_str()).color(MUTED));
+                        ui.separator();
+                        ui.label(
+                            RichText::new(if status.is_line_count_exact() {
+                                "Exact lines"
+                            } else {
+                                "Estimated lines"
+                            })
+                            .color(if status.is_line_count_exact() {
+                                SAVED
+                            } else {
+                                WARNING
+                            }),
+                        );
+                    });
+                });
             });
     }
 
     fn render_editor(&mut self, ctx: &egui::Context) {
-        let status = self.session.status();
         let viewport = self.session.read_viewport(
             ViewportRequest::new(self.first_line0, self.viewport_rows)
                 .with_columns(self.start_col, self.viewport_cols),
@@ -639,99 +724,149 @@ impl LargeFileDemo {
             .last()
             .map(|row| row.line0())
             .unwrap_or(self.first_line0);
+        let mut clicked_caret = None;
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Large-file viewport");
-            ui.label(
-                "This demo keeps viewport state in the application. Use Top/Tail/Page/Jump controls, click a row to move the caret, and type directly into the viewport.",
-            );
-            ui.monospace(format!(
-                "visible lines {}..{}, columns {}..{}",
-                self.first_line0 + 1,
-                last_visible_line0 + 1,
-                self.start_col + 1,
-                self.start_col.saturating_add(self.viewport_cols)
-            ));
-            ui.add_space(8.0);
-
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                let row_height = ui.text_style_height(&TextStyle::Monospace) + 6.0;
-                ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    for row in viewport.rows() {
-                        let is_caret_row = row.line0() == self.caret.line0();
-                        ui.horizontal(|ui| {
-                            let exact_marker = if row.is_exact() { "=" } else { "~" };
-                            let exact_color = if row.is_exact() {
-                                Color32::GRAY
-                            } else {
-                                Color32::from_rgb(210, 170, 60)
-                            };
-                            ui.add_sized(
-                                [20.0, row_height],
-                                egui::Label::new(
-                                    RichText::new(exact_marker).monospace().color(exact_color),
-                                ),
-                            );
-                            ui.add_sized(
-                                [72.0, row_height],
-                                egui::Label::new(
-                                    RichText::new(format!("{:>7}", row.line_number()))
-                                        .monospace()
-                                        .color(exact_color),
-                                ),
-                            );
-
-                            let row_text = decorate_visible_row(
-                                row.text(),
-                                is_caret_row && self.editor_has_focus,
-                                self.caret.col0(),
-                                self.start_col,
-                            );
-                            let text_color = if is_caret_row {
-                                Color32::from_rgb(220, 235, 255)
-                            } else {
-                                ui.visuals().text_color()
-                            };
-                            let response = ui.add_sized(
-                                [ui.available_width(), row_height],
-                                egui::Label::new(
-                                    RichText::new(row_text).monospace().color(text_color),
-                                )
-                                .sense(Sense::click()),
-                            );
-                            if response.clicked() {
-                                self.editor_has_focus = true;
-                                let target_col =
-                                    self.desired_col.min(self.session.line_len_chars(row.line0()));
-                                self.set_caret(TextPosition::new(row.line0(), target_col));
-                            }
-                        });
-                    }
-
-                    if viewport.rows().is_empty() {
-                        ui.monospace("<empty viewport>");
-                    }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(14)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("LARGE-FILE VIEWPORT")
+                            .small()
+                            .strong()
+                            .color(ACCENT),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Lines {}–{}  ·  Columns {}–{}",
+                                self.first_line0 + 1,
+                                last_visible_line0 + 1,
+                                self.start_col + 1,
+                                self.start_col.saturating_add(self.viewport_cols)
+                            ))
+                            .monospace()
+                            .color(MUTED),
+                        );
+                    });
                 });
+                ui.add_space(10.0);
+
+                egui::Frame::new()
+                    .fill(EDITOR_BG)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .corner_radius(CornerRadius::same(6))
+                    .show(ui, |ui| {
+                        let font = FontId::new(14.0, FontFamily::Monospace);
+                        let char_width = 8.4_f32;
+                        let content_width =
+                            GUTTER_WIDTH + (self.viewport_cols.max(1) as f32 * char_width) + 28.0;
+
+                        ScrollArea::both()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(content_width.max(ui.available_width()));
+                                for row in viewport.rows() {
+                                    let is_active = row.line0() == self.caret.line0();
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        Vec2::new(ui.available_width(), ROW_HEIGHT),
+                                        Sense::click(),
+                                    );
+                                    let painter = ui.painter();
+
+                                    if is_active {
+                                        painter.rect_filled(rect, 0.0, ACTIVE_LINE);
+                                        painter.rect_filled(
+                                            Rect::from_min_size(
+                                                rect.min,
+                                                Vec2::new(2.0, rect.height()),
+                                            ),
+                                            0.0,
+                                            ACCENT,
+                                        );
+                                    }
+
+                                    let gutter = Rect::from_min_max(
+                                        rect.min,
+                                        egui::pos2(rect.min.x + GUTTER_WIDTH, rect.max.y),
+                                    );
+                                    painter.rect_filled(gutter, 0.0, PANEL);
+                                    painter.line_segment(
+                                        [gutter.right_top(), gutter.right_bottom()],
+                                        Stroke::new(1.0_f32, BORDER),
+                                    );
+
+                                    let line_color = if row.is_exact() { MUTED } else { WARNING };
+                                    painter.text(
+                                        egui::pos2(gutter.right() - 10.0, rect.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        format!(
+                                            "{}{}",
+                                            if row.is_exact() { "" } else { "~" },
+                                            row.line_number()
+                                        ),
+                                        font.clone(),
+                                        line_color,
+                                    );
+                                    let text_pos =
+                                        egui::pos2(gutter.right() + 12.0, rect.center().y);
+                                    painter.text(
+                                        text_pos,
+                                        egui::Align2::LEFT_CENTER,
+                                        if row.text().is_empty() {
+                                            " "
+                                        } else {
+                                            row.text()
+                                        },
+                                        font.clone(),
+                                        TEXT,
+                                    );
+
+                                    if is_active && self.editor_has_focus {
+                                        let local_col =
+                                            self.caret.col0().saturating_sub(self.start_col);
+                                        let caret_x = text_pos.x + local_col as f32 * char_width;
+                                        painter.line_segment(
+                                            [
+                                                egui::pos2(caret_x, rect.top() + 3.0),
+                                                egui::pos2(caret_x, rect.bottom() - 3.0),
+                                            ],
+                                            Stroke::new(1.5_f32, ACCENT),
+                                        );
+                                    }
+
+                                    if response.clicked() {
+                                        self.editor_has_focus = true;
+                                        if let Some(pointer) = response.interact_pointer_pos() {
+                                            let local_col = ((pointer.x - text_pos.x).max(0.0)
+                                                / char_width)
+                                                .round()
+                                                as usize;
+                                            let target_col = self
+                                                .start_col
+                                                .saturating_add(local_col)
+                                                .min(self.session.line_len_chars(row.line0()));
+                                            clicked_caret =
+                                                Some(TextPosition::new(row.line0(), target_col));
+                                        }
+                                    }
+                                }
+
+                                if viewport.rows().is_empty() {
+                                    ui.add_space(24.0);
+                                    ui.horizontal_centered(|ui| {
+                                        ui.label(
+                                            RichText::new("No rows in this viewport").color(MUTED),
+                                        );
+                                    });
+                                }
+                            });
+                    });
             });
 
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("scroll rows: {}", status.display_line_count()));
-                ui.separator();
-                ui.label(format!("backing: {}", status.backing().as_str()));
-                ui.separator();
-                ui.label(format!(
-                    "line count is {}",
-                    if status.is_line_count_exact() {
-                        "exact"
-                    } else {
-                        "estimated"
-                    }
-                ));
-                ui.separator();
-                ui.label(format!("dirty: {}", status.is_dirty()));
-            });
-        });
+        if let Some(caret) = clicked_caret {
+            self.set_caret(caret);
+        }
     }
 }
 
@@ -740,6 +875,7 @@ impl eframe::App for LargeFileDemo {
         self.pump_session();
         self.handle_editor_input(ctx);
         self.render_toolbar(ctx);
+        self.render_status_bar(ctx);
         self.render_sidebar(ctx);
         self.render_editor(ctx);
 
@@ -749,50 +885,42 @@ impl eframe::App for LargeFileDemo {
     }
 }
 
-fn insert_caret_marker(text: &str, local_col0: usize) -> String {
-    if text.is_empty() {
-        return String::from("|");
-    }
+fn install_theme(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = PANEL;
+    visuals.window_fill = PANEL;
+    visuals.extreme_bg_color = BG;
+    visuals.faint_bg_color = ACTIVE_LINE;
+    visuals.widgets.noninteractive.bg_fill = PANEL;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(28, 32, 39);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(38, 44, 54);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(46, 57, 75);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(70, 120, 210, 120);
+    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
+    visuals.window_corner_radius = CornerRadius::same(6);
+    ctx.set_visuals(visuals);
 
-    let total_chars = text.chars().count();
-    if local_col0 >= total_chars {
-        let mut rendered = text.to_owned();
-        rendered.push('|');
-        return rendered;
-    }
-
-    let mut rendered = String::with_capacity(text.len() + 1);
-    for (index, ch) in text.chars().enumerate() {
-        if index == local_col0 {
-            rendered.push('|');
-        }
-        rendered.push(ch);
-    }
-    rendered
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+    style.spacing.button_padding = Vec2::new(10.0, 5.0);
+    ctx.set_style(style);
 }
 
-fn decorate_visible_row(
-    text: &str,
-    show_caret: bool,
-    caret_col0: usize,
-    start_col: usize,
-) -> String {
-    let base = if text.is_empty() {
-        String::from(" ")
-    } else {
-        text.to_owned()
-    };
-
-    if !show_caret {
-        return base;
-    }
-
-    if caret_col0 < start_col {
-        return format!("|< {base}");
-    }
-
-    let local_col0 = caret_col0.saturating_sub(start_col);
-    insert_caret_marker(&base, local_col0)
+fn section_title(ui: &mut egui::Ui, title: &str) {
+    egui::Frame::new()
+        .fill(CARD)
+        .stroke(Stroke::new(1.0_f32, BORDER))
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(Margin::symmetric(8, 5))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(title).small().strong().color(MUTED));
+        });
+    ui.add_space(5.0);
 }
 
 fn describe_capability(capability: EditCapability) -> String {

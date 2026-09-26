@@ -1024,11 +1024,19 @@ impl Document {
         }
 
         let prev_ch = rope.char(cur - 1);
+        let previous_line_col0 = if prev_ch == '\n' {
+            Some(Self::rope_line_len_chars_without_newline(
+                rope,
+                line0.saturating_sub(1),
+            ))
+        } else {
+            None
+        };
         rope.remove((cur - 1)..cur);
 
         if prev_ch == '\n' {
             let new_line0 = line0.saturating_sub(1);
-            let new_col0 = Self::rope_line_len_chars_without_newline(rope, new_line0);
+            let new_col0 = previous_line_col0.unwrap_or(0);
             Ok((true, new_line0, new_col0))
         } else {
             Ok((true, line0, col0.saturating_sub(1)))

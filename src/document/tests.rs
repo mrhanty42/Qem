@@ -194,11 +194,16 @@ fn model_backspace(text: &mut String, line_hint: usize, col0: usize) -> (bool, u
         .char_indices()
         .last()
         .expect("non-empty prefix must contain a character");
+    let previous_line_col0 = if prev_ch == '\n' {
+        Some(lines[line0.saturating_sub(1)].len_chars)
+    } else {
+        None
+    };
     text.replace_range(prev_start..cur, "");
 
     if prev_ch == '\n' {
         let new_line0 = line0.saturating_sub(1);
-        let new_col0 = model_lines(text)[new_line0].len_chars;
+        let new_col0 = previous_line_col0.unwrap_or(0);
         (true, new_line0, new_col0)
     } else {
         (true, line0, col0.saturating_sub(1))

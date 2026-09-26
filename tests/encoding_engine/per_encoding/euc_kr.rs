@@ -119,8 +119,8 @@ fn literal_and_regex_search_finds_known_match() {
     let encoding = DocumentEncoding::from_label(LABEL).unwrap();
     let doc = Document::open_with_encoding(&path, encoding).expect("open fixture");
 
- // Regex search routes through `find_next_regex_in_class_b_chunked`
- // for CJK multibyte.
+    // Regex search routes through `find_next_regex_in_class_b_chunked`
+    // for CJK multibyte.
     let query = RegexSearchQuery::new("TARGET").expect("compile ASCII regex");
     let regex_match = doc
         .find_next_regex_query(&query, TextPosition::new(0, 0))
@@ -128,8 +128,8 @@ fn literal_and_regex_search_finds_known_match() {
     assert_eq!(regex_match.start(), TextPosition::new(0, 0));
     assert_eq!(regex_match.end(), TextPosition::new(0, 6));
 
- // EUC-KR encodes ASCII bytes verbatim, so the literal byte
- // finder hits the marker on line 0 without ambiguity.
+    // EUC-KR encodes ASCII bytes verbatim, so the literal byte
+    // finder hits the marker on line 0 without ambiguity.
     let literal = doc
         .find_next("TARGET", TextPosition::new(0, 0))
         .expect("literal search must locate the ASCII marker on line 0");
@@ -166,14 +166,14 @@ const NON_ASCII_INSERT: &str = "안녕";
 
 #[test]
 fn edit_and_save_round_trip() {
- // — fifth contract for the per-encoding suite.
- // Validates (edit + save round-trip) and (save fidelity)
- // for `EUC-KR` through the encoded edit path: insert ASCII
- // insert representable Hangul, delete the ASCII prefix through the
- // encoded replace-range path, save, reopen, and assert the decoded
- // text round-trips byte-identically against the in-memory document.
- // holds implicitly because the encoded path never transcodes
- // the document into UTF-8.
+    // — fifth contract for the per-encoding suite.
+    // Validates (edit + save round-trip) and (save fidelity)
+    // for `EUC-KR` through the encoded edit path: insert ASCII
+    // insert representable Hangul, delete the ASCII prefix through the
+    // encoded replace-range path, save, reopen, and assert the decoded
+    // text round-trips byte-identically against the in-memory document.
+    // holds implicitly because the encoded path never transcodes
+    // the document into UTF-8.
     let dir = fresh_test_dir("per_encoding_euc_kr_edit");
     let path = dir.join("fixture.txt");
     let saved = dir.join("fixture.saved.txt");

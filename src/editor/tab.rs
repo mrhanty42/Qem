@@ -32,6 +32,12 @@ impl EditorTab {
         }
     }
 
+    /// Installs an optional callback invoked after an asynchronous load or save
+    /// result has been published to this tab's completion channel.
+    pub fn set_completion_notifier(&mut self, notifier: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.core.set_completion_notifier(notifier);
+    }
+
     /// Returns the tab identifier.
     pub fn id(&self) -> u64 {
         self.id

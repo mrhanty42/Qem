@@ -108,9 +108,9 @@ fn windows_1251_piece_table_preserve_save_round_trip() {
     let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
     let mut doc = Document::open_with_encoding(&path, encoding).expect("open fixture");
 
- // Insert representable Cyrillic text at line 0, column 0. The
- // encoded path appends the windows-1251 bytes of `insertion`
- // verbatim into the piece-tree add buffer.
+    // Insert representable Cyrillic text at line 0, column 0. The
+    // encoded path appends the windows-1251 bytes of `insertion`
+    // verbatim into the piece-tree add buffer.
     let insertion = "Привет, мир!";
     let _ = doc.try_insert(TextPosition::new(0, 0), insertion).unwrap();
     assert!(
@@ -119,7 +119,7 @@ fn windows_1251_piece_table_preserve_save_round_trip() {
     );
     assert!(!doc.has_rope(), "preserve-save path requires rope=None");
 
- // Preserve-save streams piece-tree bytes verbatim.
+    // Preserve-save streams piece-tree bytes verbatim.
     doc.save_to(&saved).expect("preserve-save must succeed");
 
     let saved_bytes = std::fs::read(&saved).expect("read saved file");
@@ -151,9 +151,9 @@ fn windows_1251_piece_table_save_to_utf8_decodes_correctly() {
     assert!(doc.has_piece_table());
     assert!(!doc.has_rope());
 
- // Save-conversion to UTF-8 must decode the piece-tree bytes
- // through `encoding_rs` (not through `to_string_lossy()`), then
- // re-encode into UTF-8.
+    // Save-conversion to UTF-8 must decode the piece-tree bytes
+    // through `encoding_rs` (not through `to_string_lossy()`), then
+    // re-encode into UTF-8.
     let utf8 = DocumentEncoding::utf8();
     doc.save_to_with_encoding(&saved, utf8)
         .expect("save_to_with_encoding(UTF-8) must succeed");
@@ -180,9 +180,9 @@ fn utf16le_piece_table_preserve_save_round_trip() {
     let encoding = DocumentEncoding::utf16le();
     let mut doc = Document::open_with_encoding(&path, encoding).expect("open fixture");
 
- // Insert a Unicode string. UTF-16 encodes via `str::encode_utf16`
- // in the encoded path, so any Unicode scalar (including
- // supplementary code points via surrogate pairs) is representable.
+    // Insert a Unicode string. UTF-16 encodes via `str::encode_utf16`
+    // in the encoded path, so any Unicode scalar (including
+    // supplementary code points via surrogate pairs) is representable.
     let insertion = "Привет 世界!";
     let _ = doc.try_insert(TextPosition::new(0, 0), insertion).unwrap();
     assert!(doc.has_piece_table());

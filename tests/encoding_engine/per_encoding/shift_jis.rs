@@ -67,13 +67,13 @@ const LINE4: &str = "last line";
 ///
 /// * Line 0 — ASCII with the `TARGET` marker, terminated by `LF`.
 /// * Line 1 — ASCII, terminated by `CRLF` (CRLF collapses to a
-/// single boundary in `MultiByteEngine::next_line_start`).
+///   single boundary in `MultiByteEngine::next_line_start`).
 /// * Line 2 — empty line, terminated by `LF`.
 /// * Line 3 — Kanji + Hiragana non-ASCII payload, terminated by
-/// lone `CR`. The Kanji `\u{65E5}\u{672C}\u{8A9E}` ("Japanese")
-/// and the Hiragana `\u{3072}\u{3089}\u{304C}\u{306A}` ("hiragana")
-/// each encode to 2 bytes per character in Shift_JIS, so the line
-/// contains 14 multibyte source bytes plus a single ASCII space.
+///   lone `CR`. The Kanji `\u{65E5}\u{672C}\u{8A9E}` ("Japanese")
+///   and the Hiragana `\u{3072}\u{3089}\u{304C}\u{306A}` ("hiragana")
+///   each encode to 2 bytes per character in Shift_JIS, so the line
+///   contains 14 multibyte source bytes plus a single ASCII space.
 /// * Line 4 — ASCII, no trailing newline.
 const FIXTURE_TEXT: &str =
     "TARGET line0\nascii line1\r\n\n\u{65E5}\u{672C}\u{8A9E} \u{3072}\u{3089}\u{304C}\u{306A}\rlast line";
@@ -162,11 +162,11 @@ fn literal_and_regex_search_finds_known_match() {
     let encoding = DocumentEncoding::from_label(LABEL).unwrap();
     let doc = Document::open_with_encoding(&path, encoding).expect("open fixture");
 
- // Regex search routes through `find_next_regex_in_class_b_chunked`
- // for CJK multibyte. The chunked decode +
- // glue path locates the ASCII marker on line 0 and re-encodes the
- // match through `encoding_rs::Encoding::encode` to map back to the
- // source byte offset.
+    // Regex search routes through `find_next_regex_in_class_b_chunked`
+    // for CJK multibyte. The chunked decode +
+    // glue path locates the ASCII marker on line 0 and re-encodes the
+    // match through `encoding_rs::Encoding::encode` to map back to the
+    // source byte offset.
     let query = RegexSearchQuery::new("TARGET").expect("compile ASCII regex");
     let regex_match = doc
         .find_next_regex_query(&query, TextPosition::new(0, 0))
@@ -174,12 +174,12 @@ fn literal_and_regex_search_finds_known_match() {
     assert_eq!(regex_match.start(), TextPosition::new(0, 0));
     assert_eq!(regex_match.end(), TextPosition::new(0, 6));
 
- // Literal search runs a byte-level finder against the raw mmap
- // bytes. Shift_JIS encodes ASCII bytes verbatim (no filler bytes)
- // so the six contiguous UTF-8 needle bytes for `"TARGET"` appear
- // at byte offset 0 in the source. The literal finder therefore
- // returns the same `(0, 0)..(0, 6)` text-unit position the regex
- // path produces.
+    // Literal search runs a byte-level finder against the raw mmap
+    // bytes. Shift_JIS encodes ASCII bytes verbatim (no filler bytes)
+    // so the six contiguous UTF-8 needle bytes for `"TARGET"` appear
+    // at byte offset 0 in the source. The literal finder therefore
+    // returns the same `(0, 0)..(0, 6)` text-unit position the regex
+    // path produces.
     let literal = doc
         .find_next("TARGET", TextPosition::new(0, 0))
         .expect("literal search must locate the ASCII marker on line 0");
@@ -216,14 +216,14 @@ const NON_ASCII_INSERT: &str = "こんにちは";
 
 #[test]
 fn edit_and_save_round_trip() {
- // — fifth contract for the per-encoding suite.
- // Validates (edit + save round-trip) and (save fidelity)
- // for `Shift_JIS` through the encoded edit path: insert
- // ASCII, insert representable Hiragana, delete the ASCII prefix
- // through the encoded replace-range path, save, reopen, and
- // assert the decoded text round-trips byte-identically against
- // the in-memory document. holds implicitly because the
- // encoded path never transcodes the document into UTF-8.
+    // — fifth contract for the per-encoding suite.
+    // Validates (edit + save round-trip) and (save fidelity)
+    // for `Shift_JIS` through the encoded edit path: insert
+    // ASCII, insert representable Hiragana, delete the ASCII prefix
+    // through the encoded replace-range path, save, reopen, and
+    // assert the decoded text round-trips byte-identically against
+    // the in-memory document. holds implicitly because the
+    // encoded path never transcodes the document into UTF-8.
     let dir = fresh_test_dir("per_encoding_shift_jis_edit");
     let path = dir.join("fixture.txt");
     let saved = dir.join("fixture.saved.txt");
@@ -233,16 +233,16 @@ fn edit_and_save_round_trip() {
     let encoding = DocumentEncoding::from_label(LABEL).unwrap();
     let mut doc = Document::open_with_encoding(&path, encoding).expect("open fixture");
 
- // Step 1 — ASCII insert at line 0, column 0.
+    // Step 1 — ASCII insert at line 0, column 0.
     doc.try_insert(TextPosition::new(0, 0), "EDIT ")
         .expect("ASCII insert must succeed for Shift_JIS encoded edit buffer");
- // Step 2 — representable Hiragana insert directly after the ASCII
- // prefix. Each Hiragana code point encodes to two Shift_JIS bytes.
+    // Step 2 — representable Hiragana insert directly after the ASCII
+    // prefix. Each Hiragana code point encodes to two Shift_JIS bytes.
     doc.try_insert(TextPosition::new(0, 5), NON_ASCII_INSERT)
         .expect("non-ASCII Hiragana insert must succeed");
- // Step 3 — delete the 5-column ASCII prefix through the encoded
- // replace-range path. After the splice, line 0 begins with the
- // Hiragana chunk followed by the original `TARGET line0` text.
+    // Step 3 — delete the 5-column ASCII prefix through the encoded
+    // replace-range path. After the splice, line 0 begins with the
+    // Hiragana chunk followed by the original `TARGET line0` text.
     doc.try_replace_range(0, 0, 5, "")
         .expect("encoded delete-range must succeed");
 

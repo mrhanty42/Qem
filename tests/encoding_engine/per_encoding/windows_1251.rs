@@ -187,14 +187,14 @@ const NON_ASCII_INSERT: &str = "Привет";
 
 #[test]
 fn edit_and_save_round_trip() {
- // — fifth contract for the per-encoding suite.
- // Validates (edit + save round-trip) and (save fidelity)
- // for the `windows-1251` Class A encoding through the
- // encoded edit path: insert ASCII, insert representable non-ASCII
- // delete a range, save, reopen, and assert the decoded text round-
- // trips byte-identically against the in-memory document. is
- // upheld implicitly because the encoded path never transcodes the
- // document into UTF-8.
+    // — fifth contract for the per-encoding suite.
+    // Validates (edit + save round-trip) and (save fidelity)
+    // for the `windows-1251` Class A encoding through the
+    // encoded edit path: insert ASCII, insert representable non-ASCII
+    // delete a range, save, reopen, and assert the decoded text round-
+    // trips byte-identically against the in-memory document. is
+    // upheld implicitly because the encoded path never transcodes the
+    // document into UTF-8.
 
     let dir = fresh_test_dir("per_encoding_windows_1251_edit");
     let path = dir.join("fixture.txt");
@@ -205,18 +205,18 @@ fn edit_and_save_round_trip() {
     let encoding = DocumentEncoding::from_label(LABEL).unwrap();
     let mut doc = Document::open_with_encoding(&path, encoding).expect("open fixture");
 
- // Step 1 — ASCII insert at line 0, column 0.
+    // Step 1 — ASCII insert at line 0, column 0.
     doc.try_insert(TextPosition::new(0, 0), "EDIT ")
         .expect("ASCII insert must succeed for Class A native edit buffer");
- // Step 2 — representable non-ASCII insert directly after the ASCII
- // prefix. The encoded path emits high-byte cells (one byte per
- // Cyrillic letter under windows-1251) into the piece-tree add
- // buffer without falling into the `UnrepresentableText` branch.
+    // Step 2 — representable non-ASCII insert directly after the ASCII
+    // prefix. The encoded path emits high-byte cells (one byte per
+    // Cyrillic letter under windows-1251) into the piece-tree add
+    // buffer without falling into the `UnrepresentableText` branch.
     doc.try_insert(TextPosition::new(0, 5), NON_ASCII_INSERT)
         .expect("non-ASCII insert must succeed");
- // Step 3 — delete the 5-column ASCII prefix through the encoded
- // delete path. After the splice, line 0 begins with the non-ASCII
- // chunk followed by the original `TARGET line0` text.
+    // Step 3 — delete the 5-column ASCII prefix through the encoded
+    // delete path. After the splice, line 0 begins with the non-ASCII
+    // chunk followed by the original `TARGET line0` text.
     doc.try_replace_range(0, 0, 5, "")
         .expect("encoded delete-range must succeed");
 

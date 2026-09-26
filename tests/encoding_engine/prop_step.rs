@@ -43,17 +43,17 @@ use qem::DocumentEncoding;
 /// when materialized through [`encode_atoms`].
 #[derive(Debug, Clone, Copy)]
 enum Atom {
- /// A BMP scalar in `U+0000..=U+D7FF` ∪ `U+E000..=U+FFFF`. Emits
- /// exactly one 2-byte code unit; `step` at its start must be `2`.
+    /// A BMP scalar in `U+0000..=U+D7FF` ∪ `U+E000..=U+FFFF`. Emits
+    /// exactly one 2-byte code unit; `step` at its start must be `2`.
     Bmp(u16),
- /// A supplementary scalar in `U+10000..=U+10FFFF`. Emits two 2-byte
- /// code units (high + low surrogate). `step` at the high surrogate
- /// must be `4`; `step` at the low surrogate (if visited as a 2-byte
- /// cell on its own) must be `2`.
+    /// A supplementary scalar in `U+10000..=U+10FFFF`. Emits two 2-byte
+    /// code units (high + low surrogate). `step` at the high surrogate
+    /// must be `4`; `step` at the low surrogate (if visited as a 2-byte
+    /// cell on its own) must be `2`.
     Supplementary(u32),
- /// A lone high surrogate in `U+D800..=U+DBFF` with no paired low
- /// surrogate. Emits exactly one 2-byte code unit; `step` at its
- /// start must be `2` (malformed code unit).
+    /// A lone high surrogate in `U+D800..=U+DBFF` with no paired low
+    /// surrogate. Emits exactly one 2-byte code unit; `step` at its
+    /// start must be `2` (malformed code unit).
     LoneHighSurrogate(u16),
 }
 
@@ -75,9 +75,9 @@ fn lone_high_surrogate() -> impl Strategy<Value = u16> {
 }
 
 fn atom_strategy() -> impl Strategy<Value = Atom> {
- // Weighted so most atoms are well-formed (BMP or supplementary) and
- // the malformed case still fires often enough to exercise the
- // lone-high-surrogate branch every few cases.
+    // Weighted so most atoms are well-formed (BMP or supplementary) and
+    // the malformed case still fires often enough to exercise the
+    // lone-high-surrogate branch every few cases.
     prop_oneof![
         4 => bmp_value().prop_map(Atom::Bmp),
         3 => supplementary_value().prop_map(Atom::Supplementary),
@@ -86,9 +86,9 @@ fn atom_strategy() -> impl Strategy<Value = Atom> {
 }
 
 fn atoms_strategy() -> impl Strategy<Value = Vec<Atom>> {
- // Up to 24 atoms gives byte sequences up to ~96 bytes; large enough
- // to exercise long mixed BMP + surrogate runs and small enough to
- // keep shrinking quick.
+    // Up to 24 atoms gives byte sequences up to ~96 bytes; large enough
+    // to exercise long mixed BMP + surrogate runs and small enough to
+    // keep shrinking quick.
     prop::collection::vec(atom_strategy(), 0..=24)
 }
 
@@ -104,9 +104,9 @@ fn encode_atoms(atoms: &[Atom], endian: Endian) -> (Vec<u8>, Vec<(usize, Atom)>)
         match *atom {
             Atom::Bmp(unit) => push_unit(&mut bytes, unit, endian),
             Atom::Supplementary(scalar) => {
- // : encode the scalar as a UTF-16 surrogate pair.
- // High = 0xD800 + ((scalar - 0x10000) >> 10)
- // Low = 0xDC00 + ((scalar - 0x10000) & 0x3FF).
+                // : encode the scalar as a UTF-16 surrogate pair.
+                // High = 0xD800 + ((scalar - 0x10000) >> 10)
+                // Low = 0xDC00 + ((scalar - 0x10000) & 0x3FF).
                 let v = scalar - 0x10000;
                 let high = 0xD800 + ((v >> 10) as u16);
                 let low = 0xDC00 + ((v & 0x3FF) as u16);
@@ -151,8 +151,8 @@ fn expected_step(bytes: &[u8], offset: usize, endian: Endian) -> usize {
     }
     let unit = read_u16(bytes, offset, endian);
     if (0xD800..=0xDBFF).contains(&unit) {
- // High surrogate — only forms a 4-byte character if followed by
- // a low surrogate.
+        // High surrogate — only forms a 4-byte character if followed by
+        // a low surrogate.
         if offset + 4 <= len {
             let next = read_u16(bytes, offset + 2, endian);
             if (0xDC00..=0xDFFF).contains(&next) {
@@ -161,8 +161,8 @@ fn expected_step(bytes: &[u8], offset: usize, endian: Endian) -> usize {
         }
         return 2;
     }
- // Either a BMP code unit or a lone low surrogate cell mid-pair —
- // both step by 2.
+    // Either a BMP code unit or a lone low surrogate cell mid-pair —
+    // both step by 2.
     2
 }
 
@@ -337,9 +337,9 @@ enum CjkKindUnderTest {
 }
 
 impl CjkKindUnderTest {
- /// `encoding_rs` static for this kind. Used for `encode` calls in
- /// both the input encoding step and the reference per-char
- /// re-encoding.
+    /// `encoding_rs` static for this kind. Used for `encode` calls in
+    /// both the input encoding step and the reference per-char
+    /// re-encoding.
     fn encoding_rs(self) -> &'static Encoding {
         match self {
             Self::ShiftJis => SHIFT_JIS,
@@ -348,10 +348,10 @@ impl CjkKindUnderTest {
         }
     }
 
- /// Canonical Qem `DocumentEncoding` for this kind. The canonical
- /// `encoding_rs` labels (`"Shift_JIS"`, `"gb18030"`, `"EUC-KR"`)
- /// are exactly what `engine_for_encoding` matches against when
- /// dispatching to `MultiByteEngine`.
+    /// Canonical Qem `DocumentEncoding` for this kind. The canonical
+    /// `encoding_rs` labels (`"Shift_JIS"`, `"gb18030"`, `"EUC-KR"`)
+    /// are exactly what `engine_for_encoding` matches against when
+    /// dispatching to `MultiByteEngine`.
     fn document_encoding(self) -> DocumentEncoding {
         let label = match self {
             Self::ShiftJis => "Shift_JIS",
@@ -362,19 +362,19 @@ impl CjkKindUnderTest {
             .unwrap_or_else(|| panic!("encoding_rs should know {label}"))
     }
 
- /// Regex for `proptest::string::string_regex` that emits only
- /// characters representable in this kind. Length is capped at 32
- /// chars so encoded byte sequences stay small (≤ 128 bytes for
- /// gb18030's 4-byte path) and shrinking remains quick.
+    /// Regex for `proptest::string::string_regex` that emits only
+    /// characters representable in this kind. Length is capped at 32
+    /// chars so encoded byte sequences stay small (≤ 128 bytes for
+    /// gb18030's 4-byte path) and shrinking remains quick.
     fn text_regex(self) -> &'static str {
         match self {
- // ASCII + Hiragana — fully covered by JIS X 0208 (Shift_JIS).
+            // ASCII + Hiragana — fully covered by JIS X 0208 (Shift_JIS).
             Self::ShiftJis => "[a-z0-9\\u3041-\\u3093]{1,32}",
- // ASCII + CJK Unified Ideographs — every code point has a
- // valid gb18030 encoding (mix of 2- and 4-byte sequences).
+            // ASCII + CJK Unified Ideographs — every code point has a
+            // valid gb18030 encoding (mix of 2- and 4-byte sequences).
             Self::Gb18030 => "[a-z0-9\\u4E00-\\u9FFF]{1,32}",
- // ASCII + Hangul Syllables — KS X 1001 covers the entire
- // U+AC00..=U+D7A3 block.
+            // ASCII + Hangul Syllables — KS X 1001 covers the entire
+            // U+AC00..=U+D7A3 block.
             Self::EucKr => "[a-z0-9\\uAC00-\\uD7A3]{1,32}",
         }
     }

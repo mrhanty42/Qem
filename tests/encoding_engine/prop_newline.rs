@@ -78,20 +78,20 @@ enum Atom {
 
 fn atom_strategy() -> impl Strategy<Value = Atom> {
     prop_oneof![
-        2 => Just(Atom::Lf),
-        2 => Just(Atom::Cr),
-        2 => Just(Atom::Crlf),
- // High bytes look like Cyrillic / Latin-1 glyphs in Class A
- // encodings — they must never be mistaken for terminators.
-        3 => (0xC0u8..=0xFE).prop_map(Atom::Filler),
-        3 => (b' '..=b'~').prop_map(Atom::Filler),
-    ]
+           2 => Just(Atom::Lf),
+           2 => Just(Atom::Cr),
+           2 => Just(Atom::Crlf),
+    // High bytes look like Cyrillic / Latin-1 glyphs in Class A
+    // encodings — they must never be mistaken for terminators.
+           3 => (0xC0u8..=0xFE).prop_map(Atom::Filler),
+           3 => (b' '..=b'~').prop_map(Atom::Filler),
+       ]
 }
 
 fn bytes_strategy() -> impl Strategy<Value = Vec<u8>> {
- // 0..=24 atoms turns into byte slices up to ~48 bytes, which is more
- // than enough to exercise the line scanner without inflating the per
- // case cost.
+    // 0..=24 atoms turns into byte slices up to ~48 bytes, which is more
+    // than enough to exercise the line scanner without inflating the per
+    // case cost.
     prop::collection::vec(atom_strategy(), 0..=24).prop_map(|atoms| {
         let mut bytes = Vec::with_capacity(48);
         for atom in atoms {
@@ -357,12 +357,12 @@ proptest! {
 
 #[test]
 fn property_9_misaligned_lf_byte_is_not_a_line_break_le() {
- // UTF-16LE: two code units U+0A42 (`[0x42, 0x0A]`) followed by
- // U+4242 (`[0x42, 0x42]`). The `0x0A` at byte position 1 is the
- // trailing (high) byte of the first code unit, NOT a UTF-16LE LF
- // cell — which would require `[0x0A, 0x00]` at an even offset. The
- // engine must walk past both code units and return `bytes.len()=4`
- // never the position 2 a naive memchr-on-bytes scan would report.
+    // UTF-16LE: two code units U+0A42 (`[0x42, 0x0A]`) followed by
+    // U+4242 (`[0x42, 0x42]`). The `0x0A` at byte position 1 is the
+    // trailing (high) byte of the first code unit, NOT a UTF-16LE LF
+    // cell — which would require `[0x0A, 0x00]` at an even offset. The
+    // engine must walk past both code units and return `bytes.len()=4`
+    // never the position 2 a naive memchr-on-bytes scan would report.
     let engine: &dyn EncodingEngine = engine_for_encoding(DocumentEncoding::utf16le());
     let bytes: [u8; 4] = [0x42, 0x0A, 0x42, 0x42];
     let result = engine.next_line_start(&bytes, bytes.len(), 0);
@@ -379,9 +379,9 @@ fn property_9_misaligned_lf_byte_is_not_a_line_break_le() {
 
 #[test]
 fn property_9_misaligned_cr_byte_is_not_a_line_break_le() {
- // Symmetric to the LF case but for CR (`0x0D`). U+0D42 is
- // `[0x42, 0x0D]` in LE; the `0x0D` sits at odd byte 1 and must
- // not be interpreted as CR.
+    // Symmetric to the LF case but for CR (`0x0D`). U+0D42 is
+    // `[0x42, 0x0D]` in LE; the `0x0D` sits at odd byte 1 and must
+    // not be interpreted as CR.
     let engine: &dyn EncodingEngine = engine_for_encoding(DocumentEncoding::utf16le());
     let bytes: [u8; 4] = [0x42, 0x0D, 0x42, 0x42];
     let result = engine.next_line_start(&bytes, bytes.len(), 0);
@@ -398,12 +398,12 @@ fn property_9_misaligned_cr_byte_is_not_a_line_break_le() {
 
 #[test]
 fn property_9_misaligned_lf_byte_is_not_a_line_break_be() {
- // UTF-16BE: two code units U+0A42 (`[0x0A, 0x42]`) followed by
- // U+4242 (`[0x42, 0x42]`). The `0x0A` at byte 0 is the leading
- // (high) byte of the first code unit. The BE LF cell pattern is
- // `[0x00, 0x0A]` (the `0x0A` lives at the trailing byte and is
- // paired with a `0x00` leading byte), so this `0x0A` must not be
- // mistaken for LF. Engine returns `bytes.len()=4`.
+    // UTF-16BE: two code units U+0A42 (`[0x0A, 0x42]`) followed by
+    // U+4242 (`[0x42, 0x42]`). The `0x0A` at byte 0 is the leading
+    // (high) byte of the first code unit. The BE LF cell pattern is
+    // `[0x00, 0x0A]` (the `0x0A` lives at the trailing byte and is
+    // paired with a `0x00` leading byte), so this `0x0A` must not be
+    // mistaken for LF. Engine returns `bytes.len()=4`.
     let engine: &dyn EncodingEngine = engine_for_encoding(DocumentEncoding::utf16be());
     let bytes: [u8; 4] = [0x0A, 0x42, 0x42, 0x42];
     let result = engine.next_line_start(&bytes, bytes.len(), 0);
@@ -416,9 +416,9 @@ fn property_9_misaligned_lf_byte_is_not_a_line_break_be() {
 
 #[test]
 fn property_9_misaligned_cr_byte_is_not_a_line_break_be() {
- // Symmetric BE check for CR. U+0D42 in BE is `[0x0D, 0x42]`; the
- // `0x0D` at byte 0 is a leading byte, not the BE CR pattern
- // `[0x00, 0x0D]`.
+    // Symmetric BE check for CR. U+0D42 in BE is `[0x0D, 0x42]`; the
+    // `0x0D` at byte 0 is a leading byte, not the BE CR pattern
+    // `[0x00, 0x0D]`.
     let engine: &dyn EncodingEngine = engine_for_encoding(DocumentEncoding::utf16be());
     let bytes: [u8; 4] = [0x0D, 0x42, 0x42, 0x42];
     let result = engine.next_line_start(&bytes, bytes.len(), 0);
@@ -515,28 +515,28 @@ impl Prop12CjkKind {
             .unwrap_or_else(|| panic!("encoding_rs should know {label}"))
     }
 
- /// Regex passed to `proptest::string::string_regex`. Each per-kind
- /// regex restricts the alphabet to scalars that the corresponding
- /// `encoding_rs` encoder can map without `had_unmappable`. Length
- /// is capped at 32 chars so encoded byte sequences stay small (≤
- /// 128 bytes for the gb18030 4-byte path) and shrinking remains
- /// quick. The non-ASCII ranges intentionally include line-break
- /// adjacent code points (e.g. CJK Unified Ideographs containing
- /// trail bytes that look like `0x0A` / `0x0D`) so the false-
- /// positive rejection branch in `MultiByteEngine::next_line_start`
- /// is exercised, plus injected ASCII LF / CR atoms via the regex
- /// alternation.
+    /// Regex passed to `proptest::string::string_regex`. Each per-kind
+    /// regex restricts the alphabet to scalars that the corresponding
+    /// `encoding_rs` encoder can map without `had_unmappable`. Length
+    /// is capped at 32 chars so encoded byte sequences stay small (≤
+    /// 128 bytes for the gb18030 4-byte path) and shrinking remains
+    /// quick. The non-ASCII ranges intentionally include line-break
+    /// adjacent code points (e.g. CJK Unified Ideographs containing
+    /// trail bytes that look like `0x0A` / `0x0D`) so the false-
+    /// positive rejection branch in `MultiByteEngine::next_line_start`
+    /// is exercised, plus injected ASCII LF / CR atoms via the regex
+    /// alternation.
     fn text_regex(self) -> &'static str {
         match self {
- // ASCII (incl. `\n` and `\r`) + Hiragana — fully covered
- // by JIS X 0208 (Shift_JIS).
+            // ASCII (incl. `\n` and `\r`) + Hiragana — fully covered
+            // by JIS X 0208 (Shift_JIS).
             Self::ShiftJis => "[\\n\\ra-z0-9\\u3041-\\u3093]{0,32}",
- // ASCII (incl. `\n` and `\r`) + CJK Unified Ideographs —
- // every code point has a valid gb18030 encoding (mix of
- // 2- and 4-byte sequences).
+            // ASCII (incl. `\n` and `\r`) + CJK Unified Ideographs —
+            // every code point has a valid gb18030 encoding (mix of
+            // 2- and 4-byte sequences).
             Self::Gb18030 => "[\\n\\ra-z0-9\\u4E00-\\u9FFF]{0,32}",
- // ASCII (incl. `\n` and `\r`) + Hangul Syllables — KS X
- // 1001 covers the entire `U+AC00..=U+D7A3` block.
+            // ASCII (incl. `\n` and `\r`) + Hangul Syllables — KS X
+            // 1001 covers the entire `U+AC00..=U+D7A3` block.
             Self::EucKr => "[\\n\\ra-z0-9\\uAC00-\\uD7A3]{0,32}",
         }
     }

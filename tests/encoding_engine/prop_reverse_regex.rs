@@ -127,24 +127,24 @@ use std::time::{Duration, Instant};
 /// (no zero-width, no `\b`, direction-stable match sets) and why
 /// patterns like `\d{2,4}` or `\d+\s+\d+` are NOT in this list.
 const REVERSE_SAFE_PATTERNS: &[&str] = &[
- // Single-class greedy runs — emit a unique maximal run regardless
- // of iteration direction.
+    // Single-class greedy runs — emit a unique maximal run regardless
+    // of iteration direction.
     r"\d+",
     r"\w+",
     r"[A-Za-z]+",
     r"[a-z]+",
     r"[A-Za-z0-9]+",
- // Anchor + greedy run — the anchor pins the start, the greedy run
- // pins the end, both directions converge.
+    // Anchor + greedy run — the anchor pins the start, the greedy run
+    // pins the end, both directions converge.
     r"[A-Z]\w*",
     r"X[Y-Z]+",
     r"ab+",
     r"a+b+",
- // Alternation of equal-length tokens with no shared prefix —
- // matches are isolated literal hits, no direction sensitivity.
+    // Alternation of equal-length tokens with no shared prefix —
+    // matches are isolated literal hits, no direction sensitivity.
     r"foo|bar|baz",
- // Union of equal-length tokens repeated — equivalent to a greedy
- // run over `{ab, cd}` segments.
+    // Union of equal-length tokens repeated — equivalent to a greedy
+    // run over `{ab, cd}` segments.
     r"(ab|cd)+",
 ];
 
@@ -226,56 +226,56 @@ fn collect_forward(doc: &Document, query: &RegexSearchQuery) -> Vec<(TextPositio
 ///
 /// Algorithm:
 /// 1. `before := TextPosition::new(usize::MAX, usize::MAX)` (the
-/// `clamp_position` machinery resolves this to "end of
-/// document" for every backing — see `positions.rs`).
+///    `clamp_position` machinery resolves this to "end of
+///    document" for every backing — see `positions.rs`).
 /// 2. Each iteration: `m = doc.find_prev_regex_query(&query, before)`.
 /// * `None` → terminate.
 /// * `Some(m)` with `m.start() >= before` → guard against a
-/// non-progressing dispatcher (would otherwise spin
-/// forever); return `None` so the caller can bail via
-/// `prop_assume!`.
+///   non-progressing dispatcher (would otherwise spin
+///   forever); return `None` so the caller can bail via
+///   `prop_assume!`.
 /// * Otherwise: push `(m.start(), m.end())` and lower `before`
-/// to `m.start()`.
+///   to `m.start()`.
 /// 3. Reverse the collected vector so the result is sorted in the
-/// same ascending-by-start order the forward path returns. A
-/// separate `sort_by_key` pass is unnecessary because the
-/// reverse walk visits matches in strictly descending start
-/// order over a non-overlapping match set.
+///    same ascending-by-start order the forward path returns. A
+///    separate `sort_by_key` pass is unnecessary because the
+///    reverse walk visits matches in strictly descending start
+///    order over a non-overlapping match set.
 fn collect_reverse(
     doc: &Document,
     query: &RegexSearchQuery,
+    expected_match_count: usize,
 ) -> Option<Vec<(TextPosition, TextPosition)>> {
     let mut out = Vec::new();
     let mut before = TextPosition::new(usize::MAX, usize::MAX);
- // Hard ceiling on iteration count — a pathological dispatcher bug
- // that returns the same match repeatedly would otherwise spin
- // forever. The forward iterator is also bounded indirectly by
- // the byte length of the document, so any sane reverse walk on
- // the same content terminates well below this cap.
-    let iter_cap = 4096usize;
+    // A correct reverse walk produces exactly the forward match count and
+    // then terminates. One extra iteration observes the final `None`; a
+    // second is defensive slack. This fails quickly on non-progress instead
+    // of issuing thousands of expensive reverse searches.
+    let iter_cap = expected_match_count.saturating_add(2);
     for _ in 0..iter_cap {
         let Some(m) = doc.find_prev_regex_query(query, before) else {
- // Reverse out so result is sorted ascending by start.
+            // Reverse out so result is sorted ascending by start.
             out.reverse();
             return Some(out);
         };
- // Defensive: if the dispatcher ever fails to make progress
- // (start did not strictly decrease relative to `before`), we
- // bail rather than loop.
+        // Defensive: if the dispatcher ever fails to make progress
+        // (start did not strictly decrease relative to `before`), we
+        // bail rather than loop.
         if m.start() >= before {
             return None;
         }
         out.push((m.start(), m.end()));
         before = m.start();
         if before == TextPosition::new(0, 0) {
- // No room for another match strictly before the start of
- // the document. The next call would short-circuit to
- // `None` per `find_prev_regex_query`; fold it here.
+            // No room for another match strictly before the start of
+            // the document. The next call would short-circuit to
+            // `None` per `find_prev_regex_query`; fold it here.
             out.reverse();
             return Some(out);
         }
     }
- // Iteration cap exceeded without converging; treat as a bail.
+    // Iteration cap exceeded without converging; treat as a bail.
     None
 }
 
@@ -319,16 +319,12 @@ proptest! {
  // ------------------------------------------------------------
         let rope_doc = build_rope_doc(&content);
         let forward_rope = collect_forward(&rope_doc, &query);
-        let reverse_rope = match collect_reverse(&rope_doc, &query) {
-            Some(v) => v,
-            None => {
-                prop_assume!(
-                    false,
-                    "rope reverse walk did not converge (likely zero-width match); skipping",
-                );
-                return Ok(());
-            }
-        };
+        let reverse_rope = collect_reverse(&rope_doc, &query, forward_rope.len());
+        prop_assert!(
+            reverse_rope.is_some(),
+            "rope reverse walk did not converge: pattern={pattern:?}, content={content:?}",
+        );
+        let reverse_rope = reverse_rope.expect("asserted converged rope reverse walk");
         prop_assert_eq!(
             &forward_rope,
             &reverse_rope,
@@ -343,18 +339,12 @@ proptest! {
         let dir = fresh_test_dir("prop_reverse_regex");
         let mmap_doc = open_clean_mmap_doc(content.as_bytes(), &dir, "mmap.txt");
         let forward_mmap = collect_forward(&mmap_doc, &query);
-        let reverse_mmap = match collect_reverse(&mmap_doc, &query) {
-            Some(v) => v,
-            None => {
- // Best-effort cleanup before bailing.
-                let _ = fs::remove_dir_all(&dir);
-                prop_assume!(
-                    false,
-                    "mmap reverse walk did not converge (likely zero-width match); skipping",
-                );
-                return Ok(());
-            }
-        };
+        let reverse_mmap = collect_reverse(&mmap_doc, &query, forward_mmap.len());
+        prop_assert!(
+            reverse_mmap.is_some(),
+            "mmap reverse walk did not converge: pattern={pattern:?}, content={content:?}",
+        );
+        let reverse_mmap = reverse_mmap.expect("asserted converged mmap reverse walk");
         prop_assert_eq!(
             &forward_mmap,
             &reverse_mmap,

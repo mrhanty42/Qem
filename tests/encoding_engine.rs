@@ -6,6 +6,7 @@
 //! binary.
 
 #[path = "encoding_engine/mod.rs"]
+#[allow(clippy::duplicate_mod)] // per-encoding suites reuse the shared helpers
 mod helpers;
 
 #[path = "encoding_engine/prop_dispatch.rs"]
@@ -141,7 +142,8 @@ mod perf_dense_vs_sparse;
 #[path = "encoding_engine/prop_reverse_regex.rs"]
 mod prop_reverse_regex;
 
-// Reproducer harness for diagnosing reverse-regex regressions.
+// Deterministic repeated-walk regression distilled from the temporary
+// 2,000-case reverse-regex diagnostic harness.
 
 #[path = "encoding_engine/prop_reverse_regex_repro.rs"]
 mod prop_reverse_regex_repro;

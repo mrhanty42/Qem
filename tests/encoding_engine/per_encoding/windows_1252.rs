@@ -151,11 +151,11 @@ const NON_ASCII_INSERT: &str = "café";
 
 #[test]
 fn edit_and_save_round_trip() {
- // — fifth contract. Validates (edit + save
- // round-trip) and (save fidelity) for `windows-1252` through
- // the encoded edit path: insert ASCII, insert representable
- // non-ASCII, delete a range, save, reopen, and assert the decoded
- // text round-trips byte-identically against the in-memory document.
+    // — fifth contract. Validates (edit + save
+    // round-trip) and (save fidelity) for `windows-1252` through
+    // the encoded edit path: insert ASCII, insert representable
+    // non-ASCII, delete a range, save, reopen, and assert the decoded
+    // text round-trips byte-identically against the in-memory document.
     let dir = fresh_test_dir("per_encoding_windows_1252_edit");
     let path = dir.join("fixture.txt");
     let saved = dir.join("fixture.saved.txt");

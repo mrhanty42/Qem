@@ -1,152 +1,81 @@
-// Temporary diagnostic test. Replays the saved proptest seed against
-// the current pattern_strategy() / content_strategy() to find the
-// counterexample that the cc seed re-derives. Will be deleted once
-// the root cause is identified.
+// Deterministic regression for the repeated reverse-regex walk that used to
+// be explored by a temporary 2,000-case diagnostic harness. The old harness
+// created one mmap fixture per generated case and only printed mismatches;
+// this bounded test asserts the same forward/reverse symmetry on both rope
+// and mmap backings using a dense match set that exercises repeated `find_prev`.
 
 #[path = "mod.rs"]
 #[allow(clippy::duplicate_mod)]
 mod helpers;
 
 use helpers::fresh_test_dir;
-use proptest::prelude::*;
-use proptest::strategy::ValueTree;
-use proptest::test_runner::{Config, TestRunner};
 use qem::{Document, RegexSearchQuery, TextPosition};
 use std::fs;
-use std::path::Path;
 use std::time::{Duration, Instant};
-
-const REVERSE_SAFE_PATTERNS: &[&str] = &[
-    r"\d+",
-    r"\w+",
-    r"[A-Za-z]+",
-    r"[a-z]+",
-    r"[A-Za-z0-9]+",
-    r"[A-Z]\w*",
-    r"X[Y-Z]+",
-    r"ab+",
-    r"a+b+",
-    r"foo|bar|baz",
-    r"(ab|cd)+",
-];
-
-fn pattern_strategy() -> impl Strategy<Value = String> {
-    prop::sample::select(REVERSE_SAFE_PATTERNS.to_vec()).prop_map(str::to_owned)
-}
-
-fn content_strategy() -> impl Strategy<Value = String> {
-    proptest::string::string_regex(r"[A-Za-z0-9 \n]{0,128}").expect("valid ASCII regex")
-}
-
-fn build_rope_doc(content: &str) -> Document {
-    let mut doc = Document::new();
-    if !content.is_empty() {
-        let _ = doc
-            .try_insert(TextPosition::new(0, 0), content)
-            .expect("rope try_insert");
-    }
-    doc
-}
-
-fn open_clean_mmap_doc(content: &[u8], dir: &Path, name: &str) -> Document {
-    let path = dir.join(name);
-    fs::write(&path, content).expect("mmap fixture write");
-    let doc = Document::open(&path).expect("Document::open mmap fixture");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while doc.is_indexing() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    doc
-}
 
 fn collect_forward(doc: &Document, query: &RegexSearchQuery) -> Vec<(TextPosition, TextPosition)> {
     doc.find_all_regex_query(query)
-        .map(|m| (m.start(), m.end()))
+        .map(|matched| (matched.start(), matched.end()))
         .collect()
 }
 
 fn collect_reverse(
     doc: &Document,
     query: &RegexSearchQuery,
-) -> Option<Vec<(TextPosition, TextPosition)>> {
-    let mut out = Vec::new();
+    expected_match_count: usize,
+) -> Vec<(TextPosition, TextPosition)> {
+    let mut out = Vec::with_capacity(expected_match_count);
     let mut before = TextPosition::new(usize::MAX, usize::MAX);
-    for _ in 0..4096 {
-        let Some(m) = doc.find_prev_regex_query(query, before) else {
+
+    for _ in 0..expected_match_count.saturating_add(2) {
+        let Some(matched) = doc.find_prev_regex_query(query, before) else {
             out.reverse();
-            return Some(out);
+            return out;
         };
-        if m.start() >= before {
-            return None;
-        }
-        out.push((m.start(), m.end()));
-        before = m.start();
-        if before == TextPosition::new(0, 0) {
-            out.reverse();
-            return Some(out);
-        }
+        assert!(
+            matched.start() < before,
+            "reverse regex walk must strictly lower its before position"
+        );
+        out.push((matched.start(), matched.end()));
+        before = matched.start();
     }
-    None
+
+    panic!(
+        "reverse regex walk exceeded forward match count: expected {expected_match_count}, observed at least {}",
+        out.len()
+    );
+}
+
+fn assert_symmetric(doc: &Document, query: &RegexSearchQuery, backing: &str) {
+    let forward = collect_forward(doc, query);
+    let reverse = collect_reverse(doc, query, forward.len());
+    assert_eq!(
+        forward, reverse,
+        "{backing}: repeated reverse walk must equal the forward match sequence"
+    );
 }
 
 #[test]
-fn diag_explore_strategy() {
- // Run a focused TestRunner over the strategy, looking only at
- // (pattern, content) pairs that fail the property. Don't assert
- // just print so we can find counterexamples deterministically.
-    let strategy = (pattern_strategy(), content_strategy());
-    let cfg = Config {
-        cases: 2000,
-        max_shrink_iters: 0,
-        ..Config::default()
-    };
-    let mut runner = TestRunner::new(cfg);
-    let dir = fresh_test_dir("diag_explore_strategy");
-    let mut mismatches = 0usize;
-    for i in 0..2000 {
-        let tree = strategy.new_tree(&mut runner).expect("new_tree");
-        let (pattern, content) = tree.current();
-        if content.is_empty() {
-            continue;
-        }
-        let q = match RegexSearchQuery::new(&pattern) {
-            Ok(q) => q,
-            Err(_) => continue,
-        };
-        let rope_doc = build_rope_doc(&content);
-        let f_rope = collect_forward(&rope_doc, &q);
-        let r_rope = match collect_reverse(&rope_doc, &q) {
-            Some(v) => v,
-            None => continue,
-        };
-        if f_rope != r_rope {
-            mismatches += 1;
-            println!(
-                "[{i}] ROPE MISMATCH: pattern={:?} content={:?}\n  forward={:?}\n  reverse={:?}",
-                pattern, content, f_rope, r_rope
-            );
-            if mismatches >= 3 {
-                break;
-            }
-            continue;
-        }
-        let mmap_doc = open_clean_mmap_doc(content.as_bytes(), &dir, &format!("f_{i}.txt"));
-        let f_mmap = collect_forward(&mmap_doc, &q);
-        let r_mmap = match collect_reverse(&mmap_doc, &q) {
-            Some(v) => v,
-            None => continue,
-        };
-        if f_mmap != r_mmap {
-            mismatches += 1;
-            println!(
-                "[{i}] MMAP MISMATCH: pattern={:?} content={:?}\n  forward={:?}\n  reverse={:?}",
-                pattern, content, f_mmap, r_mmap
-            );
-            if mismatches >= 3 {
-                break;
-            }
-        }
+fn repeated_reverse_walk_is_symmetric_on_rope_and_mmap() {
+    let content = "X1 alpha 22 beta X3\nfoo 444 bar X5\n".repeat(8);
+    let query = RegexSearchQuery::new(r"[A-Za-z0-9]+").expect("valid regression regex");
+
+    let mut rope_doc = Document::new();
+    rope_doc
+        .try_insert(TextPosition::new(0, 0), &content)
+        .expect("seed rope regression document");
+    assert_symmetric(&rope_doc, &query, "rope");
+
+    let dir = fresh_test_dir("reverse-regex-repeated-walk");
+    let path = dir.join("mmap.txt");
+    fs::write(&path, content.as_bytes()).expect("write mmap regression fixture");
+    let mmap_doc = Document::open(&path).expect("open mmap regression fixture");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while mmap_doc.is_indexing() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
     }
+    assert_symmetric(&mmap_doc, &query, "mmap");
+
+    drop(mmap_doc);
     let _ = fs::remove_dir_all(&dir);
-    println!("total mismatches in 2000 cases: {mismatches}");
 }

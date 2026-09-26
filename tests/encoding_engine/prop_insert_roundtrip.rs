@@ -121,11 +121,11 @@ fn is_representable(text: &str, encoding: DocumentEncoding) -> bool {
     }
     let enc = encoding_rs_for_label(encoding.name());
     let mut encoder = enc.new_encoder();
- // `max_buffer_length_from_utf8_if_no_unmappables` returns the
- // exact bound when the encode succeeds without redirects; on
- // overflow we fall back to a conservative `len * 4 + 8` cap
- // (every scalar in a Class A / CJK encoding fits within 4
- // bytes per char in the worst case).
+    // `max_buffer_length_from_utf8_if_no_unmappables` returns the
+    // exact bound when the encode succeeds without redirects; on
+    // overflow we fall back to a conservative `len * 4 + 8` cap
+    // (every scalar in a Class A / CJK encoding fits within 4
+    // bytes per char in the worst case).
     let cap = encoder
         .max_buffer_length_from_utf8_if_no_unmappables(text.len())
         .unwrap_or_else(|| text.len().saturating_mul(4).saturating_add(8));
@@ -196,31 +196,31 @@ fn encoding_strategy() -> impl Strategy<Value = DocumentEncoding> {
 /// shrink quickly.
 fn payload_strategy(encoding: DocumentEncoding) -> impl Strategy<Value = String> {
     let regex = match encoding.name() {
- // ASCII + Cyrillic capital/lowercase blocks — fully covered
- // by every Cyrillic Class A codec.
+        // ASCII + Cyrillic capital/lowercase blocks — fully covered
+        // by every Cyrillic Class A codec.
         "windows-1251" | "KOI8-R" | "IBM866" => r"[A-Za-z0-9 \u0410-\u042F\u0430-\u044F]{1,16}",
- // ASCII + Hiragana — fully covered by JIS X 0208.
+        // ASCII + Hiragana — fully covered by JIS X 0208.
         "Shift_JIS" => r"[A-Za-z0-9 \u3041-\u3093]{1,16}",
- // ASCII + a small CJK Unified Ideographs slice — every
- // scalar in the slice has a valid gb18030 encoding.
+        // ASCII + a small CJK Unified Ideographs slice — every
+        // scalar in the slice has a valid gb18030 encoding.
         "gb18030" => r"[A-Za-z0-9 \u4E00-\u4E2F]{1,16}",
- // ASCII + a small Hangul Syllables slice — KS X 1001 covers
- // the entire `U+AC00..=U+D7A3` block; the slice here keeps
- // the alphabet small for shrinking.
+        // ASCII + a small Hangul Syllables slice — KS X 1001 covers
+        // the entire `U+AC00..=U+D7A3` block; the slice here keeps
+        // the alphabet small for shrinking.
         "EUC-KR" => r"[A-Za-z0-9 \uAC00-\uAC1F]{1,16}",
- // UTF-16 covers all Unicode; mix ASCII with a few BMP Han
- // ideographs and Cyrillic letters so the engine sees both
- // single-unit (2-byte) and multi-unit (still 2-byte for
- // BMP) cells across both endianness markers.
+        // UTF-16 covers all Unicode; mix ASCII with a few BMP Han
+        // ideographs and Cyrillic letters so the engine sees both
+        // single-unit (2-byte) and multi-unit (still 2-byte for
+        // BMP) cells across both endianness markers.
         "UTF-16LE" | "UTF-16BE" => r"[A-Za-z0-9 \u4E00-\u4E2F\u0410-\u042F]{1,16}",
- // ASCII + Latin-1 supplement (`U+00A0..=U+00FF`). All 96
- // characters in the supplement are representable in
- // windows-1252; ISO-8859-15 remaps eight of them, which the
- // `prop_assume!` gate inside the test catches.
+        // ASCII + Latin-1 supplement (`U+00A0..=U+00FF`). All 96
+        // characters in the supplement are representable in
+        // windows-1252; ISO-8859-15 remaps eight of them, which the
+        // `prop_assume!` gate inside the test catches.
         "windows-1252" | "ISO-8859-15" => r"[A-Za-z0-9 \u00A0-\u00FF]{1,16}",
- // Defensive fallback: ASCII only. Reachable only if a new
- // encoding gets added to `ENCODING_LABELS` without a
- // matching alphabet entry above.
+        // Defensive fallback: ASCII only. Reachable only if a new
+        // encoding gets added to `ENCODING_LABELS` without a
+        // matching alphabet entry above.
         _ => r"[A-Za-z0-9 ]{1,16}",
     };
     proptest::string::string_regex(regex).expect("valid payload regex")

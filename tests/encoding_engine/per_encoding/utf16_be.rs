@@ -110,11 +110,11 @@ fn literal_and_regex_search_finds_known_match() {
     let encoding = DocumentEncoding::utf16be();
     let doc = Document::open_with_encoding(&path, encoding).expect("open fixture");
 
- // Regex search routes through `find_next_regex_in_class_b_chunked`
- // for UTF-16. The
- // chunked decode + glue path locates the ASCII marker on line 0
- // and maps the match back to UTF-16 source bytes with the
- // 2-byte alignment post-filter, returning text-unit positions.
+    // Regex search routes through `find_next_regex_in_class_b_chunked`
+    // for UTF-16. The
+    // chunked decode + glue path locates the ASCII marker on line 0
+    // and maps the match back to UTF-16 source bytes with the
+    // 2-byte alignment post-filter, returning text-unit positions.
     let query = RegexSearchQuery::new("TARGET").expect("compile ASCII regex");
     let regex_match = doc
         .find_next_regex_query(&query, TextPosition::new(0, 0))
@@ -122,14 +122,14 @@ fn literal_and_regex_search_finds_known_match() {
     assert_eq!(regex_match.start(), TextPosition::new(0, 0));
     assert_eq!(regex_match.end(), TextPosition::new(0, 6));
 
- // Literal search currently runs a byte-level finder against the
- // raw mmap bytes. UTF-16BE places a `0x00` filler byte before
- // every ASCII byte, so the contiguous UTF-8 needle bytes for
- // `"TARGET"` never appear in the source. The literal byte
- // finder therefore correctly returns `None` for an ASCII needle
- // in a UTF-16BE document. Encoding-aware literal search is not
- // in scope for ; this assertion documents the current
- // contract.
+    // Literal search currently runs a byte-level finder against the
+    // raw mmap bytes. UTF-16BE places a `0x00` filler byte before
+    // every ASCII byte, so the contiguous UTF-8 needle bytes for
+    // `"TARGET"` never appear in the source. The literal byte
+    // finder therefore correctly returns `None` for an ASCII needle
+    // in a UTF-16BE document. Encoding-aware literal search is not
+    // in scope for ; this assertion documents the current
+    // contract.
     assert!(
         doc.find_next("TARGET", TextPosition::new(0, 0)).is_none(),
         "literal byte-finder must not find a UTF-8 needle inside a UTF-16BE document",
@@ -166,24 +166,24 @@ const NON_ASCII_INSERT: &str = "Mix Привет 你好";
 
 #[test]
 fn edit_and_save_round_trip() {
- // — fifth contract for the per-encoding suite.
- // Validates (edit + save round-trip) and (save fidelity)
- // for `UTF-16BE` through the encoded edit path: insert
- // ASCII at (0, 0), replace that ASCII prefix with mixed Cyrillic
- // + CJK via the engine-aware `try_replace_range`, delete the
- // first text unit through the same engine-aware path, save
- // reopen, and assert the decoded text round-trips identically
- // against the in-memory document. holds implicitly because
- // the encoded path emits UTF-16 code units directly via
- // `str::encode_utf16` and never transcodes the document into
- // UTF-8.
- //
- // Note: every column-based reposition runs through `try_replace_range`
- // whose encoded branch resolves byte offsets via the engine-aware
- // `*_with_engine` walkers — the only
- // arithmetic that maps a UTF-16 text-unit column onto its raw
- // 2-byte cell offset. `try_insert` only ever runs at column 0
- // where column-as-bytes and engine-aware columns trivially agree.
+    // — fifth contract for the per-encoding suite.
+    // Validates (edit + save round-trip) and (save fidelity)
+    // for `UTF-16BE` through the encoded edit path: insert
+    // ASCII at (0, 0), replace that ASCII prefix with mixed Cyrillic
+    // + CJK via the engine-aware `try_replace_range`, delete the
+    // first text unit through the same engine-aware path, save
+    // reopen, and assert the decoded text round-trips identically
+    // against the in-memory document. holds implicitly because
+    // the encoded path emits UTF-16 code units directly via
+    // `str::encode_utf16` and never transcodes the document into
+    // UTF-8.
+    //
+    // Note: every column-based reposition runs through `try_replace_range`
+    // whose encoded branch resolves byte offsets via the engine-aware
+    // `*_with_engine` walkers — the only
+    // arithmetic that maps a UTF-16 text-unit column onto its raw
+    // 2-byte cell offset. `try_insert` only ever runs at column 0
+    // where column-as-bytes and engine-aware columns trivially agree.
     let dir = fresh_test_dir("per_encoding_utf16_be_edit");
     let path = dir.join("fixture.txt");
     let saved = dir.join("fixture.saved.txt");
@@ -193,25 +193,25 @@ fn edit_and_save_round_trip() {
     let encoding = DocumentEncoding::utf16be();
     let mut doc = Document::open_with_encoding(&path, encoding).expect("open fixture");
 
- // Step 1 — ASCII insert at (0, 0). Column 0 is the only column the
- // encoded insert path resolves identically for every encoding
- // because `byte_offset_for_col(line0, 0)` returns the raw byte
- // offset of the line start regardless of cell width.
+    // Step 1 — ASCII insert at (0, 0). Column 0 is the only column the
+    // encoded insert path resolves identically for every encoding
+    // because `byte_offset_for_col(line0, 0)` returns the raw byte
+    // offset of the line start regardless of cell width.
     doc.try_insert(TextPosition::new(0, 0), "EDIT ")
         .expect("ASCII insert must succeed for UTF-16BE encoded edit buffer");
 
- // Step 2 — engine-aware replace: the 5-text-unit ASCII prefix
- // installed in step 1 is replaced with the mixed Cyrillic + CJK
- // payload. `try_replace_range` resolves both endpoints through
- // `byte_offset_for_col_with_engine` so the replacement covers
- // exactly the 10 bytes encoding `"EDIT "` under UTF-16BE.
+    // Step 2 — engine-aware replace: the 5-text-unit ASCII prefix
+    // installed in step 1 is replaced with the mixed Cyrillic + CJK
+    // payload. `try_replace_range` resolves both endpoints through
+    // `byte_offset_for_col_with_engine` so the replacement covers
+    // exactly the 10 bytes encoding `"EDIT "` under UTF-16BE.
     doc.try_replace_range(0, 0, 5, NON_ASCII_INSERT)
         .expect("encoded replace-range must succeed for UTF-16BE");
 
- // Step 3 — engine-aware delete: drop the first text unit (the
- // leading `M` of the inserted payload). Length expressed in text
- // units, so `len_chars = 1` removes exactly one BMP cell (two
- // bytes) under UTF-16BE.
+    // Step 3 — engine-aware delete: drop the first text unit (the
+    // leading `M` of the inserted payload). Length expressed in text
+    // units, so `len_chars = 1` removes exactly one BMP cell (two
+    // bytes) under UTF-16BE.
     doc.try_replace_range(0, 0, 1, "")
         .expect("encoded delete-range must succeed for UTF-16BE");
 

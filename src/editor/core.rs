@@ -100,6 +100,15 @@ impl AsyncLifecycleState {
     }
 }
 
+#[derive(Clone)]
+struct CompletionNotifier(Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for CompletionNotifier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CompletionNotifier(..)")
+    }
+}
+
 #[derive(Debug)]
 struct SaveJob {
     path: Arc<PathBuf>,
@@ -125,6 +134,7 @@ pub(crate) struct SessionCore {
     save_job: Option<SaveJob>,
     async_state: AsyncLifecycleState,
     last_background_issue: Option<BackgroundIssue>,
+    completion_notifier: Option<CompletionNotifier>,
 }
 
 impl SessionCore {
@@ -136,7 +146,15 @@ impl SessionCore {
             save_job: None,
             async_state: AsyncLifecycleState::new(),
             last_background_issue: None,
+            completion_notifier: None,
         }
+    }
+
+    pub(super) fn set_completion_notifier(
+        &mut self,
+        notifier: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.completion_notifier = notifier.map(CompletionNotifier);
     }
 
     pub(super) fn generation(&self) -> u64 {
@@ -411,6 +429,7 @@ impl SessionCore {
             total_bytes,
             Arc::clone(&loaded_bytes),
             Arc::clone(&phase),
+            self.completion_notifier.clone(),
         );
         self.load_job = Some(LoadJob {
             path: job_path,
@@ -695,7 +714,11 @@ impl SessionCore {
         )?;
         let total_bytes = prepared.total_bytes();
         let written_bytes = Arc::new(AtomicU64::new(0));
-        let rx = spawn_save_worker(prepared, Arc::clone(&written_bytes));
+        let rx = spawn_save_worker(
+            prepared,
+            Arc::clone(&written_bytes),
+            self.completion_notifier.clone(),
+        );
         let job_path = Arc::new(path);
 
         self.save_job = Some(SaveJob {
@@ -744,11 +767,16 @@ impl SessionCore {
 fn spawn_save_worker(
     prepared: crate::document::PreparedSave,
     written_bytes: Arc<AtomicU64>,
+    notifier: Option<CompletionNotifier>,
 ) -> mpsc::Receiver<Result<SaveCompletion, DocumentError>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let result = prepared.execute(written_bytes);
-        let _ = tx.send(result);
+        if tx.send(result).is_ok() {
+            if let Some(notifier) = notifier {
+                (notifier.0)();
+            }
+        }
     });
     rx
 }
@@ -769,6 +797,7 @@ fn spawn_load_worker(
     total_bytes: u64,
     loaded_bytes: Arc<AtomicU64>,
     phase: Arc<AtomicU8>,
+    notifier: Option<CompletionNotifier>,
 ) -> mpsc::Receiver<Result<Document, DocumentError>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -784,7 +813,11 @@ fn spawn_load_worker(
                 phase.store(map_open_phase(open_phase).as_raw(), Ordering::Relaxed);
             },
         );
-        let _ = tx.send(result);
+        if tx.send(result).is_ok() {
+            if let Some(notifier) = notifier {
+                (notifier.0)();
+            }
+        }
     });
     rx
 }

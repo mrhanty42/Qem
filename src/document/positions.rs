@@ -43,7 +43,10 @@ fn next_piece_table_scan_line_range(
     })
 }
 
-fn count_text_units_in_bytes(bytes: &[u8]) -> usize {
+fn count_text_units_in_bytes(
+    engine: &dyn super::encoding_engine::EncodingEngine,
+    bytes: &[u8],
+) -> usize {
     let mut units = 0usize;
     let mut i = 0usize;
     while i < bytes.len() {
@@ -61,21 +64,17 @@ fn count_text_units_in_bytes(bytes: &[u8]) -> usize {
             }
             _ => {
                 units = units.saturating_add(1);
-                i += utf8_step(bytes, i, bytes.len());
+                let step = engine.step(bytes, i, bytes.len()).max(1);
+                i = i.saturating_add(step).min(bytes.len());
             }
         }
     }
     units
 }
 
-fn safe_piece_table_offset_for_position(piece_table: &PieceTable, position: TextPosition) -> usize {
-    Document::scanned_piece_table_offset_for_position(piece_table, position)
-        .map(|(offset, _)| offset)
-        .unwrap_or_else(|| piece_table.known_byte_len.min(piece_table.total_len()))
-}
-
 impl Document {
     pub(crate) fn piece_table_position_is_representable(
+        &self,
         piece_table: &PieceTable,
         position: TextPosition,
     ) -> bool {
@@ -98,10 +97,11 @@ impl Document {
             }
         }
 
+        let engine = self.encoding_engine();
         let line_len = if scanned.exact {
-            count_text_columns_exact(&bytes[..end])
+            engine.count_columns_exact(&bytes[..end])
         } else {
-            count_text_columns(&bytes[..end], MAX_LINE_SCAN_CHARS)
+            engine.count_columns_bounded(&bytes[..end], MAX_LINE_SCAN_CHARS)
         };
         position.col0() <= line_len
     }
@@ -117,8 +117,8 @@ impl Document {
             return false;
         }
 
-        !Self::piece_table_position_is_representable(piece_table, selection.anchor())
-            || !Self::piece_table_position_is_representable(piece_table, selection.head())
+        !self.piece_table_position_is_representable(piece_table, selection.anchor())
+            || !self.piece_table_position_is_representable(piece_table, selection.head())
     }
 
     fn scanned_piece_table_line_range(
@@ -164,6 +164,7 @@ impl Document {
     }
 
     fn scanned_piece_table_offset_for_position(
+        &self,
         piece_table: &PieceTable,
         position: TextPosition,
     ) -> Option<(usize, bool)> {
@@ -172,7 +173,7 @@ impl Document {
         let offset = byte_offset_for_text_col_in_bytes(&bytes, (0, bytes.len()), position.col0());
         Some((
             scanned.range.0.saturating_add(offset),
-            Self::piece_table_position_is_representable(piece_table, position),
+            self.piece_table_position_is_representable(piece_table, position),
         ))
     }
 
@@ -362,13 +363,19 @@ impl Document {
             return Self::line_col_to_char_index(rope, position.line0(), position.col0());
         }
         if let Some(piece_table) = &self.piece_table {
-            let offset = safe_piece_table_offset_for_position(piece_table, position);
-            return count_text_units_in_bytes(&piece_table.read_range(0, offset));
+            let offset = self
+                .scanned_piece_table_offset_for_position(piece_table, position)
+                .map(|(offset, _)| offset)
+                .unwrap_or_else(|| piece_table.known_byte_len.min(piece_table.total_len()));
+            return count_text_units_in_bytes(
+                self.encoding_engine(),
+                &piece_table.read_range(0, offset),
+            );
         }
         let bytes = self.mmap_bytes();
         let file_len = self.file_len.min(bytes.len());
         let offset = self.mmap_byte_offset_for_position(position).min(file_len);
-        count_text_units_in_bytes(&bytes[..offset])
+        count_text_units_in_bytes(self.encoding_engine(), &bytes[..offset])
     }
 
     /// Returns the number of edit text units between two typed positions.
@@ -388,9 +395,17 @@ impl Document {
             return end_idx.saturating_sub(start_idx);
         }
         if let Some(piece_table) = &self.piece_table {
-            let start_offset = safe_piece_table_offset_for_position(piece_table, start);
-            let end_offset = safe_piece_table_offset_for_position(piece_table, end);
+            let fallback_offset = || piece_table.known_byte_len.min(piece_table.total_len());
+            let start_offset = self
+                .scanned_piece_table_offset_for_position(piece_table, start)
+                .map(|(offset, _)| offset)
+                .unwrap_or_else(fallback_offset);
+            let end_offset = self
+                .scanned_piece_table_offset_for_position(piece_table, end)
+                .map(|(offset, _)| offset)
+                .unwrap_or_else(fallback_offset);
             return count_text_units_in_bytes(
+                self.encoding_engine(),
                 &piece_table.read_range(start_offset.min(end_offset), end_offset.max(start_offset)),
             );
         }
@@ -400,6 +415,7 @@ impl Document {
         let start_offset = self.mmap_byte_offset_for_position(start).min(file_len);
         let end_offset = self.mmap_byte_offset_for_position(end).min(file_len);
         count_text_units_in_bytes(
+            self.encoding_engine(),
             &bytes[start_offset.min(end_offset)..end_offset.max(start_offset)],
         )
     }

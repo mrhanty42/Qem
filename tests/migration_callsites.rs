@@ -43,17 +43,17 @@ const MIGRATED_FILES: &[&str] = &[
 #[test]
 fn migrated_files_have_no_direct_free_helper_calls() {
     for file in MIGRATED_FILES {
-        let content = fs::read_to_string(file)
-            .unwrap_or_else(|e| panic!("failed to read {file}: {e}"));
+        let content =
+            fs::read_to_string(file).unwrap_or_else(|e| panic!("failed to read {file}: {e}"));
 
         for sym in FORBIDDEN_SYMBOLS {
- // Look for the symbol followed by `(`, which is how Rust
- // function calls land in source. Mentions inside comments
- // (e.g. "wraps utf8_step") almost never use that exact
- // form, so the false-positive rate is low.
+            // Look for the symbol followed by `(`, which is how Rust
+            // function calls land in source. Mentions inside comments
+            // (e.g. "wraps utf8_step") almost never use that exact
+            // form, so the false-positive rate is low.
             let needle = format!("{sym}(");
             if let Some(idx) = content.find(needle.as_str()) {
- // Count the line number for a better diagnostic.
+                // Count the line number for a better diagnostic.
                 let line = content[..idx].matches('\n').count() + 1;
                 panic!(
                     "{file}:{line} contains a direct call to `{sym}(...)`. \

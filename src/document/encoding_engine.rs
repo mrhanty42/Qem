@@ -157,7 +157,7 @@ impl EncodingEngine for Utf8Engine {
     }
 
     fn next_line_start(&self, bytes: &[u8], file_len: usize, line_start: usize) -> usize {
-        super::search::next_line_start_exact(bytes, file_len, line_start)
+        super::search::utf8_next_line_start(bytes, file_len, line_start)
     }
 
     fn count_columns_exact(&self, bytes: &[u8]) -> usize {
@@ -294,7 +294,7 @@ impl EncodingEngine for SingleByteEngine {
         // CR / LF / CRLF detection is byte-identical to UTF-8 for every
         // ASCII-superset single-byte encoding because none of them remap
         // 0x0A or 0x0D.
-        super::search::next_line_start_exact(bytes, file_len, line_start)
+        super::search::utf8_next_line_start(bytes, file_len, line_start)
     }
 
     fn count_columns_exact(&self, bytes: &[u8]) -> usize {
@@ -948,7 +948,16 @@ pub(crate) mod multibyte {
         /// multi-byte sequence fall back to `1` so the cursor still
         /// advances on malformed tails.
         fn step(&self, bytes: &[u8], offset: usize, end: usize) -> usize {
-            self.char_len(bytes, offset, end)
+            let end = end.min(bytes.len());
+            if offset >= end {
+                return 0;
+            }
+
+            // `char_len` currently returns at least one for every byte in
+            // range, including malformed or truncated sequences. Keep that
+            // progress guarantee explicit at the trait boundary so no future
+            // detector change can make an engine-driven loop stall.
+            self.char_len(bytes, offset, end).max(1)
         }
 
         /// Backward step via scan-from-anchor.
@@ -1822,7 +1831,7 @@ mod tests {
         let engine = gb18030_engine();
         assert_eq!(engine.step(&bytes, 0, bytes.len()), 2);
         // ASCII byte is 1 byte.
-        let ascii = [b'A'];
+        let ascii = *b"A";
         assert_eq!(engine.step(&ascii, 0, ascii.len()), 1);
     }
 
@@ -1853,7 +1862,7 @@ mod tests {
         let engine = euc_kr_engine();
         assert_eq!(engine.step(&bytes, 0, bytes.len()), 2);
         // ASCII byte (lead < 0x81) is 1 byte.
-        let ascii = [b'A'];
+        let ascii = *b"A";
         assert_eq!(engine.step(&ascii, 0, ascii.len()), 1);
         // Lead 0x80 (below the 0x81..=0xFE range) is treated as 1 byte.
         let lone = [0x80u8, 0x41];

@@ -80,11 +80,11 @@ fn opens_and_indexes_lines() {
     let doc = Document::open_with_encoding(&path, requested)
         .expect("open_with_encoding(ISO-8859-1) must succeed for valid fixture");
 
- // `encoding_rs` aliases `ISO-8859-1` to `windows-1252`. The
- // installed contract reflects the canonical alias rather than the
- // requested label string; the document still self-reports as
- // equal to the encoding the caller passed in (the alias and the
- // requested encoding share `&'static Encoding`).
+    // `encoding_rs` aliases `ISO-8859-1` to `windows-1252`. The
+    // installed contract reflects the canonical alias rather than the
+    // requested label string; the document still self-reports as
+    // equal to the encoding the caller passed in (the alias and the
+    // requested encoding share `&'static Encoding`).
     assert_eq!(doc.encoding(), requested);
     assert_eq!(
         doc.encoding().name(),
@@ -171,12 +171,12 @@ const NON_ASCII_INSERT: &str = "café";
 
 #[test]
 fn edit_and_save_round_trip() {
- // — fifth contract. Validates (edit + save
- // round-trip) and (save fidelity) for the WHATWG `ISO-8859-1`
- // alias (canonicalised to `windows-1252`) through the
- // encoded edit path: insert ASCII, insert representable non-ASCII
- // delete a range, save, reopen, and assert the decoded text round-
- // trips byte-identically against the in-memory document.
+    // — fifth contract. Validates (edit + save
+    // round-trip) and (save fidelity) for the WHATWG `ISO-8859-1`
+    // alias (canonicalised to `windows-1252`) through the
+    // encoded edit path: insert ASCII, insert representable non-ASCII
+    // delete a range, save, reopen, and assert the decoded text round-
+    // trips byte-identically against the in-memory document.
     let dir = fresh_test_dir("per_encoding_latin1_edit");
     let path = dir.join("fixture.txt");
     let saved = dir.join("fixture.saved.txt");

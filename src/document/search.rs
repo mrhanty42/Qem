@@ -1,3 +1,5 @@
+use super::alignment::AlignDirection;
+use super::encoding_engine::EncodingEngine;
 use super::*;
 use memchr::memmem::{Finder, FinderRev};
 
@@ -33,7 +35,11 @@ impl PositionScanState {
     }
 }
 
-fn scan_position_bytes(bytes: &[u8], state: &mut PositionScanState) {
+fn scan_position_bytes(
+    engine: &dyn super::encoding_engine::EncodingEngine,
+    bytes: &[u8],
+    state: &mut PositionScanState,
+) {
     let mut i = 0usize;
     while i < bytes.len() {
         match bytes[i] {
@@ -54,7 +60,8 @@ fn scan_position_bytes(bytes: &[u8], state: &mut PositionScanState) {
             _ => {
                 state.prev_was_cr = false;
                 state.col0 = state.col0.saturating_add(1);
-                i += utf8_step(bytes, i, bytes.len());
+                let step = engine.step(bytes, i, bytes.len()).max(1);
+                i = i.saturating_add(step).min(bytes.len());
             }
         }
     }
@@ -79,7 +86,10 @@ pub(super) fn search_text_units(text: &str) -> usize {
             }
             _ => {
                 units += 1;
-                i += utf8_step(bytes, i, bytes.len());
+                let step = super::encoding_engine::Utf8Engine
+                    .step(bytes, i, bytes.len())
+                    .max(1);
+                i = i.saturating_add(step).min(bytes.len());
             }
         }
     }
@@ -88,11 +98,11 @@ pub(super) fn search_text_units(text: &str) -> usize {
 
 pub(super) fn advance_position_by_bytes(start: TextPosition, bytes: &[u8]) -> TextPosition {
     let mut state = PositionScanState::new(start.line0(), start.col0());
-    scan_position_bytes(bytes, &mut state);
+    scan_position_bytes(&super::encoding_engine::Utf8Engine, bytes, &mut state);
     state.position()
 }
 
-pub(super) fn next_line_start_exact(bytes: &[u8], file_len: usize, line_start: usize) -> usize {
+pub(super) fn utf8_next_line_start(bytes: &[u8], file_len: usize, line_start: usize) -> usize {
     let line_start = line_start.min(file_len);
     if line_start >= file_len {
         return file_len;
@@ -1193,8 +1203,13 @@ impl Document {
         let line_end = self
             .encoding_engine()
             .next_line_start(bytes, file_len, line_start);
-        byte_offset_for_text_col_in_bytes(bytes, (line_start, line_end), position.col0())
-            .min(file_len)
+        super::byte_offset_for_text_col_with_engine(
+            bytes,
+            (line_start, line_end),
+            position.col0(),
+            self.encoding_engine(),
+        )
+        .min(file_len)
     }
 
     pub(super) fn mmap_position_for_byte_offset(&self, byte_offset: usize) -> TextPosition {
@@ -1213,7 +1228,11 @@ impl Document {
         }
 
         let mut state = PositionScanState::new(line0, 0);
-        scan_position_bytes(&bytes[line_start..target], &mut state);
+        scan_position_bytes(
+            self.encoding_engine(),
+            &bytes[line_start..target],
+            &mut state,
+        );
         state.position()
     }
 
@@ -1291,7 +1310,11 @@ impl Document {
         }
 
         let mut state = PositionScanState::new(anchor_position.line0(), anchor_position.col0());
-        scan_position_bytes(&bytes[anchor_offset..target], &mut state);
+        scan_position_bytes(
+            self.encoding_engine(),
+            &bytes[anchor_offset..target],
+            &mut state,
+        );
         state.position()
     }
 
@@ -1332,9 +1355,14 @@ impl Document {
                 }
                 _ => {
                     remaining = remaining.saturating_sub(1);
-                    let step = engine.step(bytes, i, file_len);
-                    i += step;
-                    offset = offset.saturating_add(step);
+                    // A malformed or truncated tail (notably an odd final byte
+                    // in UTF-16 storage) must still advance. UTF-16 `step`
+                    // returns 0 when fewer than two bytes remain, so using it
+                    // unchecked here made huge open-ended ranges loop forever
+                    // on the final byte.
+                    let step = engine.step(bytes, i, file_len).max(1);
+                    i = i.saturating_add(step).min(file_len);
+                    offset = offset.saturating_add(step).min(file_len);
                 }
             }
         }
@@ -1348,10 +1376,11 @@ impl Document {
             return rope.char_to_byte(char_index);
         }
         if let Some(piece_table) = &self.piece_table {
-            return scanned_piece_table_byte_offset_for_position(piece_table, position)
+            let offset = scanned_piece_table_byte_offset_for_position(piece_table, position)
                 .unwrap_or_else(|| {
                     piece_table.byte_offset_for_col(position.line0(), position.col0())
                 });
+            return self.align_byte_offset(offset, AlignDirection::Backward);
         }
         self.mmap_byte_offset_for_position(position)
     }
@@ -1496,7 +1525,10 @@ impl PieceTable {
         let mut i = 0usize;
         while i < bytes.len() {
             units = units.saturating_add(1);
-            i += utf8_step(&bytes, i, bytes.len());
+            let step = super::encoding_engine::Utf8Engine
+                .step(&bytes, i, bytes.len())
+                .max(1);
+            i = i.saturating_add(step).min(bytes.len());
         }
         (units <= anchor_position.col0())
             .then(|| TextPosition::new(anchor_position.line0(), anchor_position.col0() - units))
@@ -1514,7 +1546,11 @@ impl PieceTable {
                 let seg_start = piece.start + local_start;
                 let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
-                scan_position_bytes(&src[seg_start..seg_end], &mut state);
+                scan_position_bytes(
+                    &super::encoding_engine::Utf8Engine,
+                    &src[seg_start..seg_end],
+                    &mut state,
+                );
             });
         state.position()
     }
@@ -1537,7 +1573,11 @@ impl PieceTable {
                 let seg_start = piece.start + local_start;
                 let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
-                scan_position_bytes(&src[seg_start..seg_end], &mut state);
+                scan_position_bytes(
+                    &super::encoding_engine::Utf8Engine,
+                    &src[seg_start..seg_end],
+                    &mut state,
+                );
             });
         state.position()
     }
