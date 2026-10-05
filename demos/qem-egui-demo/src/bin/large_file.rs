@@ -1,6 +1,6 @@
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, DragValue, FontFamily, FontId, Key, Layout, Margin,
-    ProgressBar, Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, Vec2,
+    self, Align, Color32, CornerRadius, DragValue, FontFamily, FontId, Id, Key, Layout, Margin,
+    Modal, ProgressBar, Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, Vec2,
 };
 use qem::{DocumentSession, EditCapability, TextPosition, ViewportRequest};
 use std::path::PathBuf;
@@ -51,6 +51,9 @@ struct LargeFileDemo {
     editor_has_focus: bool,
     notice: String,
     pending_open: Option<PathBuf>,
+    close_prompt: bool,
+    close_after_save: bool,
+    goto_field_focused: bool,
 }
 
 impl LargeFileDemo {
@@ -67,6 +70,9 @@ impl LargeFileDemo {
             editor_has_focus: false,
             notice: String::from("Large-file viewport demo ready."),
             pending_open: initial_path,
+            close_prompt: false,
+            close_after_save: false,
+            goto_field_focused: false,
         }
     }
 
@@ -79,9 +85,15 @@ impl LargeFileDemo {
             match result {
                 Ok(()) => {
                     self.clamp_state();
+                    if self.close_after_save && !self.session.is_dirty() {
+                        self.close_after_save = false;
+                        self.close_document();
+                        return;
+                    }
                     self.notice = String::from("Background operation completed.");
                 }
                 Err(err) => {
+                    self.close_after_save = false;
                     self.notice = format!("Background operation failed: {err}");
                 }
             }
@@ -103,7 +115,9 @@ impl LargeFileDemo {
         self.first_line0 = self.first_line0.min(max_first_line0);
 
         self.ensure_caret_visible();
-        self.goto_line = (self.caret.line0() + 1).to_string();
+        if !self.goto_field_focused {
+            self.goto_line = (self.caret.line0() + 1).to_string();
+        }
     }
 
     fn ensure_caret_visible(&mut self) {
@@ -146,14 +160,46 @@ impl LargeFileDemo {
         }
     }
 
+    fn request_close(&mut self) {
+        if self.session.is_busy() {
+            self.notice = String::from("Wait for the current file operation.");
+            return;
+        }
+        if self.session.is_dirty() {
+            // Unsaved edits are about to be discarded: ask first, matching
+            // the main editor demo's close behavior.
+            self.close_prompt = true;
+            return;
+        }
+        self.close_document();
+    }
+
     fn close_document(&mut self) {
         self.session.close_file();
+        self.close_after_save = false;
+        self.close_prompt = false;
         self.caret = TextPosition::new(0, 0);
         self.desired_col = 0;
         self.first_line0 = 0;
         self.goto_line = String::from("1");
         self.editor_has_focus = false;
         self.notice = String::from("Document closed.");
+    }
+
+    fn close_prompt_save(&mut self) {
+        self.close_prompt = false;
+        match self.session.save_async() {
+            Ok(true) => {
+                self.close_after_save = true;
+                self.notice = String::from("Save started; the document will close when done.");
+            }
+            Ok(false) => {
+                self.close_document();
+            }
+            Err(err) => {
+                self.notice = format!("Save failed: {err}");
+            }
+        }
     }
 
     fn save_current(&mut self) {
@@ -202,7 +248,9 @@ impl LargeFileDemo {
         self.caret = self.session.clamp_position(caret);
         self.desired_col = self.caret.col0();
         self.ensure_caret_visible();
-        self.goto_line = (self.caret.line0() + 1).to_string();
+        if !self.goto_field_focused {
+            self.goto_line = (self.caret.line0() + 1).to_string();
+        }
     }
 
     fn move_home(&mut self) {
@@ -324,7 +372,7 @@ impl LargeFileDemo {
     }
 
     fn handle_editor_input(&mut self, ctx: &egui::Context) {
-        if !self.editor_has_focus || self.session.is_busy() {
+        if self.close_prompt || !self.editor_has_focus || self.session.is_busy() {
             return;
         }
 
@@ -420,7 +468,7 @@ impl LargeFileDemo {
                             .add_enabled(has_path, egui::Button::new("Close"))
                             .clicked()
                         {
-                            self.close_document();
+                            self.request_close();
                         }
                         if ui
                             .add_enabled(!busy, egui::Button::new("Save As"))
@@ -531,6 +579,7 @@ impl LargeFileDemo {
                     ui.label("Go to line");
                     let goto_response =
                         ui.add(TextEdit::singleline(&mut self.goto_line).desired_width(90.0));
+                    self.goto_field_focused = goto_response.has_focus();
                     if goto_response.has_focus() {
                         self.editor_has_focus = false;
                     }
@@ -758,7 +807,14 @@ impl LargeFileDemo {
                     .corner_radius(CornerRadius::same(6))
                     .show(ui, |ui| {
                         let font = FontId::new(14.0, FontFamily::Monospace);
-                        let char_width = 8.4_f32;
+                        // Measure the real monospace glyph width instead of
+                        // guessing a constant, so the caret and click column
+                        // mapping stay glued to the rendered text.
+                        let char_width = ui
+                            .fonts_mut(|fonts| {
+                                fonts.glyph_width(&FontId::new(14.0, FontFamily::Monospace), 'M')
+                            })
+                            .max(7.0_f32);
                         let content_width =
                             GUTTER_WIDTH + (self.viewport_cols.max(1) as f32 * char_width) + 28.0;
 
@@ -878,9 +934,56 @@ impl eframe::App for LargeFileDemo {
         self.render_status_bar(ctx);
         self.render_sidebar(ctx);
         self.render_editor(ctx);
+        self.render_close_prompt(ctx);
 
         if self.session.is_busy() || self.session.is_indexing() {
             ctx.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+}
+
+impl LargeFileDemo {
+    fn render_close_prompt(&mut self, ctx: &egui::Context) {
+        if !self.close_prompt {
+            return;
+        }
+        let mut decision = None;
+        let response = Modal::new(Id::new("large-file-close-dirty"))
+            .frame(
+                egui::Frame::popup(&ctx.style())
+                    .fill(PANEL)
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.heading("Unsaved changes");
+                ui.add_space(8.0);
+                ui.label("Discard unsaved changes in this document?");
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        decision = Some(1);
+                    }
+                    if ui.button("Don't Save").clicked() {
+                        decision = Some(2);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(3);
+                    }
+                });
+            });
+        if decision.is_none() && (response.should_close() || response.backdrop_response.clicked()) {
+            decision = Some(3);
+        }
+        match decision {
+            Some(1) => self.close_prompt_save(),
+            Some(2) => {
+                self.close_prompt = false;
+                self.close_document();
+            }
+            Some(3) => self.close_prompt = false,
+            _ => {}
         }
     }
 }

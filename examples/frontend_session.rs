@@ -77,10 +77,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if session.save_as_async(output.clone())? {
             wait_for_save(&mut session, Duration::from_secs(5))?;
+            println!("saved copy: {}", output.display());
+            println!("dirty after save: {}", session.is_dirty());
+        } else {
+            println!(
+                "document already clean; nothing written to {}",
+                output.display()
+            );
         }
-
-        println!("saved copy: {}", output.display());
-        println!("dirty after save: {}", session.is_dirty());
     }
 
     Ok(())

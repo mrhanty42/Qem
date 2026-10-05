@@ -1,14 +1,21 @@
+// Release builds run as a plain GUI app: no console window is allocated, so
+// an accidental QuickEdit text selection in a console can never block the UI
+// thread inside a stderr write.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Id, Key, Layout, Margin, Modal, Rect,
     RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, Vec2,
 };
 use qem::{
-    DocumentEncoding, DocumentSession, LiteralSearchQuery, SearchMatch, TextPosition,
-    TextSelection, ViewportRequest,
+    BackgroundActivity, DocumentEncoding, DocumentSession, LiteralSearchQuery, SearchMatch,
+    TextPosition, TextSelection, ViewportRequest,
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 const BG: Color32 = Color32::from_rgb(15, 17, 21);
 const PANEL: Color32 = Color32::from_rgb(20, 23, 28);
@@ -48,14 +55,25 @@ struct UiTab {
     session: DocumentSession,
     caret: TextPosition,
     desired_col: usize,
+    /// Anchor of the active mouse selection; the head is the caret.
+    selection_anchor: Option<TextPosition>,
     search_match: Option<SearchMatch>,
     editor_has_focus: bool,
     reveal_caret: bool,
-    requested_scroll_y: Option<f32>,
-    scroll_y: f32,
+    /// First logical line shown in the bounded editor window.
+    ///
+    /// This is deliberately an integer, rather than an egui pixel offset:
+    /// `line * row_height` loses line identity once a huge file exceeds f32
+    /// precision.
+    first_line: usize,
+    /// A goto target remains pending until the backend returns that exact row.
+    pending_goto: Option<usize>,
+    wheel_remainder: f32,
     untitled_name: String,
     notice: Notice,
     close_after_save: bool,
+    /// Rows currently visible in the editor viewport; drives PageUp/PageDown.
+    visible_rows: usize,
 }
 
 impl UiTab {
@@ -65,14 +83,17 @@ impl UiTab {
             session: DocumentSession::new(),
             caret: TextPosition::new(0, 0),
             desired_col: 0,
+            selection_anchor: None,
             search_match: None,
             editor_has_focus: true,
             reveal_caret: false,
-            requested_scroll_y: None,
-            scroll_y: 0.0,
+            first_line: 0,
+            pending_goto: None,
+            wheel_remainder: 0.0,
             untitled_name: format!("Untitled {untitled_number}"),
             notice: Notice::info("Ready"),
             close_after_save: false,
+            visible_rows: 30,
         }
     }
 
@@ -86,15 +107,72 @@ impl UiTab {
     }
 
     fn set_caret(&mut self, position: TextPosition) {
-        self.caret = self.session.clamp_position(position);
+        let clamped = self.session.clamp_position(position);
+        // Exact viewport rows may lie beyond editable metadata. Never turn
+        // a click on such a row into a caret on an unrelated prefix line.
+        self.caret = if clamped.line0() == position.line0() {
+            clamped
+        } else {
+            position
+        };
         self.desired_col = self.caret.col0();
+        // Every programmatic caret move collapses the selection. Only the
+        // selection-specific paths (drag, Shift+click, Shift+arrows) manage
+        // the anchor explicitly; a stale anchor here would make the next
+        // typed character delete everything between it and the new caret.
+        self.selection_anchor = None;
         self.editor_has_focus = true;
         self.reveal_caret = true;
     }
 
+    /// Returns the active mouse selection, if it spans more than a caret.
+    fn active_selection(&self) -> Option<TextSelection> {
+        let anchor = self.selection_anchor?;
+        let selection = TextSelection::new(anchor, self.caret);
+        (!selection.is_caret()).then_some(selection)
+    }
+
+    fn collapse_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    /// Starts or keeps a selection across a navigation move: without Shift the
+    /// selection collapses, with Shift it extends from the previous anchor or
+    /// the caret the move started from.
+    fn finish_navigation(&mut self, extend: bool, caret_before: TextPosition) {
+        if extend {
+            self.selection_anchor.get_or_insert(caret_before);
+        } else {
+            self.selection_anchor = None;
+        }
+    }
+
+    /// Move the bounded logical window without converting a line number to a
+    /// large absolute pixel coordinate.
     fn reveal_line(&mut self, line0: usize) {
-        self.requested_scroll_y = Some(line0 as f32 * ROW_HEIGHT);
+        let rows = self.visible_rows.max(1);
+        let last = self.first_line.saturating_add(rows.saturating_sub(1));
+        if line0 < self.first_line {
+            self.first_line = line0;
+        } else if line0 > last {
+            self.first_line = line0.saturating_sub(rows.saturating_sub(1));
+        }
         self.reveal_caret = true;
+    }
+
+    fn set_first_line(&mut self, first_line: usize, total: usize) {
+        let page = self.visible_rows.max(1);
+        let max_first = total.saturating_sub(page);
+        self.first_line = first_line.min(max_first);
+    }
+
+    fn move_view_by(&mut self, delta: isize, total: usize) {
+        let next = if delta.is_negative() {
+            self.first_line.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.first_line.saturating_add(delta as usize)
+        };
+        self.set_first_line(next, total);
     }
 }
 
@@ -170,6 +248,7 @@ enum MenuAction {
     CenterCaret,
     ClearSearchHighlight,
     ToggleSearch,
+    GoToLine,
 }
 
 struct EditorApp {
@@ -182,6 +261,7 @@ struct EditorApp {
     close_queue: VecDeque<u64>,
     close_prompt: Option<u64>,
     rename_dialog: Option<RenameDialog>,
+    goto_dialog: Option<String>,
 }
 
 impl EditorApp {
@@ -197,6 +277,7 @@ impl EditorApp {
             close_queue: VecDeque::new(),
             close_prompt: None,
             rename_dialog: None,
+            goto_dialog: None,
         };
         if let Some(path) = initial_path {
             app.open_path(path);
@@ -275,9 +356,11 @@ impl EditorApp {
             Ok(()) => {
                 tab.caret = TextPosition::new(0, 0);
                 tab.desired_col = 0;
+                tab.selection_anchor = None;
                 tab.search_match = None;
-                tab.scroll_y = 0.0;
-                tab.requested_scroll_y = Some(0.0);
+                tab.first_line = 0;
+                tab.pending_goto = None;
+                tab.wheel_remainder = 0.0;
                 tab.notice = Notice::info(format!("Opening {}", path.display()));
             }
             Err(error) => tab.notice = Notice::error(format!("Open failed: {error}")),
@@ -288,13 +371,28 @@ impl EditorApp {
         let mut close_ids = Vec::new();
         let mut close_save_failed = false;
         for tab in &mut self.tabs {
+            let activity = tab.session.background_activity();
             if let Some(result) = tab.session.poll_background_job() {
                 match result {
                     Ok(()) => {
-                        tab.caret = tab.session.clamp_position(tab.caret);
-                        tab.desired_col = tab.caret.col0();
-                        tab.reveal_line(tab.caret.line0());
-                        tab.notice = Notice::info("Ready");
+                        if !matches!(activity, BackgroundActivity::Saving(_)) {
+                            tab.caret = tab.session.clamp_position(tab.caret);
+                            tab.desired_col = tab.caret.col0();
+                            // The document was replaced (open/reload): a stale
+                            // selection anchor must not survive into it.
+                            tab.collapse_selection();
+                        }
+                        match activity {
+                            BackgroundActivity::Saving(_) => {
+                                // Keep the viewport where the user left it;
+                                // a save never moves the text the caret sees.
+                                tab.notice = Notice::info("Saved");
+                            }
+                            _ => {
+                                tab.reveal_line(tab.caret.line0());
+                                tab.notice = Notice::info("Ready");
+                            }
+                        }
                         if tab.close_after_save && !tab.session.is_dirty() {
                             close_ids.push(tab.id);
                         }
@@ -377,8 +475,7 @@ impl EditorApp {
         if let Some(encoding) = encoding {
             if let Some(error) = self.tabs[index].session.save_error_for_encoding(encoding) {
                 let label = encoding_label.unwrap_or("selected encoding");
-                self.tabs[index].notice =
-                    Notice::error(format!("Cannot save as {label}: {error:?}"));
+                self.tabs[index].notice = Notice::error(format!("Cannot save as {label}: {error}"));
                 if close_after_save {
                     self.close_queue.clear();
                 }
@@ -530,6 +627,14 @@ impl EditorApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let command = ctx.input(|input| input.modifiers.command || input.modifiers.ctrl);
+        // While the search or rename text field owns the keyboard, the
+        // field-native clipboard/undo behavior wins: document-level
+        // Copy/Cut/Undo/Redo chords must not fire behind the widget.
+        let text_field_focused = ctx.memory(|memory| memory.focused()).is_some_and(|id| {
+            id == Id::new("qem-search-field")
+                || id == Id::new("qem-rename-field")
+                || id == Id::new("qem-goto-field")
+        });
         if command && ctx.input(|input| input.key_pressed(Key::N)) {
             self.new_tab();
         }
@@ -551,11 +656,20 @@ impl EditorApp {
         if command && ctx.input(|input| input.key_pressed(Key::W)) {
             self.request_close(self.active_tab_id);
         }
-        if command && ctx.input(|input| input.key_pressed(Key::Z)) {
+        if command && !text_field_focused && ctx.input(|input| input.key_pressed(Key::Z)) {
             self.apply_menu_action(ctx, MenuAction::Undo);
         }
-        if command && ctx.input(|input| input.key_pressed(Key::Y)) {
+        if command && !text_field_focused && ctx.input(|input| input.key_pressed(Key::Y)) {
             self.apply_menu_action(ctx, MenuAction::Redo);
+        }
+        if command && !text_field_focused && ctx.input(|input| input.key_pressed(Key::C)) {
+            self.apply_menu_action(ctx, MenuAction::CopyMatch);
+        }
+        if command && !text_field_focused && ctx.input(|input| input.key_pressed(Key::X)) {
+            self.apply_menu_action(ctx, MenuAction::CutMatch);
+        }
+        if command && ctx.input(|input| input.key_pressed(Key::G)) {
+            self.apply_menu_action(ctx, MenuAction::GoToLine);
         }
         if ctx.input(|input| input.key_pressed(Key::Tab) && input.modifiers.ctrl) {
             if ctx.input(|input| input.modifiers.shift) {
@@ -564,21 +678,82 @@ impl EditorApp {
                 self.switch_tab(1);
             }
         }
-        if ctx.input(|input| input.key_pressed(Key::Escape)) && self.search_open {
-            self.search_open = false;
-            self.active_tab_mut().search_match = None;
-            self.active_tab_mut().editor_has_focus = true;
+        if ctx.input(|input| input.key_pressed(Key::Escape)) {
+            if !self.search_open && self.active_tab().selection_anchor.is_some() {
+                self.active_tab_mut().collapse_selection();
+            } else if self.search_open {
+                self.search_open = false;
+                self.active_tab_mut().search_match = None;
+                self.active_tab_mut().editor_has_focus = true;
+            }
         }
     }
 
     fn editor_input(&mut self, ctx: &egui::Context) {
-        if self.search_open || self.active_tab().session.is_busy() {
+        if self.search_open
+            || self.close_prompt.is_some()
+            || self.rename_dialog.is_some()
+            || self.goto_dialog.is_some()
+            || self.active_tab().pending_goto.is_some()
+            || self.active_tab().session.is_busy()
+        {
             return;
         }
         if !self.active_tab().editor_has_focus {
             return;
         }
         for event in ctx.input(|input| input.events.clone()) {
+            // Library edits clamp to their editable prefix. Navigation may
+            // legitimately be beyond it, but an edit must never be redirected.
+            let mutation = match &event {
+                egui::Event::Text(_) | egui::Event::Paste(_) => true,
+                egui::Event::Key {
+                    key, pressed: true, ..
+                } => {
+                    matches!(key, Key::Enter | Key::Backspace | Key::Delete)
+                }
+                _ => false,
+            };
+            if mutation {
+                let tab = self.active_tab_mut();
+                if tab.session.clamp_position(tab.caret) != tab.caret {
+                    // The typed reason from the backend tells the user whether
+                    // the line is temporarily unresolvable or permanently
+                    // outside the bounded edit window.
+                    let reason = match tab.session.edit_capability_at(tab.caret) {
+                        qem::EditCapability::Unsupported { reason, .. } => reason.to_owned(),
+                        _ => "This line is visible but not yet available for editing".to_owned(),
+                    };
+                    tab.notice = Notice::error(reason);
+                    continue;
+                }
+                // Typing, pasting, Backspace and Delete replace or remove the
+                // active selection before the per-event handling runs.
+                if let Some(selection) = tab.active_selection() {
+                    let result = tab.session.try_delete_selection(selection);
+                    match result {
+                        Ok(result) => {
+                            let tab = self.active_tab_mut();
+                            tab.set_caret(result.cursor());
+                            tab.collapse_selection();
+                        }
+                        Err(error) => {
+                            self.active_tab_mut().notice = Notice::error(error.to_string());
+                            continue;
+                        }
+                    }
+                    // A bare Backspace/Delete press has now done its whole job.
+                    if matches!(
+                        &event,
+                        egui::Event::Key {
+                            key: Key::Backspace | Key::Delete,
+                            ..
+                        }
+                    ) {
+                        continue;
+                    }
+                }
+            }
             match event {
                 egui::Event::Text(text) if !text.chars().any(char::is_control) => {
                     self.insert(&text);
@@ -590,21 +765,59 @@ impl EditorApp {
                     modifiers,
                     ..
                 } if !modifiers.command && !modifiers.ctrl && !modifiers.alt => match key {
-                    Key::ArrowLeft => self.move_left(),
-                    Key::ArrowRight => self.move_right(),
-                    Key::ArrowUp => self.move_vertical(-1),
-                    Key::ArrowDown => self.move_vertical(1),
-                    Key::PageUp => self.move_vertical(-30),
-                    Key::PageDown => self.move_vertical(30),
+                    Key::ArrowLeft => {
+                        let before = self.active_tab().caret;
+                        self.move_left();
+                        self.active_tab_mut()
+                            .finish_navigation(modifiers.shift, before);
+                    }
+                    Key::ArrowRight => {
+                        let before = self.active_tab().caret;
+                        self.move_right();
+                        self.active_tab_mut()
+                            .finish_navigation(modifiers.shift, before);
+                    }
+                    Key::ArrowUp => {
+                        let before = self.active_tab().caret;
+                        self.move_vertical(-1);
+                        self.active_tab_mut()
+                            .finish_navigation(modifiers.shift, before);
+                    }
+                    Key::ArrowDown => {
+                        let before = self.active_tab().caret;
+                        self.move_vertical(1);
+                        self.active_tab_mut()
+                            .finish_navigation(modifiers.shift, before);
+                    }
+                    Key::PageUp => {
+                        let before = self.active_tab().caret;
+                        let page = self.active_tab().visible_rows.max(1) as isize;
+                        self.move_vertical(-page);
+                        self.active_tab_mut()
+                            .finish_navigation(modifiers.shift, before);
+                    }
+                    Key::PageDown => {
+                        let before = self.active_tab().caret;
+                        let page = self.active_tab().visible_rows.max(1) as isize;
+                        self.move_vertical(page);
+                        self.active_tab_mut()
+                            .finish_navigation(modifiers.shift, before);
+                    }
                     Key::Home => {
+                        let before = self.active_tab().caret;
                         let line = self.active_tab().caret.line0();
                         self.active_tab_mut().set_caret(TextPosition::new(line, 0));
+                        self.active_tab_mut()
+                            .finish_navigation(modifiers.shift, before);
                     }
                     Key::End => {
+                        let before = self.active_tab().caret;
                         let line = self.active_tab().caret.line0();
                         let col = self.active_tab().session.line_len_chars(line);
                         self.active_tab_mut()
                             .set_caret(TextPosition::new(line, col));
+                        self.active_tab_mut()
+                            .finish_navigation(modifiers.shift, before);
                     }
                     Key::Enter => {
                         let ending = self.active_tab().session.line_ending().as_str().to_owned();
@@ -701,17 +914,15 @@ impl EditorApp {
         let busy = status.is_busy();
         let title = tab.title();
         let current_encoding = tab.session.encoding();
+        // Encoding availability is NOT pre-validated here: the conversion
+        // preflight (`save_error_for_encoding`) materializes the whole
+        // document for the encode check, which on a 50 GiB file froze the
+        // render loop when invoked per frame for every menu entry. The
+        // entries stay enabled and the same typed check runs once, on
+        // selection, inside `save_tab_as`.
         let encoding_availability: Vec<_> = encoding_choices()
             .into_iter()
-            .map(|label| {
-                let target = DocumentEncoding::from_label(label);
-                let enabled = target.is_some_and(|target| {
-                    !busy
-                        && current_encoding != target
-                        && tab.session.save_error_for_encoding(target).is_none()
-                });
-                (label, enabled)
-            })
+            .map(|label| (label, !busy))
             .collect();
         egui::TopBottomPanel::top("titlebar")
             .exact_height(58.0)
@@ -834,6 +1045,11 @@ impl EditorApp {
                             ui.close();
                         }
                         ui.separator();
+                        if ui.button("Go to Line        Ctrl+G").clicked() {
+                            menu_action = Some(MenuAction::GoToLine);
+                            ui.close();
+                        }
+                        ui.separator();
                         let mut open = self.search_open;
                         if ui.toggle_value(&mut open, "Search Bar").clicked() {
                             menu_action = Some(MenuAction::ToggleSearch);
@@ -846,10 +1062,7 @@ impl EditorApp {
                         ui.separator();
                         for &(label, enabled) in &encoding_availability {
                             if ui
-                                .add_enabled(
-                                    enabled,
-                                    egui::Button::new(format!("Save Copy As {label}")),
-                                )
+                                .add_enabled(enabled, egui::Button::new(format!("Save As {label}")))
                                 .clicked()
                             {
                                 menu_action = Some(MenuAction::SaveAsEncoding(label));
@@ -1009,7 +1222,8 @@ impl EditorApp {
                                     ui.label(RichText::new("+").size(18.0).strong().color(ACCENT));
                                 })
                                 .response
-                                .interact(Sense::click());
+                                .interact(Sense::click())
+                                .on_hover_text("New tab (Ctrl+N)");
                             if add.clicked() {
                                 action = Some(TabAction::New);
                             }
@@ -1079,30 +1293,43 @@ impl EditorApp {
                 self.apply_tab_action(ctx, TabAction::CloseOthers(self.active_tab_id));
             }
             MenuAction::CloseAll => self.apply_tab_action(ctx, TabAction::CloseAll),
-            MenuAction::Undo => {
-                let result = self.active_tab_mut().session.document_mut().try_undo();
-                match result {
-                    Ok(true) => self.active_tab_mut().notice = Notice::info("Undo"),
-                    Ok(false) => self.active_tab_mut().notice = Notice::info("Nothing to undo"),
-                    Err(error) => {
-                        self.active_tab_mut().notice =
-                            Notice::error(format!("Undo failed: {error}"));
+            MenuAction::Undo => match self.active_tab_mut().session.try_undo() {
+                Ok(result) => {
+                    let tab = self.active_tab_mut();
+                    if result.changed() {
+                        if let Some(cursor) = result.cursor() {
+                            tab.set_caret(cursor);
+                        }
+                        tab.notice = Notice::info("Undo");
+                    } else {
+                        tab.notice = Notice::info("Nothing to undo");
                     }
                 }
-            }
-            MenuAction::Redo => {
-                let result = self.active_tab_mut().session.document_mut().try_redo();
-                match result {
-                    Ok(true) => self.active_tab_mut().notice = Notice::info("Redo"),
-                    Ok(false) => self.active_tab_mut().notice = Notice::info("Nothing to redo"),
-                    Err(error) => {
-                        self.active_tab_mut().notice =
-                            Notice::error(format!("Redo failed: {error}"));
+                Err(error) => {
+                    self.active_tab_mut().notice = Notice::error(format!("Undo failed: {error}"));
+                }
+            },
+            MenuAction::Redo => match self.active_tab_mut().session.try_redo() {
+                Ok(result) => {
+                    let tab = self.active_tab_mut();
+                    if result.changed() {
+                        if let Some(cursor) = result.cursor() {
+                            tab.set_caret(cursor);
+                        }
+                        tab.notice = Notice::info("Redo");
+                    } else {
+                        tab.notice = Notice::info("Nothing to redo");
                     }
                 }
-            }
+                Err(error) => {
+                    self.active_tab_mut().notice = Notice::error(format!("Redo failed: {error}"));
+                }
+            },
             MenuAction::CopyMatch => {
-                let selection = self.match_selection();
+                let selection = self
+                    .active_tab()
+                    .active_selection()
+                    .or_else(|| self.match_selection());
                 if let Some(selection) = selection {
                     let text = self
                         .active_tab()
@@ -1110,13 +1337,16 @@ impl EditorApp {
                         .read_selection(selection)
                         .to_string();
                     ctx.copy_text(text);
-                    self.active_tab_mut().notice = Notice::info("Copied current match");
+                    self.active_tab_mut().notice = Notice::info("Copied selection");
                 } else {
-                    self.active_tab_mut().notice = Notice::info("No current match to copy");
+                    self.active_tab_mut().notice = Notice::info("No selection or match to copy");
                 }
             }
             MenuAction::CutMatch => {
-                let selection = self.match_selection();
+                let selection = self
+                    .active_tab()
+                    .active_selection()
+                    .or_else(|| self.match_selection());
                 if let Some(selection) = selection {
                     let result = self.active_tab_mut().session.try_cut_selection(selection);
                     match result {
@@ -1125,6 +1355,7 @@ impl EditorApp {
                             ctx.copy_text(result.text().to_string());
                             let tab = self.active_tab_mut();
                             tab.set_caret(cursor);
+                            tab.collapse_selection();
                             tab.search_match = None;
                         }
                         Err(error) => {
@@ -1133,11 +1364,14 @@ impl EditorApp {
                         }
                     }
                 } else {
-                    self.active_tab_mut().notice = Notice::info("No current match to cut");
+                    self.active_tab_mut().notice = Notice::info("No selection or match to cut");
                 }
             }
             MenuAction::DeleteMatch => {
-                let selection = self.match_selection();
+                let selection = self
+                    .active_tab()
+                    .active_selection()
+                    .or_else(|| self.match_selection());
                 if let Some(selection) = selection {
                     let result = self
                         .active_tab_mut()
@@ -1148,6 +1382,7 @@ impl EditorApp {
                             let cursor = result.cursor();
                             let tab = self.active_tab_mut();
                             tab.set_caret(cursor);
+                            tab.collapse_selection();
                             tab.search_match = None;
                         }
                         Err(error) => {
@@ -1156,7 +1391,7 @@ impl EditorApp {
                         }
                     }
                 } else {
-                    self.active_tab_mut().notice = Notice::info("No current match to delete");
+                    self.active_tab_mut().notice = Notice::info("No selection or match to delete");
                 }
             }
             MenuAction::Find => {
@@ -1178,6 +1413,7 @@ impl EditorApp {
                 self.search_open = !self.search_open;
                 self.active_tab_mut().editor_has_focus = !self.search_open;
             }
+            MenuAction::GoToLine => self.begin_goto_line(),
         }
     }
 
@@ -1278,6 +1514,7 @@ impl EditorApp {
                     ui.label(RichText::new("Find").color(MUTED));
                     let response = ui.add(
                         TextEdit::singleline(&mut self.search_text)
+                            .id(Id::new("qem-search-field"))
                             .desired_width(360.0)
                             .hint_text("Search in file")
                             .font(FontId::monospace(14.0)),
@@ -1297,6 +1534,7 @@ impl EditorApp {
                     }
                     if ui.small_button("Close").clicked() {
                         self.search_open = false;
+                        self.active_tab_mut().search_match = None;
                         self.active_tab_mut().editor_has_focus = true;
                     }
                 });
@@ -1310,123 +1548,345 @@ impl EditorApp {
             .frame(egui::Frame::new().fill(EDITOR_BG))
             .show(ctx, |ui| {
                 let tab = &mut self.tabs[index];
-                let total = status.display_line_count().max(1);
+                let total = tab
+                    .session
+                    .exact_line_count()
+                    .unwrap_or_else(|| {
+                        // Estimates size the overview bar, not the range of an
+                        // exact goto. Do not snap a resolved target back into a
+                        // stale estimate on the next frame.
+                        status.display_line_count().max(
+                            tab.first_line
+                                .saturating_add(tab.visible_rows)
+                                .saturating_add(1),
+                        )
+                    })
+                    .max(1);
                 let char_width = ui.fonts_mut(|fonts| {
                     fonts
                         .glyph_width(&FontId::new(14.0, FontFamily::Monospace), 'M')
                         .max(7.0_f32)
                 });
-                let target_scroll = tab.requested_scroll_y.take().map(|target| {
-                    let centered = target - ui.available_height() * 0.42;
-                    centered.max(0.0)
-                });
-                let mut area = ScrollArea::both()
+                if tab.reveal_caret {
+                    if tab.pending_goto.is_none() {
+                        tab.reveal_line(tab.caret.line0());
+                    }
+                    tab.reveal_caret = false;
+                }
+                // Only horizontal scrolling belongs to egui. Its vertical
+                // f32 coordinates cannot represent rows in huge files. The
+                // vertical anchor is an integer and all row geometry below
+                // is local to this one screen-sized window.
+                let area = ScrollArea::horizontal()
                     .id_salt(("editor-scroll", tab.id))
                     .auto_shrink([false, false]);
-                if let Some(offset) = target_scroll {
-                    area = area.vertical_scroll_offset(offset);
-                }
-                let output = area.show_rows(ui, ROW_HEIGHT, total, |ui, range| {
-                    let viewport = tab.session.read_viewport(
-                        ViewportRequest::new(range.start, range.len()).with_columns(0, 512),
-                    );
-                    for row in viewport.rows() {
-                        let active = row.line0() == tab.caret.line0();
-                        let (rect, response) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width().max(1100.0), ROW_HEIGHT),
-                            Sense::click(),
-                        );
-                        if active {
-                            ui.painter().rect_filled(rect, 0.0, ACTIVE_LINE);
-                            ui.painter().rect_filled(
-                                Rect::from_min_size(rect.min, Vec2::new(2.0, ROW_HEIGHT)),
-                                0.0,
-                                ACCENT,
-                            );
+                // 352-million-line files need 9-digit gutters: scale the
+                // gutter to the widest line number instead of letting the
+                // numbers paint over the text.
+                let number_font_width = char_width * 13.0 / 14.0;
+                let gutter_width =
+                    (number_font_width * total.to_string().len() as f32 + 24.0).max(GUTTER_WIDTH);
+                let bounds = ui.available_rect_before_wrap();
+                let track = Rect::from_min_max(
+                    egui::pos2(bounds.right() - 16.0, bounds.top()),
+                    bounds.right_bottom(),
+                );
+                let max_first = total.saturating_sub(tab.visible_rows.max(1));
+                let track_response = ui.interact(
+                    track,
+                    Id::new(("editor-line-scroll", tab.id)),
+                    Sense::click_and_drag(),
+                );
+                if track_response.clicked() || track_response.dragged() {
+                    if let Some(pointer) = track_response.interact_pointer_pos() {
+                        // The overview bar selects a logical line (coarse on
+                        // huge files). It never creates an absolute pixel offset.
+                        let fraction = ((pointer.y - track.top()) / track.height()).clamp(0.0, 1.0);
+                        if tab.pending_goto.take().is_some() {
+                            tab.editor_has_focus = true;
+                            tab.notice = Notice::info("Go to line cancelled by scrolling");
                         }
-                        let gutter =
-                            Rect::from_min_size(rect.min, Vec2::new(GUTTER_WIDTH, ROW_HEIGHT));
-                        ui.painter().rect_filled(gutter, 0.0, PANEL);
-                        ui.painter().line_segment(
-                            [gutter.right_top(), gutter.right_bottom()],
-                            Stroke::new(1.0_f32, BORDER),
+                        tab.set_first_line(
+                            (f64::from(fraction) * max_first as f64) as usize,
+                            total,
                         );
-                        let number_color = if active {
-                            TEXT
-                        } else if row.is_exact() {
-                            MUTED
-                        } else {
-                            WARNING
-                        };
-                        ui.painter().text(
-                            gutter.right_center() - Vec2::new(12.0, 0.0),
-                            egui::Align2::RIGHT_CENTER,
-                            row.line_number().to_string(),
-                            FontId::monospace(13.0),
-                            number_color,
-                        );
-                        let text_origin = egui::pos2(gutter.right() + 14.0, rect.center().y);
-                        ui.painter().text(
-                            text_origin,
-                            egui::Align2::LEFT_CENTER,
-                            if row.text().is_empty() {
-                                " "
-                            } else {
-                                row.text()
-                            },
-                            FontId::monospace(14.0),
-                            TEXT,
-                        );
-                        if let Some(found) = tab
-                            .search_match
-                            .filter(|found| found.start().line0() == row.line0())
-                        {
-                            let start = found.start().col0() as f32 * char_width;
-                            let width = found.len_chars().max(1) as f32 * char_width;
-                            let highlight = Rect::from_min_size(
-                                egui::pos2(text_origin.x + start, rect.min.y + 3.0),
-                                Vec2::new(width, ROW_HEIGHT - 6.0),
-                            );
-                            ui.painter().rect_filled(
-                                highlight,
-                                CornerRadius::same(2),
-                                Color32::from_rgba_unmultiplied(104, 160, 255, 56),
-                            );
-                            ui.painter().rect_stroke(
-                                highlight,
-                                CornerRadius::same(2),
-                                Stroke::new(1.0_f32, ACCENT),
-                                StrokeKind::Inside,
-                            );
-                        }
-                        if active && tab.editor_has_focus {
-                            let x = text_origin.x + tab.caret.col0() as f32 * char_width;
-                            ui.painter().line_segment(
-                                [
-                                    egui::pos2(x, rect.min.y + 3.0),
-                                    egui::pos2(x, rect.max.y - 3.0),
-                                ],
-                                Stroke::new(1.5_f32, ACCENT),
-                            );
-                            if tab.reveal_caret {
-                                ui.scroll_to_rect(rect, Some(Align::Center));
-                                tab.reveal_caret = false;
-                            }
-                        }
-                        if response.clicked() {
-                            if let Some(pointer) = response.interact_pointer_pos() {
-                                let col = ((pointer.x - text_origin.x).max(0.0) / char_width)
-                                    .round() as usize;
-                                let position = TextPosition::new(
-                                    row.line0(),
-                                    col.min(tab.session.line_len_chars(row.line0())),
-                                );
-                                tab.set_caret(position);
-                            }
-                        }
                     }
-                });
-                tab.scroll_y = output.state.offset.y;
+                }
+                let output = area
+                    .max_width((bounds.width() - 20.0).max(1.0))
+                    .show_viewport(ui, |ui, local_viewport| {
+                        // Allocate exactly one screen of local rows. Unlike
+                        // show_rows there is no extra item_spacing in the pitch.
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        tab.visible_rows =
+                            (local_viewport.height() / ROW_HEIGHT).ceil().max(1.0) as usize;
+                        if tab.pending_goto.is_none() {
+                            tab.set_first_line(tab.first_line, total);
+                        }
+                        if ui.rect_contains_pointer(ui.clip_rect()) {
+                            let wheel = ui.input_mut(|input| {
+                                let delta = input.smooth_scroll_delta.y;
+                                input.smooth_scroll_delta.y = 0.0;
+                                delta
+                            });
+                            if wheel != 0.0 {
+                                if tab.pending_goto.take().is_some() {
+                                    tab.editor_has_focus = true;
+                                    tab.notice = Notice::info("Go to line cancelled by scrolling");
+                                }
+                                tab.wheel_remainder -= wheel;
+                                let lines = (tab.wheel_remainder / ROW_HEIGHT).trunc();
+                                tab.wheel_remainder -= lines * ROW_HEIGHT;
+                                tab.move_view_by(lines as isize, total);
+                            }
+                        }
+                        let first_line = tab.first_line;
+                        let text_width = (local_viewport.width() - gutter_width - 14.0).max(64.0);
+                        let visible_cols = (text_width / char_width) as usize;
+                        let viewport = tab.session.read_viewport(
+                            ViewportRequest::new(first_line, tab.visible_rows)
+                                .with_columns(0, visible_cols),
+                        );
+                        let rows = viewport.rows();
+                        if let Some(target) = tab.pending_goto {
+                            if rows
+                                .iter()
+                                .any(|row| row.line0() == target && row.is_exact())
+                            {
+                                tab.caret = TextPosition::new(target, 0);
+                                tab.desired_col = 0;
+                                tab.pending_goto = None;
+                                tab.editor_has_focus = true;
+                                tab.notice = Notice::info(format!("Line {}", target + 1));
+                            } else if tab
+                                .session
+                                .exact_line_count()
+                                .is_some_and(|count| target >= count)
+                            {
+                                tab.pending_goto = None;
+                                tab.editor_has_focus = true;
+                                tab.notice = Notice::error(format!(
+                                    "Line {} is beyond the end of the file",
+                                    target + 1
+                                ));
+                            }
+                        }
+                        for offset in 0..tab.visible_rows {
+                            let line0 = first_line.saturating_add(offset);
+                            if tab
+                                .session
+                                .exact_line_count()
+                                .is_some_and(|count| line0 >= count)
+                            {
+                                break;
+                            }
+                            let row = rows
+                                .iter()
+                                .find(|row| row.line0() == line0 && row.is_exact());
+                            let (rect, response) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width().max(1.0), ROW_HEIGHT),
+                                Sense::click_and_drag(),
+                            );
+                            // with_clip_rect already intersects in egui 0.33;
+                            // keep the local viewport intersection explicit too.
+                            let painter =
+                                ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                            let active =
+                                row.is_some_and(|rendered| rendered.line0() == tab.caret.line0());
+                            if active {
+                                painter.rect_filled(rect, 0.0, ACTIVE_LINE);
+                                painter.rect_filled(
+                                    Rect::from_min_size(rect.min, Vec2::new(2.0, ROW_HEIGHT)),
+                                    0.0,
+                                    ACCENT,
+                                );
+                            }
+                            let gutter =
+                                Rect::from_min_size(rect.min, Vec2::new(gutter_width, ROW_HEIGHT));
+                            painter.rect_filled(gutter, 0.0, PANEL);
+                            painter.line_segment(
+                                [gutter.right_top(), gutter.right_bottom()],
+                                Stroke::new(1.0_f32, BORDER),
+                            );
+                            let text_origin = egui::pos2(gutter.right() + 14.0, rect.center().y);
+                            if let Some(selection) = tab.active_selection() {
+                                let (anchor, head) = (selection.anchor(), selection.head());
+                                let (start, end) = if (anchor.line0(), anchor.col0())
+                                    <= (head.line0(), head.col0())
+                                {
+                                    (anchor, head)
+                                } else {
+                                    (head, anchor)
+                                };
+                                if line0 >= start.line0() && line0 <= end.line0() {
+                                    let line_len = tab.session.line_len_chars(line0);
+                                    let from_col = if line0 == start.line0() {
+                                        start.col0()
+                                    } else {
+                                        0
+                                    };
+                                    let to_col = if line0 == end.line0() {
+                                        end.col0().min(line_len)
+                                    } else {
+                                        line_len
+                                    };
+                                    let x0 = text_origin.x + from_col as f32 * char_width;
+                                    let x1 = (text_origin.x
+                                        + to_col.max(from_col) as f32 * char_width)
+                                        .max(x0 + 1.0);
+                                    painter.rect_filled(
+                                        Rect::from_min_max(
+                                            egui::pos2(x0, rect.min.y + 2.0),
+                                            egui::pos2(x1, rect.max.y - 2.0),
+                                        ),
+                                        0.0,
+                                        Color32::from_rgba_unmultiplied(70, 120, 210, 110),
+                                    );
+                                }
+                            }
+                            let number_color = if active {
+                                TEXT
+                            } else if row.is_some_and(|rendered| rendered.is_exact()) {
+                                MUTED
+                            } else {
+                                WARNING
+                            };
+                            painter.text(
+                                gutter.right_center() - Vec2::new(12.0, 0.0),
+                                egui::Align2::RIGHT_CENTER,
+                                row.map(|rendered| rendered.line_number().to_string())
+                                    .unwrap_or_else(|| line0.saturating_add(1).to_string()),
+                                FontId::monospace(13.0),
+                                number_color,
+                            );
+                            let text = row
+                                .map(|rendered| rendered.text())
+                                .unwrap_or("Resolving exact line…");
+                            painter.text(
+                                text_origin,
+                                egui::Align2::LEFT_CENTER,
+                                if text.is_empty() { " " } else { text },
+                                FontId::monospace(14.0),
+                                TEXT,
+                            );
+                            if let Some(found) = tab
+                                .search_match
+                                .filter(|found| row.is_some() && found.start().line0() == line0)
+                            {
+                                let start = found.start().col0() as f32 * char_width;
+                                let width = found.len_chars().max(1) as f32 * char_width;
+                                let highlight = Rect::from_min_size(
+                                    egui::pos2(text_origin.x + start, rect.min.y + 3.0),
+                                    Vec2::new(width, ROW_HEIGHT - 6.0),
+                                );
+                                painter.rect_filled(
+                                    highlight,
+                                    CornerRadius::same(2),
+                                    Color32::from_rgba_unmultiplied(104, 160, 255, 56),
+                                );
+                                painter.rect_stroke(
+                                    highlight,
+                                    CornerRadius::same(2),
+                                    Stroke::new(1.0_f32, ACCENT),
+                                    StrokeKind::Inside,
+                                );
+                            }
+                            if active && tab.editor_has_focus {
+                                let x = text_origin.x + tab.caret.col0() as f32 * char_width;
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(x, rect.min.y + 3.0),
+                                        egui::pos2(x, rect.max.y - 3.0),
+                                    ],
+                                    Stroke::new(1.5_f32, ACCENT),
+                                );
+                            }
+                            if response.drag_started() && row.is_some() {
+                                if let Some(pointer) = response.interact_pointer_pos() {
+                                    let col = ((pointer.x - text_origin.x).max(0.0) / char_width)
+                                        .round()
+                                        as usize;
+                                    let col = col.min(tab.session.line_len_chars(line0));
+                                    tab.caret = TextPosition::new(line0, col);
+                                    tab.desired_col = col;
+                                    tab.selection_anchor = Some(tab.caret);
+                                    tab.editor_has_focus = true;
+                                }
+                            } else if response.dragged() {
+                                if let Some(pointer) = response.interact_pointer_pos() {
+                                    // The pressed row keeps receiving drag events
+                                    // after the pointer leaves it, so the head row
+                                    // is derived from the pointer offset relative
+                                    // to this row — in integer line space.
+                                    let delta_rows =
+                                        ((pointer.y - rect.min.y) / ROW_HEIGHT).floor() as isize;
+                                    let line = if delta_rows >= 0 {
+                                        line0.saturating_add(delta_rows as usize)
+                                    } else {
+                                        line0.saturating_sub((-delta_rows) as usize)
+                                    }
+                                    .min(total.saturating_sub(1));
+                                    let col = ((pointer.x - text_origin.x).max(0.0) / char_width)
+                                        .round()
+                                        as usize;
+                                    let col = col.min(tab.session.line_len_chars(line));
+                                    tab.caret = TextPosition::new(line, col);
+                                    tab.desired_col = col;
+                                }
+                            } else if response.clicked() && row.is_some() {
+                                if let Some(pointer) = response.interact_pointer_pos() {
+                                    let col = ((pointer.x - text_origin.x).max(0.0) / char_width)
+                                        .round()
+                                        as usize;
+                                    let position = TextPosition::new(
+                                        line0,
+                                        col.min(tab.session.line_len_chars(line0)),
+                                    );
+                                    if ui.input(|input| input.modifiers.shift) {
+                                        let before = tab.caret;
+                                        tab.caret = position;
+                                        tab.desired_col = position.col0();
+                                        tab.selection_anchor.get_or_insert(before);
+                                    } else {
+                                        tab.selection_anchor = None;
+                                        if self.search_open {
+                                            // Clicking the editor while the search bar
+                                            // is open returns focus to the document:
+                                            // close the bar and drop the highlight so
+                                            // keystrokes cannot keep landing in the
+                                            // search field while the caret visibly
+                                            // moved.
+                                            self.search_open = false;
+                                            tab.search_match = None;
+                                        }
+                                        tab.set_caret(position);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                let painter = ui.painter().with_clip_rect(bounds);
+                painter.rect_filled(track, CornerRadius::same(4), PANEL);
+                let thumb_height = (track.height()
+                    * (tab.visible_rows as f64 / total as f64) as f32)
+                    .clamp(18.0, track.height().max(18.0));
+                let fraction = if max_first == 0 {
+                    0.0
+                } else {
+                    tab.first_line as f64 / max_first as f64
+                };
+                let top = track.top() + fraction as f32 * (track.height() - thumb_height).max(0.0);
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        egui::pos2(track.left(), top),
+                        Vec2::new(track.width(), thumb_height),
+                    ),
+                    CornerRadius::same(4),
+                    MUTED,
+                );
+                // The horizontal scroller may reserve a bar, but its content
+                // and clip rectangles must always remain screen-local.
+                debug_assert!(output.content_size.y < bounds.height() + ROW_HEIGHT * 2.0);
             });
     }
 
@@ -1465,7 +1925,7 @@ impl EditorApp {
                         ui.label(RichText::new(status.encoding().name()).small().color(MUTED));
                         ui.separator();
                         ui.label(
-                            RichText::new(format!("{:?}", status.line_ending()))
+                            RichText::new(status.line_ending().as_str())
                                 .small()
                                 .color(MUTED),
                         );
@@ -1490,7 +1950,7 @@ impl EditorApp {
         };
         let title = self.tabs[index].title();
         let mut decision = None;
-        Modal::new(Id::new("close-dirty-tab"))
+        let response = Modal::new(Id::new("close-dirty-tab"))
             .frame(
                 egui::Frame::popup(&ctx.style())
                     .fill(PANEL)
@@ -1515,6 +1975,11 @@ impl EditorApp {
                     }
                 });
             });
+        if decision.is_none() && (response.should_close() || response.backdrop_response.clicked()) {
+            // Escape or a backdrop click behaves like Cancel: abort a
+            // Close Others/Close All batch and keep the tab open.
+            decision = Some(3);
+        }
         match decision {
             Some(1) => {
                 self.close_prompt = None;
@@ -1539,7 +2004,7 @@ impl EditorApp {
         }
         let mut commit = false;
         let mut cancel = false;
-        Modal::new(Id::new("rename-file"))
+        let response = Modal::new(Id::new("rename-file"))
             .frame(
                 egui::Frame::popup(&ctx.style())
                     .fill(PANEL)
@@ -1551,19 +2016,20 @@ impl EditorApp {
                 ui.heading("Rename file");
                 ui.add_space(8.0);
                 let dialog = self.rename_dialog.as_mut().expect("dialog exists");
-                let response = ui.add(
+                let field = ui.add(
                     TextEdit::singleline(&mut dialog.name)
+                        .id(Id::new("qem-rename-field"))
                         .desired_width(380.0)
                         .font(FontId::monospace(14.0)),
                 );
-                response.request_focus();
+                field.request_focus();
                 if let Some(error) = &dialog.error {
                     ui.label(RichText::new(error).color(ERROR));
                 }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui.button("Rename").clicked()
-                        || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter)))
+                        || (field.has_focus() && ui.input(|input| input.key_pressed(Key::Enter)))
                     {
                         commit = true;
                     }
@@ -1572,26 +2038,169 @@ impl EditorApp {
                     }
                 });
             });
+        if !commit && (response.should_close() || response.backdrop_response.clicked()) {
+            // Escape or a backdrop click cancels the rename.
+            cancel = true;
+        }
         if commit {
             self.commit_rename();
         } else if cancel {
             self.rename_dialog = None;
         }
     }
+
+    fn begin_goto_line(&mut self) {
+        if self.active_tab().session.is_busy() {
+            self.active_tab_mut().notice = Notice::info("Wait for the current file operation");
+            return;
+        }
+        let line = self.active_tab().caret.line0() + 1;
+        self.active_tab_mut().editor_has_focus = false;
+        self.goto_dialog = Some(line.to_string());
+    }
+
+    /// Applies the goto dialog. Returns `false` when the input was invalid
+    /// and the dialog must stay open for correction.
+    fn commit_goto_line(&mut self) -> bool {
+        let Some(raw) = self
+            .goto_dialog
+            .as_ref()
+            .map(|dialog| dialog.trim().to_owned())
+        else {
+            return true;
+        };
+        let Ok(line_number) = raw.parse::<usize>() else {
+            self.active_tab_mut().notice = Notice::error(format!("Not a line number: {raw}"));
+            return false;
+        };
+        if line_number == 0 {
+            self.active_tab_mut().notice = Notice::error("Line numbers start at 1");
+            return false;
+        }
+        let line0 = line_number - 1;
+        if self
+            .active_tab()
+            .session
+            .exact_line_count()
+            .is_some_and(|count| line0 >= count)
+        {
+            self.active_tab_mut().notice =
+                Notice::error(format!("Line {line_number} is beyond the end of the file"));
+            return false;
+        }
+        let tab = self.active_tab_mut();
+        // A line count estimate is not an upper bound. Keep the user's exact
+        // request, and do not use edit-caret clamping to navigate the view.
+        tab.first_line = line0;
+        tab.pending_goto = Some(line0);
+        tab.wheel_remainder = 0.0;
+        tab.reveal_caret = false;
+        tab.collapse_selection();
+        tab.editor_has_focus = false;
+        tab.notice = Notice::info(format!("Resolving exact line {line_number}…"));
+        self.goto_dialog = None;
+        true
+    }
+
+    fn goto_modal(&mut self, ctx: &egui::Context) {
+        if self.goto_dialog.is_none() {
+            return;
+        }
+        let mut commit = false;
+        let mut cancel = false;
+        let response = Modal::new(Id::new("goto-line"))
+            .frame(
+                egui::Frame::popup(&ctx.style())
+                    .fill(PANEL)
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.heading("Go to line");
+                ui.add_space(8.0);
+                let dialog = self.goto_dialog.as_mut().expect("goto dialog exists");
+                let field = ui.add(
+                    TextEdit::singleline(dialog)
+                        .id(Id::new("qem-goto-field"))
+                        .desired_width(220.0)
+                        .font(FontId::monospace(14.0)),
+                );
+                field.request_focus();
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Go").clicked()
+                        || (field.has_focus() && ui.input(|input| input.key_pressed(Key::Enter)))
+                    {
+                        commit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if !commit && (response.should_close() || response.backdrop_response.clicked()) {
+            cancel = true;
+        }
+        if commit && self.commit_goto_line() {
+            return;
+        }
+        if cancel {
+            self.goto_dialog = None;
+            self.active_tab_mut().editor_has_focus = true;
+        }
+    }
 }
 
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // QEM_DEBUG_FRAMES=1 logs per-frame phase timings to stderr; used to
+        // diagnose multi-second stalls of the UI thread on huge files.
+        let debug_frames = DEBUG_FRAMES
+            .get_or_init(|| std::env::var_os("QEM_DEBUG_FRAMES").is_some_and(|v| v != "0"));
+        let frame = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let mark = |name: &str| {
+            if *debug_frames {
+                eprintln!(
+                    "[F{frame} {name}] {:.1} ms",
+                    started.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        };
+        if *debug_frames {
+            eprintln!("[F{frame} begin]");
+        }
         self.pump();
+        mark("pump");
         self.shortcuts(ctx);
+        mark("shortcuts");
         self.editor_input(ctx);
+        mark("editor_input");
         self.top_bar(ctx);
+        mark("top_bar");
         self.tab_bar(ctx);
+        mark("tab_bar");
         self.search_bar(ctx);
+        mark("search_bar");
         self.status_bar(ctx);
+        mark("status_bar");
         self.editor(ctx);
+        mark("editor");
         self.close_modal(ctx);
+        mark("close_modal");
         self.rename_modal(ctx);
+        self.goto_modal(ctx);
+        mark("modals");
+        if *debug_frames {
+            // The segment after update() — egui tessellation plus GPU submit —
+            // is outside this log; a gap between "[F n end]" and "[F n+1 begin]"
+            // pins a stall to rendering or the event wait.
+            eprintln!(
+                "[F{frame} end] {:.1} ms",
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
 
         if self
             .tabs
@@ -1602,6 +2211,9 @@ impl eframe::App for EditorApp {
         }
     }
 }
+
+static FRAME_COUNTER: AtomicU64 = AtomicU64::new(0);
+static DEBUG_FRAMES: OnceLock<bool> = OnceLock::new();
 
 fn toolbar_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
     ui.add_enabled(enabled, egui::Button::new(RichText::new(label).size(13.0)))
@@ -1675,4 +2287,146 @@ fn install_theme(ctx: &egui::Context) {
     style.spacing.item_spacing = Vec2::new(8.0, 6.0);
     style.spacing.button_padding = Vec2::new(10.0, 5.0);
     ctx.set_style(style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> EditorApp {
+        let mut app = EditorApp::new(None);
+        let text = (1..=200)
+            .map(|line| format!("row-{line:03}\n"))
+            .collect::<String>();
+        app.active_tab_mut()
+            .session
+            .try_insert(TextPosition::new(0, 0), &text)
+            .unwrap();
+        app
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        app: &mut EditorApp,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(800.0, 400.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.editor(ctx),
+        )
+    }
+
+    fn painted_rows(output: &egui::FullOutput) -> Vec<(String, f32, Rect)> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::epaint::Shape::Text(text) = &shape.shape {
+                    let content = text.galley.job.text.clone();
+                    if content.starts_with("row-") {
+                        return Some((content, text.pos.y, shape.clip_rect));
+                    }
+                }
+                None
+            })
+            .collect()
+    }
+
+    #[test]
+    fn integer_window_preserves_adjacent_lines_in_huge_files() {
+        let mut tab = UiTab::new(1, 1);
+        tab.visible_rows = 17;
+        tab.first_line = 352_000_000;
+        tab.move_view_by(1, 500_000_000);
+        assert_eq!(tab.first_line, 352_000_001);
+        tab.move_view_by(-1, 500_000_000);
+        assert_eq!(tab.first_line, 352_000_000);
+        tab.reveal_line(352_000_020);
+        assert_eq!(tab.first_line, 352_000_004);
+        tab.move_view_by(isize::MAX, 500_000_000);
+        assert_eq!(tab.first_line, 500_000_000 - 17);
+        tab.move_view_by(isize::MIN, 500_000_000);
+        assert_eq!(tab.first_line, 0);
+    }
+
+    #[test]
+    fn headless_goto_resolves_requested_row_without_spacing_drift() {
+        let ctx = egui::Context::default();
+        install_theme(&ctx);
+        let mut app = test_app();
+        app.goto_dialog = Some("101".to_owned());
+        assert!(app.commit_goto_line());
+        assert_eq!(app.active_tab().pending_goto, Some(100));
+        assert_eq!(app.active_tab().caret.line0(), 0);
+        let output = frame(&ctx, &mut app, vec![]);
+        assert_eq!(app.active_tab().caret.line0(), 100);
+        assert_eq!(app.active_tab().pending_goto, None);
+        assert_eq!(app.active_tab().first_line, 100);
+        let rows = painted_rows(&output);
+        assert_eq!(rows.first().unwrap().0, "row-101");
+        assert!(rows.len() >= 10);
+        for pair in rows.windows(2) {
+            assert!((pair[1].1 - pair[0].1 - ROW_HEIGHT).abs() < 0.1);
+        }
+        for (_, _, clip) in &rows {
+            assert!(clip.top() >= 0.0 && clip.bottom() <= 400.0);
+            assert!(clip.left() >= 0.0 && clip.right() < 800.0);
+            assert!(clip.height() <= ROW_HEIGHT + 0.1);
+        }
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(app.active_tab().first_line, 100);
+    }
+
+    #[test]
+    fn headless_wheel_keeps_rows_contiguous_and_round_trips() {
+        let ctx = egui::Context::default();
+        install_theme(&ctx);
+        let mut app = test_app();
+        app.active_tab_mut().first_line = 50;
+        frame(&ctx, &mut app, vec![]);
+        let mut events = vec![egui::Event::PointerMoved(egui::pos2(200.0, 100.0))];
+        for delta in [-ROW_HEIGHT, -ROW_HEIGHT, ROW_HEIGHT, ROW_HEIGHT] {
+            events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, delta),
+                modifiers: egui::Modifiers::default(),
+            });
+            let output = frame(&ctx, &mut app, std::mem::take(&mut events));
+            let rows = painted_rows(&output);
+            for pair in rows.windows(2) {
+                let first = pair[0].0[4..].parse::<usize>().unwrap();
+                let second = pair[1].0[4..].parse::<usize>().unwrap();
+                assert_eq!(second, first + 1);
+                assert!((pair[1].1 - pair[0].1 - ROW_HEIGHT).abs() < 0.1);
+            }
+        }
+        assert_eq!(app.active_tab().first_line, 50);
+    }
+
+    #[test]
+    fn goto_rejects_invalid_or_out_of_range_instead_of_clamping() {
+        let mut app = test_app();
+        for text in ["0", "invalid", "999999999", "18446744073709551616"] {
+            app.goto_dialog = Some(text.to_owned());
+            assert!(!app.commit_goto_line(), "accepted {text}");
+            assert!(app.goto_dialog.is_some());
+            assert_eq!(app.active_tab().caret.line0(), 0);
+            assert_eq!(app.active_tab().first_line, 0);
+        }
+    }
+
+    #[test]
+    fn click_caret_does_not_silently_clamp_to_an_unrelated_line() {
+        let mut tab = UiTab::new(1, 1);
+        tab.set_caret(TextPosition::new(352_000_000, 0));
+        assert_eq!(tab.caret.line0(), 352_000_000);
+        assert_ne!(tab.session.clamp_position(tab.caret), tab.caret);
+    }
 }
