@@ -19,6 +19,17 @@ pub(crate) enum OpenProgressPhase {
     Ready,
 }
 
+/// Upper bound for the line-ending probe on the open path.
+///
+/// `detect_line_ending` walks `memchr2` until the first newline or carriage
+/// return byte; on a huge file whose first line break is far away (logs with
+/// long binary headers, disk images, zero-filled regions) an unbounded probe
+/// scanned the whole file synchronously on every open — a 50 GiB file without
+/// an early newline froze the open for minutes. The probe therefore reads at
+/// most this many leading bytes and falls back to [`LineEnding::Lf`] beyond
+/// it, exactly like the bounded head sample real editors use.
+pub(super) const LINE_ENDING_PROBE_MAX_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
 fn line_ending_probe_bytes(bytes: &[u8]) -> usize {
     let Some(pos) = memchr::memchr2(b'\n', b'\r', bytes) else {
         return bytes.len();
@@ -205,6 +216,7 @@ impl Document {
             preserve_save_error_cache: Cell::new(None),
             rope: None,
             piece_table: None,
+            rope_history: RopeHistory::new(),
             dirty: false,
         }
     }
@@ -542,6 +554,7 @@ impl Document {
             preserve_save_error_cache: Cell::new(None),
             rope: Some(rope),
             piece_table: None,
+            rope_history: RopeHistory::new(),
             dirty: false,
         })
     }
@@ -654,6 +667,7 @@ impl Document {
             preserve_save_error_cache: Cell::new(None),
             rope: None,
             piece_table: None,
+            rope_history: RopeHistory::new(),
             dirty: false,
         };
         doc.set_encoding_contract(encoding, encoding_origin);
@@ -793,6 +807,7 @@ impl Document {
             preserve_save_error_cache: Cell::new(None),
             rope: None,
             piece_table: None,
+            rope_history: RopeHistory::new(),
             dirty: false,
         };
         doc.set_encoding_contract(encoding, encoding_origin);
@@ -821,9 +836,10 @@ impl Document {
             .map(|analysis| analysis.line_ending)
             .unwrap_or_else(|| {
                 let bytes = storage.bytes();
-                inspected_source_bytes = line_ending_probe_bytes(bytes);
+                let probe = &bytes[..bytes.len().min(LINE_ENDING_PROBE_MAX_BYTES)];
+                inspected_source_bytes = line_ending_probe_bytes(probe);
                 progress.report_inspected(inspected_source_bytes);
-                detect_line_ending(bytes)
+                detect_line_ending(probe)
             });
         phase(OpenProgressPhase::PreparingIndex);
         let disk_index = DiskLineIndex::open_or_build(&path, &storage);
@@ -874,6 +890,7 @@ impl Document {
                         piece_table: Some(PieceTable::from_recovered_session(
                             storage, add, pieces, meta,
                         )),
+                        rope_history: RopeHistory::new(),
                         dirty: true,
                     };
                 }
@@ -907,6 +924,7 @@ impl Document {
                 preserve_save_error_cache: Cell::new(None),
                 rope: Some(Rope::new()),
                 piece_table: None,
+                rope_history: RopeHistory::new(),
                 dirty: false,
             };
         }
@@ -933,6 +951,7 @@ impl Document {
                 preserve_save_error_cache: Cell::new(None),
                 rope: None,
                 piece_table: None,
+                rope_history: RopeHistory::new(),
                 dirty: false,
             };
         }
@@ -1126,6 +1145,7 @@ impl Document {
             preserve_save_error_cache: Cell::new(None),
             rope: None,
             piece_table: None,
+            rope_history: RopeHistory::new(),
             dirty: false,
         }
     }

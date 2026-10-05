@@ -4,13 +4,15 @@ use std::cell::Cell;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::{mpsc, Arc, LazyLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use super::storage::{FileStorage, StorageOpenError};
 use crate::index::DiskLineIndex;
 use crate::piece_tree::{editlog_path, Piece, PieceSource, PieceTree, SessionMeta};
+
+use rope_history::RopeHistory;
 
 mod alignment;
 mod commands;
@@ -22,6 +24,7 @@ mod persistence;
 mod positions;
 mod reads;
 mod regex_search;
+mod rope_history;
 mod search;
 mod state;
 mod types;
@@ -41,7 +44,7 @@ pub use types::{
     DocumentEncodingOrigin, DocumentError, DocumentMaintenanceStatus, DocumentOpenOptions,
     DocumentSaveOptions, DocumentStatus, EditCapability, EditResult, LineCount, LineSlice,
     MaintenanceAction, OpenEncodingPolicy, SaveEncodingPolicy, SearchMatch, TextPosition,
-    TextRange, TextSelection, TextSlice, Viewport, ViewportRequest, ViewportRow,
+    TextRange, TextSelection, TextSlice, UndoResult, Viewport, ViewportRequest, ViewportRow,
 };
 
 /// Hidden re-exports used by integration tests under `tests/encoding_engine/`.
@@ -136,9 +139,13 @@ const AVG_LINE_LEN_ESTIMATE: usize = 50;
 const AVG_LINE_LEN_SAMPLE_BYTES: usize = 256 * 1024; // 256 KiB windows
 const PIECE_TABLE_MIN_BYTES: usize = 1024 * 1024; // 1 MiB
 const MAX_LINE_SCAN_CHARS: usize = 16_384;
-const LINE_LENGTHS_MAX_SYNC_LINES: usize = 4_000_000;
+/// Budget for the materialized line-length table that seeds the piece-table
+/// edit buffer. The line count is derived from a byte budget so the 64-bit
+/// `usize` table stays bounded regardless of platform.
+const LINE_LENGTHS_MAX_SYNC_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
+const LINE_LENGTHS_MAX_SYNC_LINES: usize =
+    LINE_LENGTHS_MAX_SYNC_BYTES / std::mem::size_of::<usize>();
 const PARTIAL_PIECE_TABLE_TARGET_LINES: usize = 4_096;
-const PARTIAL_PIECE_TABLE_MAX_LINES: usize = LINE_LENGTHS_MAX_SYNC_LINES;
 const PARTIAL_PIECE_TABLE_SCAN_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 const APPROX_LINE_BACKTRACK_BYTES: usize = 64 * 1024;
 const APPROX_LINE_FORWARD_BYTES: usize = 256 * 1024;
@@ -1064,6 +1071,10 @@ pub struct Document {
     // Mutable text storage. When present, it becomes the source of truth for rendering/editing.
     rope: Option<Rope>,
     piece_table: Option<PieceTable>,
+    /// In-memory undo/redo history for the rope edit buffer. The piece-tree
+    /// buffer keeps its own snapshot history; this field only covers edits
+    /// applied directly to `rope`. See `rope_history::RopeHistory`.
+    rope_history: rope_history::RopeHistory,
     dirty: bool,
 }
 
@@ -1190,6 +1201,15 @@ impl PieceTable {
 
     pub(crate) fn total_len(&self) -> usize {
         self.total_len
+    }
+
+    /// Returns the byte length covered by the known line boundaries.
+    ///
+    /// A partial piece table indexes only a bounded window of lines, so this
+    /// can be far smaller than [`Self::total_len`]; the tail of the document
+    /// has no per-line bookkeeping until the table is widened.
+    pub(crate) fn known_byte_len(&self) -> usize {
+        self.known_byte_len
     }
 
     pub(crate) fn full_index(&self) -> bool {

@@ -313,6 +313,14 @@ impl Document {
                 self.mmap_position_for_byte_offset(file_len).line0()
             }
         };
+        // Column 0 is already within every possible line length, so the
+        // line-length walk is skipped entirely. `line_len_chars` on an
+        // mmap-backed line runs to the end of the line; on a huge file
+        // without an early line break that walk spans the whole document
+        // (a 50 GiB freeze) even when the clamped caret only needs column 0.
+        if position.col0() == 0 {
+            return TextPosition::new(line0, 0);
+        }
         let col0 = position.col0().min(self.line_len_chars(line0));
         TextPosition::new(line0, col0)
     }
@@ -484,11 +492,12 @@ impl Document {
             };
         }
 
-        EditCapability::Unsupported {
-            backing,
-            reason:
-                "document is too large to materialize into a rope; editing this region is disabled",
-        }
+        let reason = if position.line0() >= super::editing::EDIT_WINDOW_LIMIT_LINES {
+            super::editing::edit_window_limit_reason()
+        } else {
+            "document is too large to materialize into a rope; editing this region is disabled"
+        };
+        EditCapability::Unsupported { backing, reason }
     }
 
     /// Returns the editability for a typed edit range.

@@ -771,6 +771,55 @@ impl CutResult {
     }
 }
 
+/// Result of an undo or redo command.
+///
+/// `changed` reports whether an operation was applied. `cursor` carries the
+/// restored caret position when the backing can provide one: the rope edit
+/// buffer returns the position the edit started from, while the piece-tree
+/// snapshot history does not track cursors and reports `None`. Frontends
+/// should fall back to their current caret (clamped) when `cursor` is `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UndoResult {
+    changed: bool,
+    cursor: Option<TextPosition>,
+}
+
+impl UndoResult {
+    /// Creates a result for an applied operation without cursor information.
+    pub const fn applied() -> Self {
+        Self {
+            changed: true,
+            cursor: None,
+        }
+    }
+
+    /// Creates a result for an applied operation with a restored caret.
+    pub const fn applied_with_cursor(cursor: TextPosition) -> Self {
+        Self {
+            changed: true,
+            cursor: Some(cursor),
+        }
+    }
+
+    /// Creates a result for a no-op (nothing to undo or redo).
+    pub const fn noop() -> Self {
+        Self {
+            changed: false,
+            cursor: None,
+        }
+    }
+
+    /// Returns `true` when an operation was applied.
+    pub const fn changed(self) -> bool {
+        self.changed
+    }
+
+    /// Returns the restored caret position, when the backing tracks one.
+    pub const fn cursor(self) -> Option<TextPosition> {
+        self.cursor
+    }
+}
+
 /// Typed byte progress used by indexing and other document-local background work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ByteProgress {

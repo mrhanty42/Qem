@@ -464,6 +464,7 @@ fn precise_piece_table_line_lengths_require_complete_index() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -495,6 +496,7 @@ fn precise_piece_table_line_lengths_reject_large_line_arrays() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -530,6 +532,7 @@ fn piece_table_line_lengths_for_edit_builds_partial_prefix() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -668,6 +671,7 @@ fn piece_table_line_lengths_for_edit_supports_large_exact_prefix() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -677,6 +681,101 @@ fn piece_table_line_lengths_for_edit_supports_large_exact_prefix() {
     assert!(!full_index);
     assert_eq!(line_lengths.len(), 150_001);
     assert!(line_lengths.iter().all(|len| *len == 1));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn piece_table_line_lengths_for_edit_full_index_beyond_legacy_cap() {
+    let dir = std::env::temp_dir().join(format!(
+        "standpad-doc-full-beyond-cap-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("beyond-cap.bin");
+    let lines = 5_000_000usize;
+    std::fs::write(&path, vec![b'x'; lines + 1]).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut offsets = Vec::with_capacity(lines + 1);
+    for i in 0..=lines {
+        offsets.push(i as u32);
+    }
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::U32(offsets))),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: lines + 1,
+        indexed_bytes: Arc::new(AtomicUsize::new(lines + 1)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        rope_history: RopeHistory::new(),
+        piece_table: None,
+        dirty: false,
+    };
+
+    // 5M lines exceeds the legacy 4M fixed cap but fits the byte budget, so
+    // the document still gets a fully indexed edit buffer.
+    let (line_lengths, full_index) = doc.piece_table_line_lengths_for_edit(lines).unwrap();
+    assert!(full_index);
+    assert_eq!(line_lengths.len(), lines + 1);
+    assert!(line_lengths.iter().all(|len| *len == 1));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn edit_beyond_window_reports_bounded_edit_window_error() {
+    let dir = std::env::temp_dir().join(format!("standpad-doc-edit-window-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("window.txt");
+    std::fs::write(&path, b"alpha\nbeta\ngamma\n").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        // The declared length makes the document rope-unmaterializable, so a
+        // failed window seed must surface the bounded-window error, not the
+        // rope materialization error.
+        file_len: MAX_ROPE_EDIT_FILE_BYTES + 1,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        rope_history: RopeHistory::new(),
+        piece_table: None,
+        dirty: false,
+    };
+
+    let error = doc
+        .ensure_edit_buffer_for_line(LINE_LENGTHS_MAX_SYNC_LINES + 10)
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("bounded edit window"),
+        "unexpected error: {message}"
+    );
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
@@ -711,6 +810,7 @@ fn insert_uses_partial_piece_table_before_full_index_finishes() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -759,6 +859,7 @@ fn insert_fully_indexes_medium_unindexed_piece_table_documents() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -801,6 +902,7 @@ fn partial_piece_table_can_report_exact_total_lines_without_precise_line_lengths
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new_with_encoding_state(
             storage,
             vec![5, 4],
@@ -1192,6 +1294,7 @@ fn document_compact_piece_table_preserves_recovery_and_clears_recommendation() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(piece_table),
         dirty: true,
     };
@@ -1361,6 +1464,7 @@ fn prepare_save_with_forced_compaction_policy_compacts_before_snapshotting() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(piece_table),
         dirty: true,
     };
@@ -2010,6 +2114,7 @@ fn incomplete_mmap_singular_line_read_uses_exact_scan_for_existing_line() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -2043,6 +2148,7 @@ fn incomplete_mmap_single_row_batch_reads_match_singular_line_lookup() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -2084,6 +2190,121 @@ fn fully_indexed_mmap_out_of_range_line_reads_are_exact_empty() {
     assert_eq!(viewport.rows().len(), 2);
     assert!(viewport.rows().iter().all(|row| row.text().is_empty()));
     assert!(viewport.rows().iter().all(ViewportRow::is_exact));
+}
+
+fn checkpoint_viewport_fixture(path: &Path, ending: &str) -> Document {
+    // Variable line widths deliberately make average-byte extrapolation wrong.
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    for line0 in 0..100_020 {
+        write!(
+            file,
+            "row-{line0:06}-{}{ending}",
+            "x".repeat(200 + line0 % 37)
+        )
+        .unwrap();
+    }
+    file.flush().unwrap();
+    drop(file);
+    let storage = FileStorage::open(path).unwrap();
+    Document {
+        path: Some(path.to_path_buf()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::U32(vec![0]))),
+        disk_index: Some(DiskLineIndex::build_for_tests(path, &storage)),
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: storage.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(128)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        rope_history: RopeHistory::new(),
+        piece_table: None,
+        dirty: false,
+    }
+}
+
+fn assert_checkpoint_viewport(doc: &Document, first: usize, count: usize, prefix_delta: usize) {
+    let viewport = doc.read_viewport(ViewportRequest::new(first, count).with_columns(0, 16));
+    assert_eq!(viewport.len(), count);
+    for (offset, row) in viewport.rows().iter().enumerate() {
+        let line0 = first + offset;
+        let original_line0 = line0 - prefix_delta;
+        let text = format!(
+            "row-{original_line0:06}-{}",
+            "x".repeat(200 + original_line0 % 37)
+        );
+        let expected = &text[..text.len().min(16)];
+        assert_eq!(row.line0(), line0);
+        assert_eq!(row.text(), expected, "logical line {line0}");
+        assert!(row.is_exact(), "logical line {line0}");
+        assert_eq!(doc.line_slice(line0, 0, 16), *row.slice());
+    }
+}
+
+#[test]
+fn disk_checkpoint_viewport_resolves_random_lines_and_prefix_crossing() {
+    let dir = tempdir().unwrap();
+    let doc = checkpoint_viewport_fixture(&dir.path().join("checkpoint-viewport.txt"), "\r\n");
+    assert!(
+        doc.disk_index
+            .as_ref()
+            .unwrap()
+            .checkpoint_for_line(100_000)
+            .unwrap()
+            .line0
+            > 4096
+    );
+    assert_checkpoint_viewport(&doc, 4096, 8, 0);
+    assert_checkpoint_viewport(&doc, 100_000, 8, 0);
+    assert_checkpoint_viewport(&doc, 100_018, 2, 0);
+    assert_checkpoint_viewport(&doc, 8190, 8, 0);
+    assert_checkpoint_viewport(&doc, 0, 8, 0);
+    let tail = doc.read_viewport(ViewportRequest::new(100_019, 4).with_columns(0, 16));
+    assert!(tail.rows().iter().all(ViewportRow::is_exact));
+    assert!(tail.rows()[1..].iter().all(|row| row.text().is_empty()));
+    assert!(!doc.has_edit_buffer());
+    assert_eq!(doc.line_offsets.read().unwrap().len(), 1);
+}
+
+#[test]
+fn disk_checkpoint_partial_piece_table_viewport_survives_prefix_edit_and_recovery() {
+    let dir = tempdir().unwrap();
+    let mut doc = checkpoint_viewport_fixture(&dir.path().join("checkpoint-piece-table.txt"), "\n");
+    let storage = doc.storage.as_ref().unwrap().clone();
+    let mut lengths = Vec::new();
+    let mut start = 0;
+    for _ in 0..4096 {
+        let end = doc
+            .encoding_engine()
+            .next_line_start(storage.bytes(), storage.len(), start);
+        lengths.push(end - start);
+        start = end;
+    }
+    doc.piece_table = Some(PieceTable::new(storage.clone(), lengths, false));
+    assert_checkpoint_viewport(&doc, 4094, 8, 0);
+    assert_checkpoint_viewport(&doc, 100_000, 8, 0);
+    doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+    assert_eq!(doc.piece_table.as_ref().unwrap().line_count(), 4097);
+    assert_checkpoint_viewport(&doc, 4095, 8, 1);
+    assert_checkpoint_viewport(&doc, 100_000, 8, 1);
+    let table = doc.piece_table.take().unwrap();
+    let meta = table.session_meta();
+    doc.piece_table = Some(PieceTable::from_recovered_session(
+        storage,
+        table.add,
+        table.pieces,
+        meta,
+    ));
+    assert_checkpoint_viewport(&doc, 4095, 8, 1);
+    assert_checkpoint_viewport(&doc, 100_000, 8, 1);
+    assert!(!doc.piece_table.as_ref().unwrap().full_index());
+    assert_eq!(doc.line_offsets.read().unwrap().len(), 1);
 }
 
 #[test]
@@ -2130,6 +2351,7 @@ fn partial_piece_table_line_reads_follow_current_text_after_prefix_edit() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5, 4], false)),
         dirty: false,
     };
@@ -2187,6 +2409,7 @@ fn singular_partial_piece_table_line_slice_does_not_fall_back_to_stale_mmap() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2234,6 +2457,7 @@ fn partial_piece_table_find_prev_does_not_return_match_after_unresolved_before_p
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2282,6 +2506,7 @@ fn partial_piece_table_find_next_does_not_start_before_unresolved_from_position(
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2329,6 +2554,7 @@ fn partial_piece_table_find_next_and_iterators_do_not_relabel_match_before_unres
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2382,6 +2608,7 @@ fn partial_piece_table_find_next_can_start_on_scannable_incomplete_line() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2447,6 +2674,7 @@ fn partial_piece_table_line_slice_stays_exact_on_scannable_incomplete_prefix() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2498,6 +2726,7 @@ fn partial_piece_table_find_prev_can_end_on_scannable_incomplete_line() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2547,6 +2776,7 @@ fn partial_piece_table_empty_typed_reads_stay_exact_on_scannable_incomplete_line
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2594,6 +2824,7 @@ fn selection_read_stays_exact_when_partial_piece_table_head_is_scannable_incompl
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2640,6 +2871,7 @@ fn typed_range_read_matches_selection_exactness_on_scannable_incomplete_partial_
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2688,6 +2920,7 @@ fn partial_piece_table_bounded_search_does_not_escape_unresolved_end_position() 
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2741,6 +2974,7 @@ fn partial_piece_table_bounded_search_does_not_expand_unresolved_end_line_to_eof
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2794,6 +3028,7 @@ fn partial_piece_table_find_next_in_range_does_not_rewind_unresolved_start() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2839,6 +3074,7 @@ fn partial_piece_table_line_slices_do_not_invent_trailing_empty_line_without_new
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -2887,6 +3123,7 @@ fn partial_piece_table_position_helpers_do_not_fall_back_to_stale_mmap_beyond_sc
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -3130,6 +3367,7 @@ fn line_slices_near_tail_read_from_file_end_before_full_index() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -3171,6 +3409,7 @@ fn line_slices_near_tail_do_not_invent_empty_eof_row_without_trailing_newline() 
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -3231,15 +3470,20 @@ fn line_slices_bail_out_when_next_line_scan_would_be_unbounded() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
 
     let slices = doc.line_slices(0, 3, 0, 16);
-    let texts: Vec<String> = slices.into_iter().map(LineSlice::into_text).collect();
+    let texts: Vec<String> = slices.iter().map(|slice| slice.text().to_owned()).collect();
 
     assert_eq!(texts[0], "aaaaaaaaaaaaaaaa");
-    assert_eq!(texts[1], "");
+    // The estimated line-1 start sits inside the first huge line, but the
+    // exact scan chained from line 0's real boundary still resolves line 1
+    // ("tail") and the trailing empty line within the bounded scan budget —
+    // never via an unbounded scan.
+    assert_eq!(texts[1], "tail");
     assert_eq!(texts[2], "");
 
     let _ = std::fs::remove_file(&path);
@@ -3265,6 +3509,7 @@ fn indexing_progress_reports_inflight_state() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -3917,7 +4162,7 @@ fn try_insert_rejects_large_mmap_rope_fallback() {
     drop(file);
 
     let mut doc = Document::open(path.clone()).unwrap();
-    let err = doc.try_insert_text_at(PARTIAL_PIECE_TABLE_MAX_LINES + 1, 0, "x");
+    let err = doc.try_insert_text_at(LINE_LENGTHS_MAX_SYNC_LINES + 1, 0, "x");
 
     assert!(matches!(err, Err(DocumentError::EditUnsupported { .. })));
     assert!(!doc.has_edit_buffer());
@@ -3954,6 +4199,7 @@ fn try_insert_rejects_large_piece_table_promotion_to_rope() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable {
             original: storage,
             add: Vec::new(),
@@ -4157,6 +4403,7 @@ fn partial_piece_table_position_helpers_follow_current_text_after_prefix_edit() 
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5, 4], false)),
         dirty: false,
     };
@@ -4210,11 +4457,17 @@ fn partial_piece_table_clamp_position_preserves_scannable_lines_beyond_estimated
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![2], false)),
         dirty: false,
     };
 
-    assert_eq!(doc.display_line_count(), 1);
+    // The 1-line window no longer masquerades as the display count: the
+    // estimate extrapolates the tail from the window's own average line
+    // length (2 bytes/line over a 6-byte file), which happens to be exact
+    // for this fixture.
+    assert_eq!(doc.display_line_count(), 3);
+    assert!(!doc.is_line_count_exact());
     assert_eq!(doc.line_slice(2, 0, 16).text(), "c");
     assert!(doc.line_slice(2, 0, 16).is_exact());
 
@@ -4257,6 +4510,7 @@ fn partial_piece_table_position_helpers_do_not_invent_text_units_past_safe_bound
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -4296,6 +4550,7 @@ fn incomplete_mmap_position_helpers_clamp_to_eof_instead_of_inventing_lines() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -4335,6 +4590,7 @@ fn incomplete_mmap_line_len_chars_does_not_invent_tail_columns() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -4438,6 +4694,7 @@ fn selection_read_is_inexact_when_partial_piece_table_head_is_unresolved() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -4481,6 +4738,7 @@ fn selection_read_stays_exact_on_long_exact_partial_piece_table_line() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -4527,6 +4785,7 @@ fn empty_range_read_is_inexact_when_partial_piece_table_start_is_unresolved() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -4561,6 +4820,7 @@ fn incomplete_mmap_nonempty_range_read_past_eof_is_empty_and_inexact() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -4603,6 +4863,7 @@ fn incomplete_mmap_typed_read_uses_exact_start_offset_instead_of_heuristic_line_
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -5105,6 +5366,7 @@ fn selection_replace_promotes_partial_piece_table_before_clamping_unresolved_hea
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -5150,6 +5412,7 @@ fn selection_edit_capability_requires_promotion_for_unresolved_partial_piece_tab
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
         dirty: false,
     };
@@ -5274,6 +5537,7 @@ fn document_status_reports_pending_exact_line_count() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -5312,6 +5576,7 @@ fn wait_for_exact_line_count_observes_background_disk_index_completion() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: None,
         dirty: false,
     };
@@ -5559,8 +5824,11 @@ fn edit_capability_clamps_large_mmap_positions_to_eof_before_reporting_promotion
     drop(file);
 
     let doc = Document::open(path.clone()).unwrap();
-    let capability =
-        doc.edit_capability_at(TextPosition::new(PARTIAL_PIECE_TABLE_MAX_LINES + 1, 0));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while doc.is_indexing() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let capability = doc.edit_capability_at(TextPosition::new(LINE_LENGTHS_MAX_SYNC_LINES + 1, 0));
 
     assert_eq!(
         capability,
@@ -5604,6 +5872,7 @@ fn edit_capability_reports_partial_piece_table_promotion_limits() {
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
         rope: None,
+        rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable {
             original: storage,
             add: Vec::new(),
@@ -6133,4 +6402,377 @@ fn try_backspace_at_encoded_shift_jis_walks_back_one_kanji_cell() {
     assert_eq!(used, encoding_rs::SHIFT_JIS);
     assert!(!had_errors);
     assert_eq!(decoded, "あ\n");
+}
+
+#[test]
+fn small_rope_document_undo_redo_round_trip() {
+    let dir = std::env::temp_dir().join(format!("qem-undo-small-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("small.txt");
+    std::fs::write(&path, b"alpha\nbeta\n").unwrap();
+
+    let mut doc = Document::open(&path).unwrap();
+    assert!(
+        doc.rope.is_none(),
+        "precondition: small file is mmap-backed"
+    );
+
+    let cursor = doc.try_insert(TextPosition::new(0, 0), "X").unwrap();
+    assert_eq!(cursor, TextPosition::new(0, 1));
+    assert!(doc.rope.is_some());
+    assert_eq!(doc.text_lossy(), "Xalpha\nbeta\n");
+
+    let undo = doc.try_undo_with_cursor().unwrap();
+    assert!(undo.changed());
+    assert_eq!(undo.cursor(), Some(TextPosition::new(0, 0)));
+    assert_eq!(doc.text_lossy(), "alpha\nbeta\n");
+    assert!(doc.is_dirty(), "undo keeps the document dirty");
+
+    let redo = doc.try_redo_with_cursor().unwrap();
+    assert!(redo.changed());
+    assert_eq!(redo.cursor(), Some(TextPosition::new(0, 1)));
+    assert_eq!(doc.text_lossy(), "Xalpha\nbeta\n");
+
+    assert!(
+        doc.try_undo().unwrap(),
+        "history must still hold the first edit"
+    );
+    assert!(
+        !doc.try_undo().unwrap(),
+        "history exhausted after both undos"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn untitled_document_undo_redo_round_trip() {
+    let mut doc = Document::new();
+    assert!(!doc.try_undo().unwrap(), "nothing to undo before any edit");
+
+    doc.try_insert_text_at(0, 0, "hello").unwrap();
+    doc.try_backspace_at(0, 5).unwrap();
+    assert_eq!(doc.text_lossy(), "hell");
+
+    let undo = doc.try_undo_with_cursor().unwrap();
+    assert!(undo.changed());
+    assert_eq!(undo.cursor(), Some(TextPosition::new(0, 5)));
+    assert_eq!(doc.text_lossy(), "hello");
+
+    let redo = doc.try_redo_with_cursor().unwrap();
+    assert!(redo.changed());
+    assert_eq!(redo.cursor(), Some(TextPosition::new(0, 4)));
+    assert_eq!(doc.text_lossy(), "hell");
+}
+
+#[test]
+fn fresh_edit_after_undo_drops_redo() {
+    let mut doc = Document::new();
+    doc.try_insert_text_at(0, 0, "ab").unwrap();
+    assert!(doc.try_undo().unwrap());
+    assert_eq!(doc.text_lossy(), "");
+    doc.try_insert_text_at(0, 0, "c").unwrap();
+    assert_eq!(doc.text_lossy(), "c");
+    assert!(
+        !doc.try_redo().unwrap(),
+        "redo stack must drop after a new edit"
+    );
+}
+
+#[test]
+fn composite_replace_range_undoes_in_one_step() {
+    let dir = std::env::temp_dir().join(format!("qem-undo-replace-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("replace.txt");
+    std::fs::write(&path, b"alpha\nbeta\n").unwrap();
+
+    let mut doc = Document::open(&path).unwrap();
+    let cursor = doc.try_replace_range(0, 0, 5, "omega").unwrap();
+    assert_eq!(cursor, (0, 5));
+    assert_eq!(doc.text_lossy(), "omega\nbeta\n");
+
+    let undo = doc.try_undo_with_cursor().unwrap();
+    assert!(undo.changed());
+    assert_eq!(doc.text_lossy(), "alpha\nbeta\n");
+    assert_eq!(undo.cursor(), Some(TextPosition::new(0, 5)));
+
+    let redo = doc.try_redo_with_cursor().unwrap();
+    assert!(redo.changed());
+    assert_eq!(redo.cursor(), Some(TextPosition::new(0, 5)));
+    assert_eq!(doc.text_lossy(), "omega\nbeta\n");
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn backspace_delete_forward_undo_round_trip() {
+    let mut doc = Document::new();
+    doc.try_insert_text_at(0, 0, "abc\n").unwrap();
+
+    doc.try_delete_forward_at(0, 0).unwrap();
+    assert_eq!(doc.text_lossy(), "bc\n");
+    doc.try_backspace_at(0, 1).unwrap();
+    assert_eq!(doc.text_lossy(), "c\n");
+
+    assert!(doc.try_undo().unwrap());
+    assert_eq!(doc.text_lossy(), "bc\n");
+    assert!(doc.try_undo().unwrap());
+    assert_eq!(doc.text_lossy(), "abc\n");
+    assert!(doc.try_redo().unwrap());
+    assert_eq!(doc.text_lossy(), "bc\n");
+    assert!(doc.try_redo().unwrap());
+    assert_eq!(doc.text_lossy(), "c\n");
+}
+
+#[test]
+fn rope_undo_survives_save_and_marks_dirty() {
+    let dir = std::env::temp_dir().join(format!("qem-undo-save-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let src = dir.join("source.txt");
+    let dst = dir.join("copy.txt");
+    std::fs::write(&src, b"alpha\nbeta\n").unwrap();
+
+    let mut doc = Document::open(&src).unwrap();
+    doc.try_insert_text_at(0, 0, "X").unwrap();
+    doc.save_to(&dst).unwrap();
+    assert!(!doc.is_dirty());
+    assert_eq!(std::fs::read(&dst).unwrap(), b"Xalpha\nbeta\n");
+
+    let undo = doc.try_undo_with_cursor().unwrap();
+    assert!(undo.changed());
+    assert_eq!(doc.text_lossy(), "alpha\nbeta\n");
+    assert!(
+        doc.is_dirty(),
+        "undo after save re-marks the document dirty"
+    );
+    assert_eq!(
+        std::fs::read(&dst).unwrap(),
+        b"Xalpha\nbeta\n",
+        "undo must not touch the saved file"
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn piece_table_promotion_rope_history_covers_post_promotion_edits() {
+    let dir = std::env::temp_dir().join(format!("qem-undo-promote-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("big.txt");
+    let original = b"abc\ndef\n".repeat((PIECE_TABLE_MIN_BYTES / 8) + 1);
+    std::fs::write(&path, &original).unwrap();
+
+    let mut doc = Document::open(&path).unwrap();
+    doc.try_insert_text_at(0, 0, "X").unwrap();
+    assert!(
+        doc.piece_table.is_some(),
+        "precondition: PIECE_TABLE_MIN_BYTES file edits through the piece table"
+    );
+
+    // Piece-tree snapshot history keeps working, without caret bookkeeping.
+    let undo = doc.try_undo_with_cursor().unwrap();
+    assert!(undo.changed());
+    assert_eq!(undo.cursor(), None);
+    assert!(doc.try_redo().unwrap());
+
+    // Simulate what an out-of-window edit does on partial-index documents:
+    // promote the piece tree into the rope buffer.
+    doc.promote_piece_table_to_rope().unwrap();
+    assert!(doc.rope.is_some());
+    assert!(doc.piece_table.is_none());
+
+    // Post-promotion edits are undoable through rope history.
+    doc.try_insert_text_at(0, 0, "Y").unwrap();
+    assert!(doc.text_lossy().starts_with("YXabc\n"));
+    let undo = doc.try_undo_with_cursor().unwrap();
+    assert!(undo.changed());
+    assert_eq!(undo.cursor(), Some(TextPosition::new(0, 0)));
+    assert!(doc.text_lossy().starts_with("Xabc\n"));
+
+    // Pre-promotion piece-tree history is intentionally not carried over.
+    assert!(!doc.try_undo().unwrap());
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn line_ending_probe_is_bounded_when_first_break_is_beyond_window() {
+    let dir = std::env::temp_dir().join(format!("qem-probe-bound-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("no-early-newline.bin");
+    // The first line break sits 1 MiB past the 16 MiB probe window. The
+    // open path must stop at the probe instead of memchr-scanning the rest
+    // of the file synchronously (the 50 GiB freeze).
+    let mut content = vec![b'a'; super::lifecycle::LINE_ENDING_PROBE_MAX_BYTES + 1024 * 1024];
+    content.extend_from_slice(b"\r\ntail\n");
+    std::fs::write(&path, &content).unwrap();
+
+    let started = Instant::now();
+    let doc = Document::open(&path).unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(doc.line_ending(), LineEnding::Lf);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "open scanned past the probe window in {elapsed:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn line_ending_probe_still_detects_crlf_within_window() {
+    let dir = std::env::temp_dir().join(format!("qem-probe-crlf-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("crlf-head.bin");
+    // Past the 8 MiB inline-analysis gate so the probe path is exercised,
+    // with CRLF inside the probe window.
+    let line = b"alpha\r\nbeta\r\n";
+    let content = line.repeat((9 * 1024 * 1024 / line.len()) + 1);
+    std::fs::write(&path, &content).unwrap();
+
+    let doc = Document::open(&path).unwrap();
+
+    assert_eq!(doc.line_ending(), LineEnding::Crlf);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn clamp_position_at_column_zero_skips_line_length_walk() {
+    let dir = std::env::temp_dir().join(format!("qem-clamp-col0-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("no-newline.bin");
+    // A single line spanning the whole file: computing its length requires a
+    // full-file walk, so clamping a column-0 caret must not need it.
+    std::fs::write(&path, vec![b'a'; 3 * 1024 * 1024]).unwrap();
+
+    let doc = Document::open(&path).unwrap();
+    assert_eq!(
+        doc.clamp_position(TextPosition::new(0, 0)),
+        TextPosition::new(0, 0)
+    );
+
+    // Non-zero columns still clamp to the real (O(line)) line length.
+    let clamped = doc.clamp_position(TextPosition::new(0, usize::MAX));
+    assert_eq!(clamped, TextPosition::new(0, 3 * 1024 * 1024));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn partial_piece_table_window_does_not_claim_exact_line_count() {
+    let dir = std::env::temp_dir().join(format!("qem-partial-window-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("windowed.bin");
+    let file_len = 2 * 1024 * 1024;
+    std::fs::write(&path, vec![b'a'; file_len]).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    // A bounded window covering only the first 512 KiB of the 2 MiB file:
+    // boundaries for the tail do not exist yet.
+    let window_lines = 100usize;
+    let line_lengths = vec![512 * 1024 / window_lines; window_lines];
+    let piece_table = PieceTable::new_with_encoding_state(
+        storage.clone(),
+        line_lengths,
+        false,
+        None,
+        DocumentEncodingOrigin::Utf8FastPath,
+        false,
+    );
+    assert!(piece_table.known_byte_len() < piece_table.total_len());
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::new_for_file_len(file_len))),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len,
+        indexed_bytes: Arc::new(AtomicUsize::new(file_len)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(piece_table),
+        rope_history: RopeHistory::new(),
+        dirty: false,
+    };
+
+    // The window count must never surface as the exact document total: doing
+    // so capped scroll ranges at the window size after the first edit.
+    assert!(doc.exact_line_count().is_none());
+    assert!(!doc.is_line_count_exact());
+    // The scroll estimate extrapolates the tail from the window's own
+    // average line length and stays well above the window.
+    assert!(doc.display_line_count() > window_lines);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn partial_piece_table_covering_whole_file_keeps_exact_count() {
+    let dir = std::env::temp_dir().join(format!("qem-partial-full-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("covered.bin");
+    let line = b"abc\n";
+    let content_len = 1024 * 1024;
+    let line_count = content_len / line.len();
+    std::fs::write(&path, line.repeat(line_count)).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    // full_index=false, but the boundary list covers every line of the file:
+    // the delta math over the base total stays exact.
+    let line_lengths = vec![line.len(); line_count];
+    let piece_table = PieceTable::new_with_encoding_state(
+        storage,
+        line_lengths,
+        false,
+        Some(line_count),
+        DocumentEncodingOrigin::Utf8FastPath,
+        false,
+    );
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: None,
+        line_offsets: Arc::new(RwLock::new(LineOffsets::new_for_file_len(content_len))),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: content_len,
+        indexed_bytes: Arc::new(AtomicUsize::new(content_len)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(piece_table),
+        rope_history: RopeHistory::new(),
+        dirty: false,
+    };
+
+    assert_eq!(doc.exact_line_count(), Some(line_count));
+    assert!(doc.is_line_count_exact());
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
 }

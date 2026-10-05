@@ -1141,6 +1141,18 @@ impl Document {
             (line0, line_start) = line_offsets_anchor_for_line(&offsets, target_line0);
             line_start = line_start.min(file_len);
         }
+        // A disk index keeps sparse checkpoints even while the in-memory
+        // offsets are still only a prefix. Prefer the newest checkpoint so a
+        // random viewport read scans only the bounded gap to its target line,
+        // rather than treating the average-line estimate as authoritative.
+        if let Some((checkpoint_line0, checkpoint_byte0)) =
+            self.disk_index_checkpoint_for_line(target_line0)
+        {
+            if checkpoint_line0 >= line0 {
+                line0 = checkpoint_line0;
+                line_start = checkpoint_byte0.min(file_len);
+            }
+        }
 
         let engine = self.encoding_engine();
         while line0 < target_line0 && line_start < file_len {

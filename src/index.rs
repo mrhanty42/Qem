@@ -167,6 +167,15 @@ impl DiskLineIndex {
         })
     }
 
+    pub(crate) fn checkpoint_for_byte(&self, byte0: usize) -> Option<LineCheckpoint> {
+        let ready = self.ready()?;
+        let checkpoint = ready.checkpoint_for_byte(byte0 as u64).ok()?;
+        Some(LineCheckpoint {
+            line0: checkpoint.line0 as usize,
+            byte0: checkpoint.byte0 as usize,
+        })
+    }
+
     pub(crate) fn total_lines(&self) -> Option<usize> {
         let ready = self.ready()?;
         usize::try_from(ready.total_lines).ok()
@@ -185,6 +194,15 @@ impl DiskLineIndex {
         match &*state {
             DiskLineIndexState::Ready(ready) => Some(Arc::clone(ready)),
             DiskLineIndexState::Building | DiskLineIndexState::Failed => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_for_tests(path: &Path, storage: &FileStorage) -> Self {
+        let metadata = source_metadata(path, storage.bytes()).unwrap();
+        let ready = build_or_open_index(path, storage, metadata).unwrap();
+        Self {
+            state: Arc::new(RwLock::new(DiskLineIndexState::Ready(Arc::new(ready)))),
         }
     }
 
@@ -248,6 +266,29 @@ impl ReadyDiskLineIndex {
                     byte0: 0,
                     child_page: 0,
                 });
+            };
+            if page.kind == PageKind::Leaf {
+                return Ok(entry);
+            }
+            current_page = entry.child_page;
+        }
+    }
+
+    fn checkpoint_for_byte(&self, byte0: u64) -> io::Result<PageEntry> {
+        if self.page_count == 0 {
+            return self.checkpoint_for_line(0);
+        }
+        let mut current_page = self.root_page;
+        loop {
+            let page = self.read_page(current_page)?;
+            // Checkpoint byte offsets are monotone in the same order as lines.
+            let index = page.entries.partition_point(|entry| entry.byte0 <= byte0);
+            let Some(entry) = index
+                .checked_sub(1)
+                .and_then(|i| page.entries.get(i))
+                .copied()
+            else {
+                return self.checkpoint_for_line(0);
             };
             if page.kind == PageKind::Leaf {
                 return Ok(entry);
@@ -800,6 +841,8 @@ mod tests {
         let checkpoint = ready.checkpoint_for_line(16_384).unwrap();
         assert!(checkpoint.line0 <= 16_384);
         assert!(checkpoint.byte0 <= storage.len() as u64);
+        let by_byte = ready.checkpoint_for_byte(checkpoint.byte0 + 1).unwrap();
+        assert_eq!(by_byte, checkpoint);
 
         let _ = fs::remove_file(&sidecar);
         let _ = fs::remove_file(&path);

@@ -71,6 +71,8 @@ impl Document {
             added_lines = normalized_lines;
             last_col = normalized_last_col;
             rope.insert(insert_at, &normalized);
+            self.rope_history
+                .record(insert_at, String::new(), normalized);
         } else {
             for ch in text.chars() {
                 if ch == '\n' {
@@ -81,6 +83,8 @@ impl Document {
                 }
             }
             rope.insert(insert_at, text);
+            self.rope_history
+                .record(insert_at, String::new(), text.to_owned());
         }
         if added_lines == 0 {
             Ok((line0, col0.saturating_add(last_col)))
@@ -324,6 +328,8 @@ impl Document {
             added_lines = normalized_lines;
             last_col = normalized_last_col;
             rope.insert(insert_at, &normalized);
+            self.rope_history
+                .record(insert_at, String::new(), normalized);
         } else {
             for ch in text.chars() {
                 if ch == '\n' {
@@ -334,6 +340,8 @@ impl Document {
                 }
             }
             rope.insert(insert_at, text);
+            self.rope_history
+                .record(insert_at, String::new(), text.to_owned());
         }
         if added_lines == 0 {
             Ok((line0, col0.saturating_add(last_col)))
@@ -462,7 +470,9 @@ impl Document {
         let start = Self::line_col_to_char_index(rope, line0, start_col0);
         let end = start.saturating_add(len_chars).min(rope.len_chars());
         if end > start {
+            let removed = rope.slice(start..end).to_string();
             rope.remove(start..end);
+            self.rope_history.record(start, removed, String::new());
             self.mark_dirty();
         }
         Ok((line0, start_col0))
@@ -514,7 +524,9 @@ impl Document {
             let start = Self::line_col_to_char_index(rope, line0, start_col0);
             let end = start.saturating_add(len_chars).min(rope.len_chars());
             if end > start {
+                let removed = rope.slice(start..end).to_string();
                 rope.remove(start..end);
+                self.rope_history.record(start, removed, String::new());
                 self.mark_dirty();
             }
             return Ok((line0, start_col0));
@@ -609,8 +621,16 @@ impl Document {
             }
         }
 
-        let (line0, col0) = self.try_delete_text_range_at_internal(line0, col0, len_chars)?;
-        self.try_insert_text_at(line0, col0, text)
+        // The composite delete + insert pair undoes as a single operation,
+        // matching the piece-table `replace_range_at` granularity. The batch
+        // always flushes: if the insert failed after a successful delete, the
+        // document did change and the deletion must stay undoable.
+        self.rope_history.begin_batch();
+        let result = self
+            .try_delete_text_range_at_internal(line0, col0, len_chars)
+            .and_then(|(line0, col0)| self.try_insert_text_at(line0, col0, text));
+        self.rope_history.end_batch();
+        result
     }
 
     /// Encoded replace path for non-UTF-8 documents.
@@ -821,6 +841,8 @@ impl Document {
             } else {
                 (true, line0, col0.saturating_sub(1))
             };
+            self.rope_history
+                .record(cur - 1, prev_ch.to_string(), String::new());
             self.mark_dirty();
             return Ok(result);
         }
@@ -1033,6 +1055,8 @@ impl Document {
             None
         };
         rope.remove((cur - 1)..cur);
+        self.rope_history
+            .record(cur - 1, prev_ch.to_string(), String::new());
 
         if prev_ch == '\n' {
             let new_line0 = line0.saturating_sub(1);
@@ -1141,7 +1165,9 @@ impl Document {
         if start >= rope.len_chars() {
             return Ok((false, line0, start_col0));
         }
+        let removed = rope.char(start).to_string();
         rope.remove(start..(start + 1));
+        self.rope_history.record(start, removed, String::new());
         self.mark_dirty();
         Ok((true, line0, start_col0))
     }

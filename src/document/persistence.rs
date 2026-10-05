@@ -342,6 +342,18 @@ pub(super) fn clear_session_sidecar(path: &Path) {
 }
 
 impl Document {
+    /// Deletes the persisted `.qem.editlog` session sidecar for `path`.
+    ///
+    /// Frontends use this to offer an explicit "reopen clean" action when a
+    /// restored session turns out to be stale or implausible — for example,
+    /// a recovered document that is far smaller than its source file. The
+    /// source file is never touched; the next open starts from the pristine
+    /// disk contents and rebuilds every sidecar from scratch.
+    pub fn clear_persisted_session(path: &std::path::Path) {
+        let _ = editlog_path(path);
+        let _ = std::fs::remove_file(editlog_path(path));
+    }
+
     pub(crate) fn handle_discarded_save_completion(&mut self, completion: &SaveCompletion) {
         let Some(path) = self.path.as_deref() else {
             return;
@@ -475,23 +487,128 @@ impl Document {
     }
 
     /// Restores the document to the previous persisted piece-tree root snapshot.
-    pub fn try_undo(&mut self) -> Result<bool, DocumentError> {
+    ///
+    /// This is the piece-tree branch of [`Self::try_undo_with_cursor`]. The
+    /// snapshot history does not track caret positions, so the returned
+    /// [`UndoResult`] always reports `cursor: None` on this path.
+    fn try_undo_piece_table(&mut self) -> Result<UndoResult, DocumentError> {
         let doc_path = self.path.clone();
         let Some(piece_table) = self.piece_table.as_mut() else {
-            return Ok(false);
+            return Ok(UndoResult::noop());
         };
         let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
         match piece_table.undo() {
-            Ok(false) => Ok(false),
+            Ok(false) => Ok(UndoResult::noop()),
             Ok(true) => {
                 self.mark_dirty();
-                Ok(true)
+                Ok(UndoResult::applied())
             }
             Err(source) => {
                 self.mark_dirty();
                 Err(DocumentError::Write { path, source })
             }
         }
+    }
+
+    /// Reapplies the next piece-tree root snapshot.
+    ///
+    /// Piece-tree branch of [`Self::try_redo_with_cursor`]; see
+    /// [`Self::try_undo_piece_table`] for the cursor contract.
+    fn try_redo_piece_table(&mut self) -> Result<UndoResult, DocumentError> {
+        let doc_path = self.path.clone();
+        let Some(piece_table) = self.piece_table.as_mut() else {
+            return Ok(UndoResult::noop());
+        };
+        let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
+        match piece_table.redo() {
+            Ok(false) => Ok(UndoResult::noop()),
+            Ok(true) => {
+                self.mark_dirty();
+                Ok(UndoResult::applied())
+            }
+            Err(source) => {
+                self.mark_dirty();
+                Err(DocumentError::Write { path, source })
+            }
+        }
+    }
+
+    /// Restores the document to the state before the most recent edit and
+    /// reports whether anything was undone.
+    ///
+    /// History is per edit buffer: the piece-tree buffer replays its
+    /// persisted snapshot history, and the rope buffer replays its in-memory
+    /// `rope_history::RopeHistory`. Small UTF-8 documents (below the
+    /// piece-table size gate) and untitled documents always edit through the
+    /// rope buffer, so they undo through rope history; once such a document
+    /// has been edited, this no longer reports a silent no-op.
+    ///
+    /// Undoing marks the document dirty on both paths.
+    ///
+    /// # Errors
+    /// Returns [`DocumentError::Write`] when the piece-tree snapshot replay
+    /// fails against the session sidecar.
+    pub fn try_undo(&mut self) -> Result<bool, DocumentError> {
+        Ok(self.try_undo_with_cursor()?.changed())
+    }
+
+    /// Like [`Self::try_undo`], but also reports the restored caret position
+    /// when the backing tracks one.
+    ///
+    /// The rope buffer returns the position the undone edit started from.
+    /// The piece-tree snapshot history has no caret bookkeeping and reports
+    /// `cursor: None`; frontends keep their current (clamped) caret there.
+    ///
+    /// # Errors
+    /// Returns [`DocumentError::Write`] when the piece-tree snapshot replay
+    /// fails against the session sidecar.
+    pub fn try_undo_with_cursor(&mut self) -> Result<UndoResult, DocumentError> {
+        if self.piece_table.is_some() {
+            return self.try_undo_piece_table();
+        }
+        let Some(rope) = self.rope.as_mut() else {
+            return Ok(UndoResult::noop());
+        };
+        let Some(cursor_char) = self.rope_history.undo(rope) else {
+            return Ok(UndoResult::noop());
+        };
+        self.mark_dirty();
+        Ok(UndoResult::applied_with_cursor(
+            self.position_for_char_index(cursor_char),
+        ))
+    }
+
+    /// Reapplies the next change from persistent history.
+    ///
+    /// See [`Self::try_undo`] for the per-buffer history contract.
+    ///
+    /// # Errors
+    /// Returns [`DocumentError::Write`] when the piece-tree snapshot replay
+    /// fails against the session sidecar.
+    pub fn try_redo(&mut self) -> Result<bool, DocumentError> {
+        Ok(self.try_redo_with_cursor()?.changed())
+    }
+
+    /// Like [`Self::try_redo`], but also reports the resulting caret position
+    /// when the backing tracks one. See [`Self::try_undo_with_cursor`].
+    ///
+    /// # Errors
+    /// Returns [`DocumentError::Write`] when the piece-tree snapshot replay
+    /// fails against the session sidecar.
+    pub fn try_redo_with_cursor(&mut self) -> Result<UndoResult, DocumentError> {
+        if self.piece_table.is_some() {
+            return self.try_redo_piece_table();
+        }
+        let Some(rope) = self.rope.as_mut() else {
+            return Ok(UndoResult::noop());
+        };
+        let Some(cursor_char) = self.rope_history.redo(rope) else {
+            return Ok(UndoResult::noop());
+        };
+        self.mark_dirty();
+        Ok(UndoResult::applied_with_cursor(
+            self.position_for_char_index(cursor_char),
+        ))
     }
 
     /// Rolls the document back to the previous persisted edit snapshot.
@@ -499,26 +616,6 @@ impl Document {
     #[deprecated(since = "0.3.0", note = "use try_undo() for explicit error handling")]
     pub fn undo(&mut self) -> bool {
         self.try_undo().unwrap_or(false)
-    }
-
-    /// Reapplies the next change from persistent history.
-    pub fn try_redo(&mut self) -> Result<bool, DocumentError> {
-        let doc_path = self.path.clone();
-        let Some(piece_table) = self.piece_table.as_mut() else {
-            return Ok(false);
-        };
-        let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
-        match piece_table.redo() {
-            Ok(false) => Ok(false),
-            Ok(true) => {
-                self.mark_dirty();
-                Ok(true)
-            }
-            Err(source) => {
-                self.mark_dirty();
-                Err(DocumentError::Write { path, source })
-            }
-        }
     }
 
     /// Reapplies the next persisted edit snapshot.

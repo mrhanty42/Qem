@@ -300,8 +300,8 @@ pub use document::{
     DocumentStatus, EditCapability, EditResult, FragmentationStats, IdleCompactionOutcome,
     LineCount, LineEnding, LineSlice, LiteralSearchIter, LiteralSearchQuery, MaintenanceAction,
     OpenEncodingPolicy, RegexCompileError, RegexSearchIter, RegexSearchQuery, SaveEncodingPolicy,
-    SearchMatch, TextPosition, TextRange, TextSelection, TextSlice, Viewport, ViewportRequest,
-    ViewportRow,
+    SearchMatch, TextPosition, TextRange, TextSelection, TextSlice, UndoResult, Viewport,
+    ViewportRequest, ViewportRow,
 };
 #[cfg(feature = "editor")]
 pub use editor::{

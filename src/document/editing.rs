@@ -17,6 +17,20 @@ enum ActiveEditPlan {
     PromotePieceTableToRope,
 }
 
+/// Reported when an edit lands beyond the bounded piece-table window of a
+/// storage-backed document that can never be materialized into a rope.
+pub(super) static EDIT_WINDOW_LIMIT_REASON: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "editing is limited to the first {LINE_LENGTHS_MAX_SYNC_LINES} lines of this file (bounded edit window)"
+    )
+});
+
+pub(super) const EDIT_WINDOW_LIMIT_LINES: usize = LINE_LENGTHS_MAX_SYNC_LINES;
+
+pub(super) fn edit_window_limit_reason() -> &'static str {
+    &EDIT_WINDOW_LIMIT_REASON
+}
+
 impl Document {
     pub(super) fn precise_piece_table_line_lengths(
         &self,
@@ -53,13 +67,14 @@ impl Document {
                 return Some((line_lengths, true));
             }
         }
+        // A window reaching beyond the sync budget can never be seeded; bail
+        // before materializing a doomed prefix vector.
+        if line0 >= LINE_LENGTHS_MAX_SYNC_LINES {
+            return None;
+        }
         let required_lines = line0
             .saturating_add(1)
-            .clamp(
-                PARTIAL_PIECE_TABLE_TARGET_LINES,
-                PARTIAL_PIECE_TABLE_MAX_LINES,
-            )
-            .min(LINE_LENGTHS_MAX_SYNC_LINES);
+            .max(PARTIAL_PIECE_TABLE_TARGET_LINES);
         let guard = self.line_offsets.read().ok()?;
 
         let mut line_lengths = prefix_line_lengths_from_offsets(&guard, required_lines);
@@ -155,6 +170,14 @@ impl Document {
                 // On huge mmap-backed files we must never fall back to a full Rope
                 // materialization unless policy explicitly allows it.
                 self.indexing.store(false, Ordering::Relaxed);
+                if self.storage.is_some() && !self.can_materialize_rope(self.file_len) {
+                    let reason: &'static str = if line0 >= LINE_LENGTHS_MAX_SYNC_LINES {
+                        &EDIT_WINDOW_LIMIT_REASON
+                    } else {
+                        "the edit buffer for this line could not be prepared"
+                    };
+                    return Err(self.edit_unsupported(reason));
+                }
                 self.ensure_rope()
             }
         }

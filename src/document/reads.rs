@@ -388,7 +388,7 @@ impl Document {
     }
 
     fn line_slice_from_piece_table_backing(
-        engine: &dyn EncodingEngine,
+        &self,
         piece_table: &PieceTable,
         line0: usize,
         start_col: usize,
@@ -400,8 +400,7 @@ impl Document {
                 true,
             ));
         }
-        Self::line_slices_from_partial_piece_table_backing(
-            engine,
+        self.line_slices_from_partial_piece_table_backing(
             piece_table,
             line0,
             1,
@@ -456,24 +455,15 @@ impl Document {
             if start0 >= file_len {
                 return LineSlice::new(String::new(), true);
             }
-            if let Some(scanned) = next_mmap_line_range(
+            let end0 = engine.next_line_start(bytes, file_len, start0);
+            return line_slice_from_bytes(
                 engine,
                 bytes,
-                file_len,
-                start0,
-                FALLBACK_NEXT_LINE_SCAN_BYTES,
-            ) {
-                if scanned.complete {
-                    return line_slice_from_bytes(
-                        engine,
-                        bytes,
-                        Some(scanned.range),
-                        start_col,
-                        max_cols,
-                        true,
-                    );
-                }
-            }
+                Some((start0, end0)),
+                start_col,
+                max_cols,
+                true,
+            );
         }
 
         let indexing_complete = self.is_fully_indexed();
@@ -540,8 +530,7 @@ impl Document {
         let remaining = line_count.saturating_sub(slices.len());
         if remaining > 0 {
             let scan_start_line0 = first_line0.saturating_add(slices.len());
-            if let Some(mut scanned) = Self::line_slices_from_partial_piece_table_backing(
-                self.encoding_engine(),
+            if let Some(mut scanned) = self.line_slices_from_partial_piece_table_backing(
                 piece_table,
                 scan_start_line0,
                 remaining,
@@ -556,8 +545,102 @@ impl Document {
         slices
     }
 
+    fn checkpoint_piece_table_line_slices(
+        &self,
+        piece_table: &PieceTable,
+        first_line0: usize,
+        line_count: usize,
+        start_col: usize,
+        max_cols: usize,
+    ) -> Option<Vec<LineSlice>> {
+        let disk_index = self.disk_index.as_ref()?;
+        let engine = self.encoding_engine();
+        let boundary = piece_table.known_byte_len.min(piece_table.total_len());
+        let mut original_start = None;
+        let mut expected = None;
+        // Never apply an original-file checkpoint to edited tail text. Verify
+        // that the entire unindexed tail is a contiguous original range first;
+        // this also works with recovered sessions without assuming edit history.
+        let untouched = piece_table.pieces.visit_range_while(
+            boundary,
+            piece_table.total_len(),
+            |piece, local_start, local_end| {
+                if piece.src != PieceSource::Original {
+                    return false;
+                }
+                let start = piece.start.saturating_add(local_start);
+                if expected.is_some_and(|offset| offset != start) {
+                    return false;
+                }
+                original_start.get_or_insert(start);
+                expected = Some(piece.start.saturating_add(local_end));
+                true
+            },
+        );
+        if !untouched {
+            return None;
+        }
+        let original_start = original_start?;
+        let bytes = piece_table.original.bytes();
+        let file_len = bytes.len();
+        if expected != Some(file_len) {
+            return None;
+        }
+        let anchor = disk_index.checkpoint_for_byte(original_start)?;
+        let mut original_line0 = anchor.line0;
+        let mut start = anchor.byte0;
+        while start < original_start {
+            let next = engine.next_line_start(bytes, file_len, start);
+            if next <= start || next > original_start {
+                return None;
+            }
+            start = next;
+            original_line0 = original_line0.saturating_add(1);
+        }
+        // The known prefix must end at a real original line boundary, not in
+        // the middle of a line (malformed or interrupted recovery metadata).
+        if start != original_start {
+            return None;
+        }
+        let target =
+            original_line0.checked_add(first_line0.checked_sub(piece_table.line_count())?)?;
+        let checkpoint = disk_index.checkpoint_for_line(target)?;
+        let mut line0 = checkpoint.line0;
+        start = checkpoint.byte0;
+        while line0 < target {
+            if start >= file_len {
+                return None;
+            }
+            let next = engine.next_line_start(bytes, file_len, start);
+            if next <= start {
+                return None;
+            }
+            start = next;
+            line0 += 1;
+        }
+        let mut slices = Vec::with_capacity(line_count);
+        let total_lines = disk_index.total_lines()?;
+        for offset in 0..line_count {
+            if target.saturating_add(offset) >= total_lines || start == file_len {
+                slices.push(LineSlice::new(String::new(), true));
+                continue;
+            }
+            let end = engine.next_line_start(bytes, file_len, start);
+            slices.push(line_slice_from_bytes(
+                engine,
+                bytes,
+                Some((start, end)),
+                start_col,
+                max_cols,
+                true,
+            ));
+            start = end;
+        }
+        Some(slices)
+    }
+
     fn line_slices_from_partial_piece_table_backing(
-        engine: &dyn EncodingEngine,
+        &self,
         piece_table: &PieceTable,
         first_line0: usize,
         line_count: usize,
@@ -566,6 +649,16 @@ impl Document {
     ) -> Option<Vec<LineSlice>> {
         if line_count == 0 || first_line0 < piece_table.line_count() {
             return Some(Vec::new());
+        }
+        let engine = self.encoding_engine();
+        if let Some(slices) = self.checkpoint_piece_table_line_slices(
+            piece_table,
+            first_line0,
+            line_count,
+            start_col,
+            max_cols,
+        ) {
+            return Some(slices);
         }
 
         let scan_start = piece_table.known_byte_len.min(piece_table.total_len());
@@ -578,6 +671,17 @@ impl Document {
 
         let bytes = piece_table.read_range(scan_start, scan_end);
         let buffer_reaches_eof = scan_end == piece_table.total_len();
+        // Recovery metadata may end in the middle of an original line. In
+        // that case the first scanned row (and every following row in this
+        // window) has an uncertain logical line number; never advertise it as
+        // exact even when the bounded scan itself reaches a newline.
+        let boundary_is_line_start = scan_start == 0
+            || matches!(
+                piece_table
+                    .read_range(scan_start.saturating_sub(1), scan_start)
+                    .last(),
+                Some(b'\n' | b'\r')
+            );
         let mut rel_start = 0usize;
         let mut skip_lines = first_line0.saturating_sub(piece_table.line_count());
         while skip_lines > 0 {
@@ -617,7 +721,7 @@ impl Document {
                     scanned.range,
                     start_col,
                     max_cols,
-                    scanned.complete,
+                    scanned.complete && boundary_is_line_start,
                 ),
             ));
             rel_start = scanned.range.1;
@@ -680,10 +784,32 @@ impl Document {
         let mut scan_start = None;
         let engine = self.encoding_engine();
 
+        // A sparse disk index is an exact line-start index, not an estimate.
+        // When the in-memory prefix has not reached the requested row, scan
+        // forward from its checkpoint and keep the resulting rows exact.
+        if self
+            .disk_index_checkpoint_for_line(request.first_line0)
+            .is_some()
+        {
+            scan_start = self.mmap_line_start_offset_exact(request.first_line0);
+        } else if let Some(start) = ctx.offsets.and_then(|o| o.get_usize(request.first_line0)) {
+            scan_start = Some(start.min(ctx.file_len));
+        }
+
         while slices.len() < request.line_count {
-            let Some(range) =
+            let range =
                 mmap_line_byte_range(ctx.offsets, ctx.file_len, next_line0, ctx.indexing_complete)
-            else {
+                    .or_else(|| {
+                        let start0 = scan_start?;
+                        if start0 >= ctx.file_len {
+                            return Some((ctx.file_len, ctx.file_len));
+                        }
+                        Some((
+                            start0,
+                            engine.next_line_start(ctx.bytes, ctx.file_len, start0),
+                        ))
+                    });
+            let Some(range) = range else {
                 break;
             };
             scan_start = Some(range.1);
@@ -783,12 +909,13 @@ impl Document {
             indexing_complete,
             offsets,
         };
-        if let Some(slices) = self.tail_estimated_mmap_line_slices(ctx, request) {
-            return slices;
-        }
-
         let (mut slices, next_line0, scan_start) =
             self.collect_exact_mmap_line_slices(ctx, request);
+        if slices.is_empty() {
+            if let Some(slices) = self.tail_estimated_mmap_line_slices(ctx, request) {
+                return slices;
+            }
+        }
         self.extend_estimated_mmap_line_slices(&mut slices, ctx, request, next_line0, scan_start);
         slices.resize(line_count, LineSlice::default());
         if let Some(total_lines) = exact_total_lines {
@@ -879,13 +1006,9 @@ impl Document {
         }
 
         if let Some(piece_table) = &self.piece_table {
-            if let Some(slice) = Self::line_slice_from_piece_table_backing(
-                self.encoding_engine(),
-                piece_table,
-                line0,
-                start_col,
-                max_cols,
-            ) {
+            if let Some(slice) =
+                self.line_slice_from_piece_table_backing(piece_table, line0, start_col, max_cols)
+            {
                 return slice;
             }
             return LineSlice::default();

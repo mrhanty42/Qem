@@ -146,7 +146,7 @@ impl Document {
             .unwrap_or(false)
     }
 
-    fn disk_index_checkpoint_for_line(&self, line0: usize) -> Option<(usize, usize)> {
+    pub(super) fn disk_index_checkpoint_for_line(&self, line0: usize) -> Option<(usize, usize)> {
         if self.rope.is_some() || self.piece_table.is_some() {
             return None;
         }
@@ -275,10 +275,23 @@ impl Document {
             return total_lines.max(1);
         }
 
+        // A partial piece table knows the true average line length for its
+        // window; that sample is far better than the open-time heuristic for
+        // extrapolating the unwindowed tail.
+        let avg = self
+            .piece_table
+            .as_ref()
+            .filter(|piece_table| {
+                !piece_table.full_index()
+                    && piece_table.known_byte_len() > 0
+                    && piece_table.line_count() > 0
+            })
+            .map(|piece_table| piece_table.known_byte_len() / piece_table.line_count())
+            .unwrap_or_else(|| self.avg_line_len().max(1));
         let estimate = if self.file_len() == 0 {
             1
         } else {
-            self.file_len().div_ceil(self.avg_line_len().max(1)).max(1)
+            self.file_len().div_ceil(avg).max(1)
         };
         let offsets_rows = if let Ok(guard) = self.line_offsets.read() {
             guard.len().max(1)
@@ -309,7 +322,19 @@ impl Document {
             return Some(total_lines.max(1));
         }
         if self.is_fully_indexed() {
-            return Some(self.bounded_line_count().max(1));
+            // `indexed_bytes` is stamped to the full file length once a piece
+            // table owns line bookkeeping, but a partial piece table only
+            // carries boundaries for its bounded window. Reporting the window
+            // count as the exact document total silently capped scroll ranges
+            // at the window size (4096 lines on a 352-million-line file).
+            let window_covers_document = self
+                .piece_table
+                .as_ref()
+                .is_none_or(|piece_table| piece_table.known_byte_len() >= piece_table.total_len());
+            if window_covers_document {
+                return Some(self.bounded_line_count().max(1));
+            }
+            return None;
         }
         None
     }

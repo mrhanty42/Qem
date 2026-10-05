@@ -912,6 +912,46 @@ impl EditorTab {
         Ok(result)
     }
 
+    /// Undoes the most recent edit and updates the tab cursor when the
+    /// backing reports a restored caret position.
+    ///
+    /// Rejected while a background open or save is in flight, like the other
+    /// guarded tab edits. See [`Document::try_undo_with_cursor`] for the
+    /// per-buffer history contract; the tab cursor only moves when the
+    /// result carries a cursor, which the piece-tree snapshot path does not
+    /// provide.
+    ///
+    /// # Errors
+    /// Returns [`DocumentError::EditUnsupported`] while a background job is
+    /// running, and [`DocumentError::Write`] when the piece-tree snapshot
+    /// replay fails against the session sidecar.
+    pub fn try_undo(&mut self) -> Result<UndoResult, DocumentError> {
+        self.core.ensure_idle_for_edit()?;
+        let result = self.core.document_mut().try_undo_with_cursor()?;
+        if let Some(cursor) = result.cursor() {
+            self.cursor = CursorPosition::from_text_position(cursor);
+        }
+        Ok(result)
+    }
+
+    /// Redoes the most recently undone edit and updates the tab cursor when
+    /// the backing reports the resulting caret position.
+    ///
+    /// See [`EditorTab::try_undo`] and [`Document::try_redo_with_cursor`].
+    ///
+    /// # Errors
+    /// Returns [`DocumentError::EditUnsupported`] while a background job is
+    /// running, and [`DocumentError::Write`] when the piece-tree snapshot
+    /// replay fails against the session sidecar.
+    pub fn try_redo(&mut self) -> Result<UndoResult, DocumentError> {
+        self.core.ensure_idle_for_edit()?;
+        let result = self.core.document_mut().try_redo_with_cursor()?;
+        if let Some(cursor) = result.cursor() {
+            self.cursor = CursorPosition::from_text_position(cursor);
+        }
+        Ok(result)
+    }
+
     /// Applies a forward-delete command to an anchor/head selection and updates the tab cursor.
     pub fn try_delete_forward_selection(
         &mut self,

@@ -146,6 +146,43 @@ impl DocumentSession {
         self.core.document_mut()
     }
 
+    /// Undoes the most recent edit through the session guard.
+    ///
+    /// This is the guarded counterpart of
+    /// `document_mut().try_undo()`: it rejects while a background open or
+    /// save is in flight instead of mutating the document underneath a
+    /// running job. Frontends should prefer this method; undoing through the
+    /// raw `document_mut()` escape hatch during a background save can leave
+    /// the saved snapshot behind the in-memory text while the dirty flag is
+    /// cleared at job completion.
+    ///
+    /// See [`Document::try_undo_with_cursor`] for the per-buffer history
+    /// contract and the `cursor` semantics.
+    ///
+    /// # Errors
+    /// Returns [`DocumentError::EditUnsupported`] while a background job is
+    /// running, and [`DocumentError::Write`] when the piece-tree snapshot
+    /// replay fails against the session sidecar.
+    pub fn try_undo(&mut self) -> Result<UndoResult, DocumentError> {
+        self.core.ensure_idle_for_edit()?;
+        self.core.document_mut().try_undo_with_cursor()
+    }
+
+    /// Redoes the most recently undone edit through the session guard.
+    ///
+    /// The guarded counterpart of `document_mut().try_redo()`; see
+    /// [`DocumentSession::try_undo`] and
+    /// [`Document::try_redo_with_cursor`] for the contracts.
+    ///
+    /// # Errors
+    /// Returns [`DocumentError::EditUnsupported`] while a background job is
+    /// running, and [`DocumentError::Write`] when the piece-tree snapshot
+    /// replay fails against the session sidecar.
+    pub fn try_redo(&mut self) -> Result<UndoResult, DocumentError> {
+        self.core.ensure_idle_for_edit()?;
+        self.core.document_mut().try_redo_with_cursor()
+    }
+
     /// Returns the full document text as a `String`.
     ///
     /// This materializes the entire current document through

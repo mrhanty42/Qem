@@ -3346,3 +3346,80 @@ fn document_session_large_async_open_reports_pending_exact_line_count_before_ind
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn session_try_undo_rejected_while_background_save_in_flight() {
+    let dir = std::env::temp_dir().join(format!("qem-undo-busy-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("undo-busy.txt");
+    let original = b"abc\ndef\n".repeat((1024 * 1024 / 8) + 1);
+    fs::write(&path, &original).unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file(path.clone()).unwrap();
+    let _ = session.try_insert(TextPosition::new(0, 0), "123").unwrap();
+
+    assert!(session.save_async().unwrap());
+    assert!(session.is_saving());
+
+    // The guarded undo must refuse to mutate the document underneath the
+    // running save worker instead of silently desyncing the dirty flag.
+    let err = session.try_undo().unwrap_err();
+    assert!(matches!(err, DocumentError::EditUnsupported { .. }));
+    assert!(session.is_saving());
+    assert!(session.text().starts_with("123abc\ndef\n"));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = session.poll_background_job() {
+            result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background save after busy undo rejection timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(!session.is_busy());
+    // A same-path save of an mmap-anchored piece table reloads the document
+    // from disk at completion (finish_save's reload path), which intentionally
+    // resets edit history. The guarded undo reports the no-op honestly.
+    let undo = session.try_undo().unwrap();
+    assert!(!undo.changed());
+    assert!(!session.is_dirty());
+    assert!(session.text().starts_with(
+        "123abc
+def
+"
+    ));
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_try_undo_restores_text_after_edit() {
+    let dir = std::env::temp_dir().join(format!("qem-undo-session-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("undo-session.txt");
+    fs::write(&path, b"alpha\nbeta\n").unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file(path.clone()).unwrap();
+    let _ = session.try_insert(TextPosition::new(0, 0), "X").unwrap();
+    assert!(session.text().starts_with("Xalpha\n"));
+
+    let undo = session.try_undo().unwrap();
+    assert!(undo.changed());
+    assert_eq!(undo.cursor(), Some(TextPosition::new(0, 0)));
+    assert_eq!(session.text(), "alpha\nbeta\n");
+
+    let redo = session.try_redo().unwrap();
+    assert!(redo.changed());
+    assert_eq!(session.text(), "Xalpha\nbeta\n");
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}

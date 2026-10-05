@@ -3,7 +3,8 @@ use crate::{
     ByteProgress, CompactionPolicy, CutResult, Document, DocumentBacking, DocumentEncoding,
     DocumentEncodingOrigin, DocumentError, DocumentOpenOptions, DocumentSaveOptions,
     DocumentStatus, EditCapability, EditResult, LineCount, LineEnding, LiteralSearchQuery,
-    SearchMatch, TextPosition, TextRange, TextSelection, TextSlice, Viewport, ViewportRequest,
+    SearchMatch, TextPosition, TextRange, TextSelection, TextSlice, UndoResult, Viewport,
+    ViewportRequest,
 };
 use std::fs;
 use std::io;
