@@ -136,10 +136,18 @@ offsets.
 
 ## 0.9.0
 
-`0.9.0` is the rope replacement release.
+`0.9.0` is the rope replacement release, expanded to also ship rope-path
+undo/redo history: the piece tree already keeps snapshot history, but the
+rope edit buffer (small UTF-8 files and untitled documents) silently had
+none.
 
 ### Focus
 
+- Add undo/redo history to the rope edit buffer with guarded
+  `try_undo` / `try_redo` session entry points and caret reporting. The
+  in-memory history layer records inverted range edits and is deliberately
+  buffer-agnostic, so it carries over to the Qem-native edited buffer when
+  `ropey` is removed.
 - Replace the `ropey` dependency with a Qem-native edited-buffer structure.
   The new structure must:
   - support large-file editing with predictable memory.
@@ -165,6 +173,8 @@ offsets.
 - `ropey` is removed from `Cargo.toml`.
 - The new edited-buffer structure passes property-based parity tests
   against a reference oracle.
+- Undo/redo round-trip tests pass for rope-backed documents: small files,
+  untitled documents, composite replaces, and post-promotion edits.
 - All existing scenario tests stay green without behavior change.
 - Real-file perf numbers on edited buffers stay within the established
   baseline (no regression).

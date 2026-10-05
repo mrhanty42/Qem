@@ -1,5 +1,111 @@
 # Changelog
 
+## Unreleased (0.9.0)
+
+### Added
+
+- Undo/redo history for the rope edit buffer. Small UTF-8 documents (below
+  the piece-table size gate) and untitled documents edit through the rope
+  buffer and previously reported "nothing to undo" even right after edits;
+  they now keep a bounded in-memory history (500 operations) covering
+  insert, delete, backspace, delete-forward, and replace, with composite
+  replaces undoing in a single step. The history survives same-encoding
+  saves and is reset on reopen and on piece-table-to-rope promotion.
+- `Document::try_undo_with_cursor` / `try_redo_with_cursor` returning a
+  typed `UndoResult` that carries the restored caret position. The
+  piece-tree snapshot path reports `cursor: None` (its snapshots carry no
+  caret); rope history returns the position the edit started from.
+- `DocumentSession::try_undo` / `try_redo` and `EditorTab::try_undo` /
+  `try_redo`: guarded undo entry points that refuse while a background
+  open/save is in flight instead of mutating the document through the
+  `document_mut()` escape hatch underneath a running job.
+- Mouse text selection in the egui demo editor: drag with the left button,
+  Shift+click and Shift+arrow keys extend the selection, Escape collapses
+  it, and Ctrl+C / Ctrl+X / Delete / Backspace / typing operate on the
+  selection (falling back to the current search match when there is no
+  selection). The selection renders as a highlight under the text and its
+  geometry stays in integer line space, so it works at any depth of a
+  huge file.
+- The piece-table edit window is budget-based instead of a fixed
+  4,000,000-line cap: the materialized line-length table is bounded by a
+  128 MiB byte budget (16,777,216 rows on 64-bit targets), and
+  storage-backed documents whose whole line table fits the budget get a
+  fully indexed edit buffer, making every line editable (a
+  7,043,298-line 1 GiB log file used to refuse edits past line
+  4,000,000).
+
+### Fixed
+
+- The egui demo rendered every panel and the editor twice per frame after a
+  debugging leftover duplicated the whole update pass, doubling all widget
+  IDs (egui painted "First use / Second use of widget ID" warnings over the
+  window) and dropping the frame rate to single digits. The frame runs one
+  pass again; per-frame stderr diagnostics were removed and remain
+  available behind `QEM_DEBUG_FRAMES=1`. Release builds no longer allocate
+  a console window at all, so a QuickEdit text selection in a console can
+  never block the UI thread inside a stderr write again.
+- Typing after undo/redo, a search jump, or a background job completing no
+  longer deletes the text between a stale selection anchor and the caret:
+  every programmatic caret move now collapses the selection, and only the
+  selection-specific interactions (drag, Shift+click, Shift+arrows) manage
+  the anchor.
+- Editing beyond the bounded piece-table window reports the real limit
+  ("editing is limited to the first N lines of this file (bounded edit
+  window)") through `edit_capability_at` and the edit buffer paths, instead
+  of claiming the document is "too large to materialize into a rope".
+- The egui demo's Undo/Redo menu entries now actually undo and redo edits
+  (previously a silent no-op on rope-backed documents), restore the caret,
+  and route through the session guard.
+- The Edit-menu shortcuts that never existed (Ctrl+C / Ctrl+X for the
+  current search match) are wired up. Ctrl+Z / Ctrl+Y and the new clipboard
+  chords are ignored while the search or rename text field owns the
+  keyboard, so document undo no longer fires behind a text field.
+- Keyboard input no longer reaches the document while the "Unsaved changes"
+  or rename modal is open, and both modals close on Escape and backdrop
+  clicks via `Modal::should_close()`.
+- The demo Encoding menu entry "Save Copy As {encoding}" is renamed to
+  "Save As {encoding}" to match what it does (the document rebinds to the
+  new path when the save completes), same-encoding entries are no longer
+  disabled, and the pre-save rejection now renders the typed error through
+  its `Display` implementation.
+- Clicking the editor while the search bar is open closes the search bar
+  and drops the highlight instead of moving the caret while keystrokes keep
+  landing in the search field; the search-bar Close button now clears the
+  highlight like Escape does.
+- large_file demo: "Close" asks for confirmation when the document has
+  unsaved edits (including save-then-close), the caret column mapping
+  measures the real monospace glyph width instead of a hardcoded 8.4 px,
+  and the "Go to line" field is no longer reset while it is being edited.
+- Demo PageUp/PageDown use the actual viewport height instead of a fixed
+  30-line page, and background saves report "Saved" without yanking the
+  viewport back to the caret.
+- The demo editor viewport requests only the columns that fit the window
+  and clips every row to its own rect, so long lines no longer paint past
+  the window edge on huge files.
+- Opening a file whose first line break sits far from the start (log files
+  with long binary headers, zero-filled images) no longer scans the whole
+  document synchronously: the line-ending probe is bounded at 16 MiB and
+  falls back to LF beyond it. A 50 GiB no-newline file used to block the
+  background load for minutes.
+- Clamping a caret at column 0 no longer walks to the end of the line; on
+  a file stored as one giant line that walk crossed the whole document on
+  the UI thread.
+- Editing a huge file no longer collapses the reported line count to the
+  piece-table window. After the first edit the document moves into a
+  bounded piece-table window (4096 lines on the 50 GiB bench file), and
+  both the line count and the scroll range snapped to that window because
+  the window count was reported as the exact document total. A window that
+  does not cover the whole document now reports an honest estimate
+  extrapolated from the window's own average line length, and the full
+  scroll range survives the edit.
+
+### Changed
+
+- The `frontend_session` example only reports "saved copy" when the save
+  actually ran; a clean document already bound to the target path reports
+  that nothing was written.
+
+
 ## 0.8.1
 
 ### Fixed
