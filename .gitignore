@@ -10,3 +10,11 @@ demo_stdout.log
 # Per-OS junk.
 .DS_Store
 Thumbs.db
+
+# Scratch files written by demo runs and manual probes.
+examples/demo_test.txt
+examples/input.txt
+examples/output.txt
+
+# Local mapbuild worktree (its own build cache).
+/mapbuild

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 83ed91f7f64b22949312ad2e5015fe7876263c54380dc8a2ca693bdb21e164c2 # shrinks to encoding = DocumentEncoding("windows-1251"), seed_text = "", edits = [(TextPosition { line0: 0, col0: 0 }, "a"), (TextPosition { line0: 1, col0: 0 }, "A")]
