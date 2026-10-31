@@ -29,6 +29,15 @@ mod search;
 mod state;
 mod types;
 
+/// Reported when a far-line edit cannot be resolved because the disk line
+/// index is missing or does not cover the requested line.
+fn edit_span_unresolvable_error() -> DocumentError {
+    DocumentError::EditUnsupported {
+        path: None,
+        reason: editing::edit_span_unresolvable_reason(),
+    }
+}
+
 pub use crate::piece_tree::FragmentationStats;
 pub use compaction::{
     CompactionPolicy, CompactionRecommendation, CompactionUrgency, IdleCompactionOutcome,
@@ -1137,15 +1146,21 @@ impl PieceTable {
         }
         let known_byte_len = line_lengths.iter().copied().sum::<usize>().min(total_len);
         let known_line_count = line_lengths.len().max(1);
-        let pieces =
-            Self::build_initial_piece_tree(&original, total_len, &line_lengths, known_byte_len);
+        let pieces = Self::build_initial_piece_tree(
+            &original,
+            total_len,
+            &line_lengths,
+            known_byte_len,
+            full_index,
+        );
+        let exact_base_line_breaks = pieces.total_line_breaks();
 
         Self {
             original,
             add: Vec::new(),
             pieces,
             known_line_count,
-            exact_base_line_breaks: Some(known_line_count.saturating_sub(1)),
+            exact_base_line_breaks: Some(exact_base_line_breaks),
             exact_base_total_lines: exact_base_total_lines
                 .or(full_index.then_some(known_line_count)),
             known_byte_len,
@@ -1168,7 +1183,10 @@ impl PieceTable {
         meta: SessionMeta,
     ) -> Self {
         let total_len = pieces.total_len();
-        let known_line_count = pieces.total_line_breaks().saturating_add(1).max(1);
+        let known_line_count = pieces
+            .total_line_breaks()
+            .saturating_add(usize::from(meta.full_index))
+            .max(1);
         let known_byte_len = meta.known_byte_len.min(total_len);
 
         Self {
@@ -1195,8 +1213,217 @@ impl PieceTable {
         }
     }
 
+    /// Builds a piece table from pre-annotated pieces whose exact line-break
+    /// counts cover everything below `known_byte_len` (a document line
+    /// boundary). Used by the checkpoint-window edit path when the first
+    /// edit lands far beyond the in-memory line-offset prefix: the pieces
+    /// carry true per-piece break counts, so the piece tree can navigate to
+    /// the edit target without materializing a per-line length vector for
+    /// the whole span. `pieces` must end with one pristine tail piece
+    /// covering `[known_byte_len .. total_len)` with `line_breaks: 0`.
+    fn from_annotated_pieces(
+        original: FileStorage,
+        pieces: Vec<Piece>,
+        known_byte_len: usize,
+        known_line_count: usize,
+        exact_base_total_lines: Option<usize>,
+        encoding_origin: DocumentEncodingOrigin,
+        decoding_had_errors: bool,
+    ) -> Self {
+        let total_len: usize = pieces.iter().map(|piece| piece.len).sum();
+        let pieces = if total_len >= PIECE_TREE_DISK_MIN_BYTES {
+            PieceTree::from_pieces_disk(original.path(), pieces.clone())
+                .unwrap_or_else(|_| PieceTree::from_pieces(pieces))
+        } else {
+            PieceTree::from_pieces(pieces)
+        };
+        Self {
+            original,
+            add: Vec::new(),
+            pieces,
+            known_line_count,
+            exact_base_line_breaks: Some(known_line_count),
+            exact_base_total_lines,
+            known_byte_len: known_byte_len.min(total_len),
+            total_len,
+            full_index: false,
+            encoding_origin,
+            decoding_had_errors,
+            pending_session_flush: false,
+            pending_session_edits: 0,
+            last_session_flush: None,
+            edit_batch_depth: 0,
+            edit_batch_dirty: false,
+        }
+    }
+
+    /// Appends checkpoint-annotated pieces covering the document span from
+    /// the end of the known region through the interval that contains
+    /// `line0`, and splices them into the piece tree. The span must be
+    /// pristine original content (edits only ever happen inside the known
+    /// region, which `has_line` enforces at the edit gates). Returns the
+    /// number of line breaks the annotation added.
+    fn splice_annotated_pieces(
+        &mut self,
+        engine: &dyn encoding_engine::EncodingEngine,
+        disk: &crate::index::DiskLineIndex,
+        line0: usize,
+    ) -> Result<usize, DocumentError> {
+        // The byte walks below operate on the original storage bytes, so the
+        // walk bound is the original length, not the (post-edit) doc length.
+        let file_len = self.original.len().min(self.total_len);
+        let bytes = self.original.read_range(0, file_len);
+        let known_byte_len = self.known_byte_len;
+        let known_line_count = self.line_count();
+
+        // The first piece at or after the known-region boundary gives the
+        // constant doc→original offset of the pristine span.
+        let pieces = self.pieces.to_vec();
+        let mut consumed = 0usize;
+        let mut span_delta: i128 = 0;
+        let mut span_found = false;
+        for piece in &pieces {
+            let piece_end = consumed.saturating_add(piece.len);
+            if piece_end > known_byte_len {
+                span_delta = piece.start as i128 - consumed as i128;
+                span_found = true;
+                break;
+            }
+            consumed = piece_end;
+        }
+        if !span_found || known_byte_len as i128 + span_delta < 0 {
+            return Err(edit_span_unresolvable_error());
+        }
+        let orig_from = (known_byte_len as i128 + span_delta) as usize;
+        if orig_from >= file_len {
+            return Err(edit_span_unresolvable_error());
+        }
+
+        // The original line containing `orig_from` anchors the walk; a
+        // pristine span maps document lines onto original lines 1:1.
+        let Some(anchor) = disk.checkpoint_for_byte(orig_from) else {
+            return Err(edit_span_unresolvable_error());
+        };
+        let mut line = anchor.line0;
+        let mut byte = anchor.byte0;
+        while byte < file_len && byte < orig_from {
+            let next = engine.next_line_start(bytes, file_len, byte);
+            if next <= byte {
+                return Err(edit_span_unresolvable_error());
+            }
+            byte = next;
+            line += 1;
+        }
+        let anchor_line = line;
+        // Document lines inside the known region include the lines added or
+        // removed by earlier edits (`known_line_count` is refreshed from the
+        // piece tree after every edit), so the document→original line delta
+        // at the boundary is `known_line_count - 1 - anchor_line`: the doc
+        // line starting at the boundary has index `known_line_count - 1` and
+        // corresponds to the original line starting at (or containing)
+        // `orig_from`.
+        let target_orig_line = anchor_line + (line0 - known_line_count) + 1;
+        if let Some(total_lines) = disk.total_lines() {
+            if target_orig_line >= total_lines {
+                return Err(edit_span_unresolvable_error());
+            }
+        }
+        let Some((new_pieces, span_breaks, window_end_orig)) = checkpoint_pieces_up_to(
+            bytes,
+            file_len,
+            engine,
+            disk,
+            orig_from,
+            anchor_line,
+            target_orig_line,
+        ) else {
+            return Err(edit_span_unresolvable_error());
+        };
+
+        // Pristine-span check: every piece overlapping the doc range
+        // [known_byte_len .. target_doc_byte] must be original content with
+        // a contiguous original mapping, so the constant `span_delta` holds
+        // across the whole span.
+        let target_doc_byte = (window_end_orig as i128 - span_delta) as usize;
+        let mut expected_orig: Option<usize> = None;
+        let mut pristine = true;
+        self.pieces.visit_range_while(
+            known_byte_len,
+            target_doc_byte,
+            |piece, local_start, local_end| {
+                if !pristine {
+                    return false;
+                }
+                if piece.src != PieceSource::Original {
+                    pristine = false;
+                    return false;
+                }
+                let orig_start = piece.start + local_start;
+                match expected_orig {
+                    None => {
+                        if orig_start as i128 - (known_byte_len as i128 + local_start as i128)
+                            != span_delta
+                        {
+                            pristine = false;
+                            return false;
+                        }
+                    }
+                    Some(expected) => {
+                        if expected != orig_start {
+                            pristine = false;
+                            return false;
+                        }
+                    }
+                }
+                expected_orig = Some(piece.start + local_end);
+                true
+            },
+        );
+        if !pristine {
+            return Err(edit_span_unresolvable_error());
+        }
+
+        // The last piece is the pristine tail covering
+        // [known_byte_len .. total_len): the annotated pieces replace it, and
+        // a new pristine tail continues after the annotated region. Appending
+        // after the tail would place the pieces out of document order.
+        let mut all = self.pieces.to_vec();
+        let tail = all.pop();
+        match tail {
+            Some(piece) if piece.src == PieceSource::Original => {
+                let tail_doc_start = self.total_len.saturating_sub(piece.len);
+                if tail_doc_start != known_byte_len {
+                    return Err(edit_span_unresolvable_error());
+                }
+            }
+            _ => return Err(edit_span_unresolvable_error()),
+        }
+        all.extend(new_pieces);
+        let window_end_doc = (window_end_orig as i128 - span_delta) as usize;
+        if window_end_doc < self.total_len {
+            all.push(Piece {
+                src: PieceSource::Original,
+                start: window_end_orig,
+                len: self.total_len - window_end_doc,
+                line_breaks: 0,
+            });
+        }
+        self.pieces.replace_current_root_with_pieces(all);
+        self.known_byte_len = window_end_doc;
+        self.known_line_count += span_breaks;
+        self.exact_base_line_breaks = self
+            .exact_base_line_breaks
+            .map(|base| base.saturating_add(span_breaks));
+        Ok(span_breaks)
+    }
+
     pub(crate) fn line_count(&self) -> usize {
         self.known_line_count.max(1)
+    }
+
+    #[cfg(test)]
+    fn pieces_snapshot(&self) -> Vec<Piece> {
+        self.pieces.to_vec()
     }
 
     pub(crate) fn total_len(&self) -> usize {
@@ -1403,20 +1630,20 @@ impl PieceTable {
         let Some(line_start) = self.line_start_byte(line0) else {
             return String::new();
         };
-        if line_start >= self.known_byte_len {
+        let line_end = self.line_range(line0).1;
+        if line_start >= line_end {
             return String::new();
         }
         let start = self.byte_offset_for_col(line0, start_col);
-        if start >= self.known_byte_len {
+        if start >= line_end {
             return String::new();
         }
 
         let mut out = Vec::with_capacity(max_cols.min(4096).saturating_mul(4));
         let mut cols = 0usize;
-        let _ = self.pieces.visit_range_while(
-            start,
-            self.known_byte_len,
-            |piece, local_start, local_end| {
+        let _ = self
+            .pieces
+            .visit_range_while(start, line_end, |piece, local_start, local_end| {
                 if cols >= max_cols {
                     return false;
                 }
@@ -1441,8 +1668,7 @@ impl PieceTable {
                 }
 
                 true
-            },
-        );
+            });
 
         String::from_utf8(out)
             .unwrap_or_else(|err| String::from_utf8_lossy(&err.into_bytes()).into_owned())
@@ -1495,10 +1721,6 @@ impl PieceTable {
         let bytes = normalized.as_bytes();
         if !bytes.is_empty() {
             self.insert_bytes(insert_at, bytes)?;
-            if insert_at <= self.known_byte_len {
-                self.known_byte_len = self.known_byte_len.saturating_add(bytes.len());
-            }
-            self.refresh_known_line_count();
         }
 
         let cursor = if added_lines == 0 {
@@ -1542,10 +1764,6 @@ impl PieceTable {
 
         let insert_at = byte_offset.min(self.total_len);
         self.insert_bytes(insert_at, encoded)?;
-        if insert_at <= self.known_byte_len {
-            self.known_byte_len = self.known_byte_len.saturating_add(encoded.len());
-        }
-        self.refresh_known_line_count();
 
         Ok(EditOutcome::new(true, (0, 0)))
     }
@@ -1590,10 +1808,6 @@ impl PieceTable {
             if !encoded.is_empty() {
                 let insert_at = start.min(self.total_len);
                 self.insert_bytes(insert_at, encoded)?;
-                if insert_at <= self.known_byte_len {
-                    self.known_byte_len = self.known_byte_len.saturating_add(encoded.len());
-                }
-                self.refresh_known_line_count();
             }
             Ok(())
         })();
@@ -1995,9 +2209,15 @@ impl PieceTable {
         self.pieces
             .insert(pos.min(self.total_len), new_piece, &mut split_piece);
         self.total_len = self.pieces.total_len();
+        // Maintain the known-region boundary here, before the session flush
+        // can run: the journal must never serialize pieces from a newer
+        // document length with an older known_byte_len.
         if self.full_index {
             self.known_byte_len = self.total_len;
+        } else if pos <= self.known_byte_len {
+            self.known_byte_len = self.known_byte_len.saturating_add(bytes.len());
         }
+        self.refresh_known_line_count();
         self.schedule_session_flush()
     }
 
@@ -2047,6 +2267,7 @@ impl PieceTable {
         total_len: usize,
         line_lengths: &[usize],
         known_byte_len: usize,
+        full_index: bool,
     ) -> PieceTree {
         if total_len == 0 {
             return PieceTree::new();
@@ -2079,7 +2300,15 @@ impl PieceTable {
         };
 
         for (idx, len) in line_lengths.iter().copied().enumerate() {
-            let line_has_break = idx + 1 < known_line_count;
+            // A partial prefix ends at a complete line, so every prefix line's
+            // newline lies inside the known bytes and must be attributed. A
+            // full index ends with the virtual trailing line, which owns no
+            // break.
+            let line_has_break = if full_index {
+                idx + 1 < known_line_count
+            } else {
+                true
+            };
             if line_has_break && len > PIECE_TREE_TARGET_BYTES {
                 flush_chunk(
                     &mut pieces,
@@ -2187,7 +2416,16 @@ impl PieceTable {
     }
 
     fn refresh_known_line_count(&mut self) {
-        self.known_line_count = self.pieces.total_line_breaks().saturating_add(1).max(1);
+        // A full index counts the virtual trailing line after the final
+        // newline; a partial region ends at a complete line whose break is
+        // attributed, and the line starting at the boundary is not yet fully
+        // known, so it stays out of the count.
+        let trailing = usize::from(self.full_index);
+        self.known_line_count = self
+            .pieces
+            .total_line_breaks()
+            .saturating_add(trailing)
+            .max(1);
     }
 
     fn line_start_byte(&self, line0: usize) -> Option<usize> {
@@ -2195,7 +2433,7 @@ impl PieceTable {
             .find_line_start(line0, |piece, local_break_idx| {
                 self.local_offset_after_break(piece, local_break_idx)
             })
-            .filter(|offset| *offset <= self.known_byte_len)
+            .filter(|offset| *offset <= self.total_len)
     }
 
     fn local_offset_after_break(&self, piece: Piece, local_break_idx: usize) -> Option<usize> {
@@ -2233,6 +2471,160 @@ impl PieceTable {
         }
         None
     }
+}
+
+/// Builds checkpoint-aligned original pieces covering the document span from
+/// `from_byte` (whose containing original line is `from_line0`) until the
+/// checkpoint interval containing `target_orig_line` has been split at that
+/// line's exact start byte. Break counts come from the disk index, so the
+/// only byte scanning is the final ≤8192-line walk inside the target's
+/// interval. Returns the pieces, the line breaks they carry, and the byte
+/// offset that ends the annotated region (the end of the target interval).
+///
+/// Returns `None` when the disk index cannot resolve the span (missing
+/// checkpoints for the region, target beyond the indexed lines, or a
+/// malformed walk).
+fn checkpoint_pieces_up_to(
+    bytes: &[u8],
+    file_len: usize,
+    engine: &dyn encoding_engine::EncodingEngine,
+    disk: &crate::index::DiskLineIndex,
+    from_byte: usize,
+    from_line0: usize,
+    target_orig_line: usize,
+) -> Option<(Vec<Piece>, usize, usize)> {
+    if file_len == 0 || from_byte >= file_len || target_orig_line < from_line0 {
+        return None;
+    }
+    let stride = crate::index::INDEX_CHECKPOINT_STRIDE_LINES as usize;
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut span_breaks = 0usize;
+    let mut prev_line = from_line0;
+    let mut prev_byte = from_byte;
+    let mut guard = 0usize;
+    while prev_byte < file_len {
+        guard += 1;
+        if guard > 64 * 1024 * 1024 {
+            return None;
+        }
+        // The next stored checkpoint after `prev_line`. Stored checkpoints
+        // are at most `stride` lines apart, so querying `prev_line + stride`
+        // always makes progress while any checkpoint remains; past the last
+        // one the target sits within the final stride-sized stretch and the
+        // interval end is the end of the file.
+        let (cp_line, cp_byte) = match disk.checkpoint_for_line(prev_line + stride) {
+            Some(cp) if cp.line0 > prev_line => (cp.line0, cp.byte0.min(file_len)),
+            _ => {
+                    // No stored checkpoint covers the stretch up to the target: it
+                    // is within the final stride-sized stretch, so walk it and
+                    // attribute every line break exactly.
+                    let mut walk_line = prev_line;
+                    let mut walk_byte = prev_byte;
+                    while walk_line < target_orig_line && walk_byte < file_len {
+                        let next = engine.next_line_start(bytes, file_len, walk_byte);
+                        if next <= walk_byte {
+                            return None;
+                        }
+                        walk_byte = next;
+                        walk_line += 1;
+                    }
+                    if walk_line != target_orig_line {
+                        return None;
+                    }
+                    if walk_byte > prev_byte {
+                        pieces.push(Piece {
+                            src: PieceSource::Original,
+                            start: prev_byte,
+                            len: walk_byte - prev_byte,
+                            line_breaks: walk_line - prev_line,
+                        });
+                        span_breaks += walk_line - prev_line;
+                    }
+                    // Cover the target line itself through its terminator so the
+                    // annotated region includes its content and its break.
+                    if walk_byte < file_len {
+                        let line_end = engine.next_line_start(bytes, file_len, walk_byte);
+                        if line_end > walk_byte {
+                            pieces.push(Piece {
+                                src: PieceSource::Original,
+                                start: walk_byte,
+                                len: line_end - walk_byte,
+                                line_breaks: 1,
+                            });
+                            span_breaks += 1;
+                            walk_byte = line_end;
+                        }
+                    }
+                    return Some((pieces, span_breaks, walk_byte));
+            },
+        };
+        if cp_line < target_orig_line {
+            pieces.push(Piece {
+                src: PieceSource::Original,
+                start: prev_byte,
+                len: cp_byte.saturating_sub(prev_byte),
+                line_breaks: cp_line - prev_line,
+            });
+            span_breaks += cp_line - prev_line;
+            prev_line = cp_line;
+            prev_byte = cp_byte;
+            continue;
+        }
+        // The interval containing the target: split it at the exact start
+        // byte of `target_orig_line`.
+        let mut split_byte = prev_byte;
+        let mut split_line = prev_line;
+        while split_line < target_orig_line && split_byte < file_len {
+            let next = engine.next_line_start(bytes, file_len, split_byte);
+            if next <= split_byte {
+                return None;
+            }
+            split_byte = next;
+            split_line += 1;
+        }
+        if split_line != target_orig_line {
+            return None;
+        }
+        // The target line itself must land inside the annotated region with
+        // its terminator, so its content and break are fully known.
+        let mut target_end = split_byte;
+        if target_end < file_len {
+            let line_end = engine.next_line_start(bytes, file_len, target_end);
+            if line_end > target_end {
+                target_end = line_end;
+            }
+        }
+        let left_breaks = target_orig_line - prev_line;
+        let target_breaks = usize::from(target_end > split_byte);
+        let right_breaks = cp_line.saturating_sub(target_orig_line + 1);
+        if split_byte > prev_byte {
+            pieces.push(Piece {
+                src: PieceSource::Original,
+                start: prev_byte,
+                len: split_byte - prev_byte,
+                line_breaks: left_breaks,
+            });
+        }
+        if target_end > split_byte {
+            pieces.push(Piece {
+                src: PieceSource::Original,
+                start: split_byte,
+                len: target_end - split_byte,
+                line_breaks: target_breaks,
+            });
+        }
+        if cp_byte > target_end {
+            pieces.push(Piece {
+                src: PieceSource::Original,
+                start: target_end,
+                len: cp_byte - target_end,
+                line_breaks: right_breaks,
+            });
+        }
+        span_breaks += left_breaks + target_breaks + right_breaks;
+        return Some((pieces, span_breaks, cp_byte));
+    }
+    None
 }
 
 fn piece_source_bytes<'a>(original: &'a FileStorage, add: &'a [u8], src: PieceSource) -> &'a [u8] {

@@ -6776,3 +6776,203 @@ fn partial_piece_table_covering_whole_file_keeps_exact_count() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn windowed_piece_table_edits_far_lines_via_disk_index() {
+    let dir = std::env::temp_dir().join(format!("standpad-doc-windowed-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("windowed.log");
+    // The file must exceed FULL_SYNC_PIECE_TABLE_MAX_FILE_BYTES (64 MiB) so
+    // the synchronous line-length scan is skipped and the checkpoint-window
+    // path engages for a far first edit.
+    let lines = 1_000_000usize;
+    let line_len = 72usize; // "LINE-NNNNNNNN-" + 58 filler bytes + '\n'
+    let mut bytes = Vec::with_capacity(lines * line_len);
+    for i in 0..lines {
+        bytes.extend_from_slice(format!("LINE-{i:07}-{}\n", "x".repeat(58)).as_bytes());
+    }
+    assert!(bytes.len() > FULL_SYNC_PIECE_TABLE_MAX_FILE_BYTES);
+    assert_eq!(bytes.len(), lines * line_len);
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+    let disk = crate::index::DiskLineIndex::build_for_tests(&path, &storage);
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: Some(disk),
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        rope_history: RopeHistory::new(),
+        piece_table: None,
+        dirty: false,
+    };
+
+    // First edit far beyond the 16 MiB sync-scan reach.
+    let target = 650_000usize;
+    doc.try_insert_text_at(target, 0, "EDITED\n").unwrap();
+    let row = doc.line_slice(target, 0, 32);
+    assert!(row.is_exact(), "edited far row must be exact");
+    assert!(row.text().starts_with("EDITED"), "got {:?}", row.text());
+    let shifted = doc.line_slice(target + 1, 0, 24);
+    assert!(
+        shifted.text().starts_with(&format!("LINE-{target:07}-")),
+        "got {:?}",
+        shifted.text()
+    );
+    // The document total grew by exactly one line.
+    assert_eq!(doc.exact_line_count(), Some(lines + 2));
+
+    // A second far region: the annotated region extends monotonically and
+    // both distant edits coexist.
+    let target2 = 900_000usize;
+    doc.try_insert_text_at(target2, 0, "SECOND\n").unwrap();
+    let row2 = doc.line_slice(target2, 0, 32);
+    assert!(row2.is_exact());
+    assert!(row2.text().starts_with("SECOND"), "got {:?}", row2.text());
+    // An edit back inside the first known region still resolves.
+    doc.try_insert_text_at(10, 0, "EARLY\n").unwrap();
+    let row3 = doc.line_slice(10, 0, 32);
+    assert!(row3.text().starts_with("EARLY"), "got {:?}", row3.text());
+    assert_eq!(doc.exact_line_count(), Some(lines + 4));
+
+    // Save streams the pieces byte-accurately and the saved file reopens
+    // with every far edit in place.
+    let saved = dir.join("windowed-saved.log");
+    doc.save_to(&saved).unwrap();
+    drop(doc);
+    let reopened = Document::open(&saved).unwrap();
+    let expected_total = lines + 4;
+    let mut settled = false;
+    for _ in 0..600 {
+        if reopened.exact_line_count() == Some(expected_total) {
+            settled = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(settled, "reopened document did not finish indexing");
+    assert!(
+        reopened.line_slice(10, 0, 16).text().starts_with("EARLY"),
+        "early edit missing after reopen"
+    );
+    assert!(
+        reopened
+            .line_slice(target + 1, 0, 16)
+            .text()
+            .starts_with("EDITED"),
+        "far edit missing after reopen"
+    );
+    assert!(
+        reopened
+            .line_slice(target2 + 1, 0, 16)
+            .text()
+            .starts_with("SECOND"),
+        "second far edit missing after reopen"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&saved);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn recovered_far_edit_session_reads_beyond_annotated_region() {
+    let dir =
+        std::env::temp_dir().join(format!("standpad-doc-recovered-far-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("recovered.log");
+    let lines = 1_000_000usize;
+    let line_len = 72usize;
+    let mut bytes = Vec::with_capacity(lines * line_len);
+    for i in 0..lines {
+        bytes.extend_from_slice(format!("LINE-{i:07}-{}\n", "x".repeat(58)).as_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+    let disk = crate::index::DiskLineIndex::build_for_tests(&path, &storage);
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: Some(disk),
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
+        encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        rope_history: RopeHistory::new(),
+        piece_table: None,
+        dirty: false,
+    };
+
+    // Far edit through the checkpoint window; the session journal is flushed
+    // on the first edit (no debounce anchor yet).
+    doc.try_insert_text_at(650_000, 0, "EDITED\n").unwrap();
+    assert!(doc.is_dirty());
+    drop(doc);
+
+    // Reopen: the session journal must recover the far edit as a piece
+    // table, and reads BEYOND the annotated region must still resolve
+    // through the disk index.
+    let reopened = Document::open(&path).unwrap();
+    assert_eq!(
+        reopened.status().backing().as_str(),
+        "piece-table",
+        "session did not recover as a piece table"
+    );
+    let row = reopened.line_slice(650_000, 0, 16);
+    assert!(
+        row.text().starts_with("EDITED"),
+        "recovered edit missing: {:?}",
+        row.text()
+    );
+    if let Some(piece_table) = reopened.piece_table.as_ref() {
+        eprintln!(
+            "DEBUG recovered: known_byte={} known_lines={} total_len={} pieces={}",
+            piece_table.known_byte_len(),
+            piece_table.line_count(),
+            piece_table.total_len(),
+            piece_table.pieces_snapshot().len(),
+        );
+        for (i, p) in piece_table.pieces_snapshot().iter().take(36).enumerate() {
+            eprintln!(
+                "  p[{i}] start={} len={} breaks={}",
+                p.start, p.len, p.line_breaks
+            );
+        }
+    }
+    // Lines after the recovered edit are shifted by one document line.
+    for l in [700_000usize, 900_000, 999_000] {
+        let row = reopened.line_slice(l, 0, 24);
+        assert!(
+            row.is_exact() && row.text().starts_with(&format!("LINE-{:07}-", l - 1)),
+            "line {l} did not resolve after recovery: [exact={}] {:?}",
+            row.is_exact(),
+            row.text()
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("log.qem.editlog"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

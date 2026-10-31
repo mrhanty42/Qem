@@ -602,8 +602,17 @@ impl Document {
         if start != original_start {
             return None;
         }
+        // Map the document line to its original line through the boundary:
+        // `doc_breaks_before_boundary` counts the document line breaks below
+        // `boundary` directly from the piece tree, so the mapping does not
+        // depend on which known_line_count convention constructed the table
+        // (the line_lengths prefix and the checkpoint window differ by one).
+        let mut doc_breaks_before_boundary = 0usize;
+        piece_table.pieces.visit_range(0, boundary, |piece, _, _| {
+            doc_breaks_before_boundary += piece.line_breaks;
+        });
         let target =
-            original_line0.checked_add(first_line0.checked_sub(piece_table.line_count())?)?;
+            original_line0.checked_add(first_line0.checked_sub(doc_breaks_before_boundary)?)?;
         let checkpoint = disk_index.checkpoint_for_line(target)?;
         let mut line0 = checkpoint.line0;
         start = checkpoint.byte0;

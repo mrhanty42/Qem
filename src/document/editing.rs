@@ -8,6 +8,17 @@ enum EditBufferPlan {
         line_lengths: Vec<usize>,
         full_index: bool,
     },
+    /// Seed the piece table from disk-index checkpoints: the pieces carry
+    /// exact break counts for everything below `known_byte_len`, so edits
+    /// work at the target line without materializing per-line lengths for
+    /// the whole span.
+    CreatePieceTableWindowed {
+        storage: FileStorage,
+        pieces: Vec<Piece>,
+        known_byte_len: usize,
+        known_line_count: usize,
+        exact_total_lines: Option<usize>,
+    },
     CreateRope,
 }
 
@@ -29,6 +40,16 @@ pub(super) const EDIT_WINDOW_LIMIT_LINES: usize = LINE_LENGTHS_MAX_SYNC_LINES;
 
 pub(super) fn edit_window_limit_reason() -> &'static str {
     &EDIT_WINDOW_LIMIT_REASON
+}
+
+/// Reported when a far-line edit cannot be resolved because the disk line
+/// index is missing or cannot cover the target line.
+pub(super) static EDIT_SPAN_UNRESOLVABLE_REASON: LazyLock<String> = LazyLock::new(|| {
+    "this line cannot be resolved for editing: the on-disk line index is missing or does not cover it yet".to_owned()
+});
+
+pub(super) fn edit_span_unresolvable_reason() -> &'static str {
+    &EDIT_SPAN_UNRESOLVABLE_REASON
 }
 
 impl Document {
@@ -125,9 +146,91 @@ impl Document {
                     };
                 }
             }
+            // The target sits beyond every in-memory anchor. Seed the known
+            // region from disk-index checkpoints instead: the piece tree gets
+            // exact break counts down to the target without materializing a
+            // per-line vector for the span.
+            if let Some(plan) = self.windowed_piece_table_plan(line0) {
+                return plan;
+            }
         }
 
         EditBufferPlan::CreateRope
+    }
+
+    /// Builds the checkpoint-window piece-table plan for a first edit at
+    /// `line0` when no in-memory anchor reaches that far. Returns `None`
+    /// when there is no disk index (or it does not cover the line), leaving
+    /// the caller to report its own error.
+    fn windowed_piece_table_plan(&self, line0: usize) -> Option<EditBufferPlan> {
+        if line0 == 0 {
+            return None;
+        }
+        let disk = self.disk_index.as_ref()?;
+        let storage = self.storage.as_ref().cloned()?;
+        if let Some(total_lines) = disk.total_lines() {
+            if line0 >= total_lines {
+                return None;
+            }
+        }
+        let engine = self.encoding_engine();
+        let bytes = storage.read_range(0, storage.len());
+        let file_len = bytes.len();
+        let (mut pieces, span_breaks, window_end_orig) =
+            checkpoint_pieces_up_to(bytes, file_len, engine, disk, 0, 0, line0)?;
+        if window_end_orig < file_len {
+            pieces.push(Piece {
+                src: PieceSource::Original,
+                start: window_end_orig,
+                len: file_len - window_end_orig,
+                line_breaks: 0,
+            });
+        }
+        Some(EditBufferPlan::CreatePieceTableWindowed {
+            storage,
+            pieces,
+            known_byte_len: window_end_orig,
+            known_line_count: span_breaks,
+            exact_total_lines: disk.total_lines(),
+        })
+    }
+
+    /// Extends the existing piece table's annotated region so `line0` becomes
+    /// navigable, using the disk line index. A no-op when the table already
+    /// reaches the line or when the document is rope-backed.
+    fn annotate_piece_table_line(&mut self, line0: usize) -> Result<(), DocumentError> {
+        if self
+            .piece_table
+            .as_ref()
+            .is_none_or(|piece_table| piece_table.has_line(line0))
+        {
+            return Ok(());
+        }
+        let Some(disk) = self.disk_index.as_ref() else {
+            return Err(edit_span_unresolvable_error());
+        };
+        let engine = self.encoding_engine();
+        let flush = {
+            let piece_table = self
+                .piece_table
+                .as_mut()
+                .expect("piece table checked above");
+            piece_table.splice_annotated_pieces(engine, disk, line0)?
+        };
+        if flush > 0 {
+            // Persist the annotated pieces so crash recovery keeps them.
+            let path = self.path.clone();
+            if let Some(piece_table) = self.piece_table.as_mut() {
+                let sidecar = session_sidecar_path(path.as_deref(), piece_table.original.path());
+                piece_table
+                    .schedule_session_flush()
+                    .map_err(|source| DocumentError::Write {
+                        path: sidecar,
+                        source,
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     fn active_edit_plan_for_line(&self, line0: usize) -> ActiveEditPlan {
@@ -147,7 +250,22 @@ impl Document {
         line0: usize,
     ) -> Result<(), DocumentError> {
         match self.edit_buffer_plan_for_line(line0) {
-            EditBufferPlan::KeepCurrent => Ok(()),
+            EditBufferPlan::KeepCurrent => {
+                // A piece table already exists; extend its annotated region
+                // when the edit targets a line the tree cannot navigate to
+                // yet. When annotation is impossible but the table is still
+                // small enough to promote to a rope, fall through to the
+                // promotion path (the pre-window behavior).
+                if let Err(err) = self.annotate_piece_table_line(line0) {
+                    let promotable = self.piece_table.as_ref().is_some_and(|piece_table| {
+                        self.can_materialize_rope(piece_table.total_len())
+                    });
+                    if !promotable {
+                        return Err(err);
+                    }
+                }
+                Ok(())
+            }
             EditBufferPlan::CreatePieceTable {
                 storage,
                 line_lengths,
@@ -161,6 +279,25 @@ impl Document {
                     line_lengths,
                     full_index,
                     self.raw_disk_index_total_lines(),
+                    self.encoding_origin,
+                    self.decoding_had_errors,
+                ));
+                Ok(())
+            }
+            EditBufferPlan::CreatePieceTableWindowed {
+                storage,
+                pieces,
+                known_byte_len,
+                known_line_count,
+                exact_total_lines,
+            } => {
+                self.indexing.store(false, Ordering::Relaxed);
+                self.piece_table = Some(PieceTable::from_annotated_pieces(
+                    storage,
+                    pieces,
+                    known_byte_len,
+                    known_line_count,
+                    exact_total_lines,
                     self.encoding_origin,
                     self.decoding_had_errors,
                 ));

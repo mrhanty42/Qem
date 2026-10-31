@@ -22,7 +22,7 @@ const INDEX_CACHE_PAGES: usize = 32;
 const INDEX_BUILD_MIN_FILE_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 #[cfg(windows)]
 const INDEX_SYNC_BUILD_MAX_SCAN_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
-const INDEX_CHECKPOINT_STRIDE_LINES: u64 = 8_192;
+pub(crate) const INDEX_CHECKPOINT_STRIDE_LINES: u64 = 8_192;
 const INDEX_CHECKPOINT_STRIDE_BYTES: u64 = 1_048_576; // 1 MiB
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

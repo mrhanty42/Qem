@@ -26,6 +26,17 @@
   selection). The selection renders as a highlight under the text and its
   geometry stays in integer line space, so it works at any depth of a
   huge file.
+- Editing at any line of a huge storage-backed document. When an edit
+  targets a line beyond every in-memory anchor, the piece table extends its
+  annotated region from the on-disk line index: checkpoint-aligned pieces
+  carry exact per-piece line-break counts, so the piece tree can navigate
+  to the edit point without materializing per-line lengths for the span
+  (a line-132,213,510 insert into the 50 GiB bench file completes in well
+  under a second). The annotated region grows monotonically, edits in
+  several distant regions coexist, reads outside it keep using the disk
+  index, and annotated pieces persist through the session journal and
+  streaming saves. Documents that can still be promoted to a rope keep the
+  promotion fallback.
 - The piece-table edit window is budget-based instead of a fixed
   4,000,000-line cap: the materialized line-length table is bounded by a
   128 MiB byte budget (16,777,216 rows on 64-bit targets), and

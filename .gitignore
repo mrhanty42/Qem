@@ -4,6 +4,8 @@
 /all_combined.txt
 /tmp_probe.rs
 /scripts/huge_test.log
+demo_stderr.log
+demo_stdout.log
 
 # Per-OS junk.
 .DS_Store
