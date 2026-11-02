@@ -2515,48 +2515,48 @@ fn checkpoint_pieces_up_to(
         let (cp_line, cp_byte) = match disk.checkpoint_for_line(prev_line + stride) {
             Some(cp) if cp.line0 > prev_line => (cp.line0, cp.byte0.min(file_len)),
             _ => {
-                    // No stored checkpoint covers the stretch up to the target: it
-                    // is within the final stride-sized stretch, so walk it and
-                    // attribute every line break exactly.
-                    let mut walk_line = prev_line;
-                    let mut walk_byte = prev_byte;
-                    while walk_line < target_orig_line && walk_byte < file_len {
-                        let next = engine.next_line_start(bytes, file_len, walk_byte);
-                        if next <= walk_byte {
-                            return None;
-                        }
-                        walk_byte = next;
-                        walk_line += 1;
-                    }
-                    if walk_line != target_orig_line {
+                // No stored checkpoint covers the stretch up to the target: it
+                // is within the final stride-sized stretch, so walk it and
+                // attribute every line break exactly.
+                let mut walk_line = prev_line;
+                let mut walk_byte = prev_byte;
+                while walk_line < target_orig_line && walk_byte < file_len {
+                    let next = engine.next_line_start(bytes, file_len, walk_byte);
+                    if next <= walk_byte {
                         return None;
                     }
-                    if walk_byte > prev_byte {
+                    walk_byte = next;
+                    walk_line += 1;
+                }
+                if walk_line != target_orig_line {
+                    return None;
+                }
+                if walk_byte > prev_byte {
+                    pieces.push(Piece {
+                        src: PieceSource::Original,
+                        start: prev_byte,
+                        len: walk_byte - prev_byte,
+                        line_breaks: walk_line - prev_line,
+                    });
+                    span_breaks += walk_line - prev_line;
+                }
+                // Cover the target line itself through its terminator so the
+                // annotated region includes its content and its break.
+                if walk_byte < file_len {
+                    let line_end = engine.next_line_start(bytes, file_len, walk_byte);
+                    if line_end > walk_byte {
                         pieces.push(Piece {
                             src: PieceSource::Original,
-                            start: prev_byte,
-                            len: walk_byte - prev_byte,
-                            line_breaks: walk_line - prev_line,
+                            start: walk_byte,
+                            len: line_end - walk_byte,
+                            line_breaks: 1,
                         });
-                        span_breaks += walk_line - prev_line;
+                        span_breaks += 1;
+                        walk_byte = line_end;
                     }
-                    // Cover the target line itself through its terminator so the
-                    // annotated region includes its content and its break.
-                    if walk_byte < file_len {
-                        let line_end = engine.next_line_start(bytes, file_len, walk_byte);
-                        if line_end > walk_byte {
-                            pieces.push(Piece {
-                                src: PieceSource::Original,
-                                start: walk_byte,
-                                len: line_end - walk_byte,
-                                line_breaks: 1,
-                            });
-                            span_breaks += 1;
-                            walk_byte = line_end;
-                        }
-                    }
-                    return Some((pieces, span_breaks, walk_byte));
-            },
+                }
+                return Some((pieces, span_breaks, walk_byte));
+            }
         };
         if cp_line < target_orig_line {
             pieces.push(Piece {
