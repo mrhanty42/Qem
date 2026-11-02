@@ -25,7 +25,7 @@ the rope dependency with our own structure, then freeze the public API at
 
 ## Current Release Line
 
-Current target: `0.8.0`
+Current target: `0.9.0` (in progress, unreleased)
 
 ## 0.8.0
 
@@ -245,9 +245,11 @@ none.
 
 ## Short Version
 
-- `0.8.0` (current): regex + fast search + encoding-aware native byte
+- `0.8.0` (shipped): regex + fast search + encoding-aware native byte
   engine + UTF-8 BOM
-- `0.9.0`: replace `ropey` with a Qem-native edited-buffer structure
+- `0.9.0` (in progress): rope-path undo/redo, budget-bounded edit window,
+  far-edit support; planned: replace `ropey` with a Qem-native
+  edited-buffer structure
 - `1.0.0`: small cleanup (module splits, drop non-critical `unsafe`,
   remove `unwrap` / `expect` on recoverable paths, sidecar typed
   outcomes, backing transition events, regression benches in CI) +

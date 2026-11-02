@@ -205,9 +205,11 @@
 //! - Auto-detect open currently recognizes BOM-backed UTF-16 files.
 //!   Otherwise Qem stays on the normal UTF-8 / ASCII path unless the caller
 //!   provides an explicit fallback through [`DocumentOpenOptions`].
-//! - Non-UTF8 opens currently materialize into a rope-backed document instead
-//!   of using the mmap fast path. Very large legacy-encoded files may still be
-//!   rejected until the wider encoding contract expands.
+//! - Non-UTF8 opens run through the native per-encoding engines on the
+//!   mmap fast path (single-byte encodings, UTF-16 LE / BE, Shift_JIS,
+//!   GB18030, EUC-KR) without materializing a UTF-8 rope. Only the UTF-8
+//!   BOM-strip path and explicit transcode opens still decode through the
+//!   rope pipeline, and those branches are size-guarded.
 //! - [`Document::decoding_had_errors`] means the source required lossy decode
 //!   replacement at open time. That does not automatically mean preserve-save
 //!   is forbidden.

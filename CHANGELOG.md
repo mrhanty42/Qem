@@ -56,6 +56,11 @@
 
 ### Fixed
 
+- The crate-root support contract no longer claims that non-UTF-8 opens
+  materialize a rope-backed document: since 0.8.0 they run through the
+  native per-encoding engines on the mmap fast path, and only the UTF-8
+  BOM-strip and explicit transcode paths still decode through the rope
+  pipeline. ROADMAP's current-target labels now point at the 0.9.0 line.
 - A corrupt `.qem.editlog` sidecar whose raw (unchecksummed) header declares
   garbage history or add counters could drive huge allocations or
   out-of-bounds page reads while recovering a session. Page-chain lengths
