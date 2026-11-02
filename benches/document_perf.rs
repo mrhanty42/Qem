@@ -1,7 +1,7 @@
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
-use qem::__test_support::build_edit_buffer_line_count;
+use qem::document::__test_support::build_edit_buffer_line_count;
 use qem::{
     CompactionPolicy, Document, LiteralSearchQuery, RegexSearchQuery, TextPosition, TextSelection,
     ViewportRequest,

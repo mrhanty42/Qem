@@ -175,10 +175,6 @@ impl EditBuffer {
         self.root.summary().lines + 1
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len_bytes() == 0
-    }
-
     /// Converts a char index to a byte offset.
     ///
     /// # Panics
