@@ -1,4 +1,5 @@
 use crate::document::DocumentEncodingOrigin;
+use crate::sidecar::{le_u32, le_u64};
 use crate::source_identity::{sampled_content_fingerprint, sampled_file_fingerprint};
 use crate::storage::FileStorage;
 use crc32fast::Hasher;
@@ -1424,8 +1425,8 @@ fn read_editlog_header(file: &mut File) -> io::Result<EditLogHeader> {
             "invalid qem editlog magic",
         ));
     }
-    let version = u32::from_le_bytes(buf[8..12].try_into().unwrap_or([0; 4]));
-    let page_size = u32::from_le_bytes(buf[12..16].try_into().unwrap_or([0; 4]));
+    let version = le_u32(&buf, 8, "qem editlog header")?;
+    let page_size = le_u32(&buf, 12, "qem editlog header")?;
     if version != EDITLOG_VERSION || page_size as usize != EDITLOG_PAGE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1433,20 +1434,20 @@ fn read_editlog_header(file: &mut File) -> io::Result<EditLogHeader> {
         ));
     }
     Ok(EditLogHeader {
-        page_count: u64::from_le_bytes(buf[16..24].try_into().unwrap_or([0; 8])),
-        source_len: u64::from_le_bytes(buf[24..32].try_into().unwrap_or([0; 8])),
-        source_mtime_ns: u64::from_le_bytes(buf[32..40].try_into().unwrap_or([0; 8])),
-        source_fingerprint: u64::from_le_bytes(buf[40..48].try_into().unwrap_or([0; 8])),
-        history_first_page_id: u64::from_le_bytes(buf[48..56].try_into().unwrap_or([0; 8])),
-        history_page_count: u64::from_le_bytes(buf[56..64].try_into().unwrap_or([0; 8])),
-        history_len: u64::from_le_bytes(buf[64..72].try_into().unwrap_or([0; 8])),
-        history_index: u64::from_le_bytes(buf[72..80].try_into().unwrap_or([0; 8])),
-        add_first_page_id: u64::from_le_bytes(buf[80..88].try_into().unwrap_or([0; 8])),
-        add_page_count: u64::from_le_bytes(buf[88..96].try_into().unwrap_or([0; 8])),
-        add_len: u64::from_le_bytes(buf[96..104].try_into().unwrap_or([0; 8])),
-        known_byte_len: u64::from_le_bytes(buf[104..112].try_into().unwrap_or([0; 8])),
-        flags: u64::from_le_bytes(buf[112..120].try_into().unwrap_or([0; 8])),
-        encoding_origin: u32::from_le_bytes(buf[120..124].try_into().unwrap_or([0; 4])),
+        page_count: le_u64(&buf, 16, "qem editlog header")?,
+        source_len: le_u64(&buf, 24, "qem editlog header")?,
+        source_mtime_ns: le_u64(&buf, 32, "qem editlog header")?,
+        source_fingerprint: le_u64(&buf, 40, "qem editlog header")?,
+        history_first_page_id: le_u64(&buf, 48, "qem editlog header")?,
+        history_page_count: le_u64(&buf, 56, "qem editlog header")?,
+        history_len: le_u64(&buf, 64, "qem editlog header")?,
+        history_index: le_u64(&buf, 72, "qem editlog header")?,
+        add_first_page_id: le_u64(&buf, 80, "qem editlog header")?,
+        add_page_count: le_u64(&buf, 88, "qem editlog header")?,
+        add_len: le_u64(&buf, 96, "qem editlog header")?,
+        known_byte_len: le_u64(&buf, 104, "qem editlog header")?,
+        flags: le_u64(&buf, 112, "qem editlog header")?,
+        encoding_origin: le_u32(&buf, 120, "qem editlog header")?,
     })
 }
 
@@ -1518,7 +1519,7 @@ fn parse_page(buf: &[u8]) -> io::Result<PiecePage> {
         ));
     }
 
-    let expected_crc = u32::from_le_bytes(buf[0..4].try_into().unwrap_or([0; 4]));
+    let expected_crc = le_u32(buf, 0, "qem editlog page")?;
     let mut hasher = Hasher::new();
     hasher.update(&buf[4..]);
     if hasher.finalize() != expected_crc {
@@ -1540,7 +1541,7 @@ fn parse_page(buf: &[u8]) -> io::Result<PiecePage> {
             ));
         }
     };
-    let count = u64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8])) as usize;
+    let count = le_u64(buf, 8, "qem editlog page")? as usize;
     let mut cursor = EDITLOG_PAGE_HEADER_BYTES;
 
     match kind {
@@ -1557,15 +1558,9 @@ fn parse_page(buf: &[u8]) -> io::Result<PiecePage> {
             let mut children = Vec::with_capacity(count);
             for _ in 0..count {
                 children.push(ChildRef {
-                    page_id: u64::from_le_bytes(
-                        buf[cursor..cursor + 8].try_into().unwrap_or([0; 8]),
-                    ),
-                    total_bytes: u64::from_le_bytes(
-                        buf[cursor + 8..cursor + 16].try_into().unwrap_or([0; 8]),
-                    ) as usize,
-                    total_line_breaks: u64::from_le_bytes(
-                        buf[cursor + 16..cursor + 24].try_into().unwrap_or([0; 8]),
-                    ) as usize,
+                    page_id: le_u64(buf, cursor, "qem editlog page")?,
+                    total_bytes: le_u64(buf, cursor + 8, "qem editlog page")? as usize,
+                    total_line_breaks: le_u64(buf, cursor + 16, "qem editlog page")? as usize,
                 });
                 cursor += INTERNAL_ENTRY_BYTES;
             }
@@ -1594,15 +1589,9 @@ fn parse_page(buf: &[u8]) -> io::Result<PiecePage> {
                 };
                 pieces.push(Piece {
                     src,
-                    start: u64::from_le_bytes(
-                        buf[cursor + 8..cursor + 16].try_into().unwrap_or([0; 8]),
-                    ) as usize,
-                    len: u64::from_le_bytes(
-                        buf[cursor + 16..cursor + 24].try_into().unwrap_or([0; 8]),
-                    ) as usize,
-                    line_breaks: u64::from_le_bytes(
-                        buf[cursor + 24..cursor + 32].try_into().unwrap_or([0; 8]),
-                    ) as usize,
+                    start: le_u64(buf, cursor + 8, "qem editlog page")? as usize,
+                    len: le_u64(buf, cursor + 16, "qem editlog page")? as usize,
+                    line_breaks: le_u64(buf, cursor + 24, "qem editlog page")? as usize,
                 });
                 cursor += LEAF_ENTRY_BYTES;
             }
@@ -1689,30 +1678,38 @@ fn read_history_entries(
         return Ok(Vec::new());
     }
 
+    // The raw header is not checksummed, so its counters are bounded by what
+    // the sidecar file can physically hold before they reach the allocation
+    // and the per-page cursor below.
+    let page_capacity = history_page_capacity();
+    let page_count = bounded_page_count(file, page_count);
+    let history_len = history_len.min(page_count.saturating_mul(page_capacity));
+
     let mut out = Vec::with_capacity(history_len);
     for rel in 0..page_count {
         let page_id = first_page_id.saturating_add(rel as u64);
         let buf = read_raw_page_from_file(file, page_id)?;
         let count = parse_page_header(&buf, PageKind::History)?;
+        if count > page_capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "history editlog page is overfull",
+            ));
+        }
         let mut cursor = EDITLOG_PAGE_HEADER_BYTES;
         for _ in 0..count {
             if out.len() >= history_len {
                 break;
             }
-            let present = u64::from_le_bytes(buf[cursor..cursor + 8].try_into().unwrap_or([0; 8]));
+            let present = le_u64(&buf, cursor, "qem editlog history page")?;
             let root = if present == 0 {
                 None
             } else {
                 Some(ChildRef {
-                    page_id: u64::from_le_bytes(
-                        buf[cursor + 8..cursor + 16].try_into().unwrap_or([0; 8]),
-                    ),
-                    total_bytes: u64::from_le_bytes(
-                        buf[cursor + 16..cursor + 24].try_into().unwrap_or([0; 8]),
-                    ) as usize,
-                    total_line_breaks: u64::from_le_bytes(
-                        buf[cursor + 24..cursor + 32].try_into().unwrap_or([0; 8]),
-                    ) as usize,
+                    page_id: le_u64(&buf, cursor + 8, "qem editlog history page")?,
+                    total_bytes: le_u64(&buf, cursor + 16, "qem editlog history page")? as usize,
+                    total_line_breaks: le_u64(&buf, cursor + 24, "qem editlog history page")?
+                        as usize,
                 })
             };
             out.push(RootEntry { root });
@@ -1732,6 +1729,11 @@ fn read_add_bytes(
         return Ok(Vec::new());
     }
 
+    // Same raw-header bound as `read_history_entries`: the declared counters
+    // cannot exceed what the sidecar file can physically hold.
+    let page_count = bounded_page_count(file, page_count);
+    let add_len = add_len.min(page_count.saturating_mul(add_page_capacity().max(1)));
+
     let mut out = Vec::with_capacity(add_len);
     for rel in 0..page_count {
         let page_id = first_page_id.saturating_add(rel as u64);
@@ -1746,6 +1748,22 @@ fn read_add_bytes(
     }
     out.truncate(add_len);
     Ok(out)
+}
+
+/// Bounds a page-chain length taken from the raw editlog header by the
+/// number of pages the sidecar file can actually hold, so corrupt counters
+/// fail as typed errors instead of driving huge allocations or out-of-bounds
+/// cursors.
+fn bounded_page_count(file: &File, page_count: usize) -> usize {
+    let Ok(metadata) = file.metadata() else {
+        return page_count;
+    };
+    let usable = metadata
+        .len()
+        .saturating_sub(EDITLOG_HEADER_BYTES as u64)
+        .saturating_div(EDITLOG_PAGE_SIZE as u64);
+    let usable = usize::try_from(usable).unwrap_or(usize::MAX);
+    page_count.min(usable)
 }
 
 fn read_raw_page_from_file(file: &mut File, page_id: u64) -> io::Result<Vec<u8>> {
@@ -1777,7 +1795,7 @@ fn parse_page_header(buf: &[u8], expected_kind: PageKind) -> io::Result<usize> {
             "unexpected qem editlog page kind",
         ));
     }
-    Ok(u64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8])) as usize)
+    Ok(le_u64(buf, 8, "qem editlog page")? as usize)
 }
 
 fn validate_page_crc(buf: &[u8]) -> io::Result<()> {
@@ -1788,7 +1806,7 @@ fn validate_page_crc(buf: &[u8]) -> io::Result<()> {
         ));
     }
 
-    let expected_crc = u32::from_le_bytes(buf[0..4].try_into().unwrap_or([0; 4]));
+    let expected_crc = le_u32(buf, 0, "qem editlog page")?;
     let mut hasher = Hasher::new();
     hasher.update(&buf[4..]);
     if hasher.finalize() != expected_crc {
@@ -1966,6 +1984,7 @@ mod tests {
         PieceTree, SessionMeta, SourceMetadata,
     };
     use std::fs;
+    use std::io::{Seek, SeekFrom, Write};
 
     fn collect(tree: &PieceTree) -> Vec<(PieceSource, usize, usize, usize)> {
         tree.to_vec()
@@ -2434,6 +2453,77 @@ mod tests {
                 (PieceSource::Original, 3, 3, 1),
             ]
         );
+
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_open_surfaces_corrupt_history_counters_as_typed_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "qem-piece-tree-corrupt-history-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef\n").unwrap();
+        let mut tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 7,
+                line_breaks: 1,
+            }],
+        )
+        .unwrap();
+        let mut split = |piece: Piece, left_len: usize| {
+            let left = Piece {
+                src: piece.src,
+                start: piece.start,
+                len: left_len,
+                line_breaks: 0,
+            };
+            let right = Piece {
+                src: piece.src,
+                start: piece.start + left_len,
+                len: piece.len - left_len,
+                line_breaks: piece.line_breaks,
+            };
+            (Some(left), Some(right))
+        };
+        tree.insert(
+            3,
+            Piece {
+                src: PieceSource::Add,
+                start: 10,
+                len: 2,
+                line_breaks: 1,
+            },
+            &mut split,
+        );
+        tree.flush_session(b"ignored-by-test", SessionMeta::default())
+            .unwrap();
+        drop(tree);
+
+        let sidecar = editlog_path(&source);
+        {
+            let mut file = fs::OpenOptions::new().write(true).open(&sidecar).unwrap();
+            file.seek(SeekFrom::Start(56)).unwrap();
+            // history_page_count and history_len are raw header fields with
+            // no checksum. A corrupt sidecar must surface as a typed error
+            // instead of driving huge allocations or out-of-bounds reads.
+            file.write_all(&(u64::MAX / 2).to_le_bytes()).unwrap();
+            file.write_all(&(u64::MAX / 2).to_le_bytes()).unwrap();
+            file.flush().unwrap();
+        }
+
+        let err = PieceTree::open_disk(&source).unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+        ));
 
         let _ = fs::remove_file(&sidecar);
         let _ = fs::remove_file(&source);

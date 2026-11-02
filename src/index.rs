@@ -1,3 +1,4 @@
+use crate::sidecar::{le_u32, le_u64};
 use crate::source_identity::sampled_content_fingerprint;
 use crate::storage::FileStorage;
 use memchr::memchr2_iter;
@@ -724,8 +725,8 @@ fn read_header(file: &mut File) -> io::Result<FileHeader> {
         ));
     }
 
-    let version = u32::from_le_bytes(buf[8..12].try_into().unwrap_or([0; 4]));
-    let page_size = u32::from_le_bytes(buf[12..16].try_into().unwrap_or([0; 4]));
+    let version = le_u32(&buf, 8, "qem line index header")?;
+    let page_size = le_u32(&buf, 12, "qem line index header")?;
     if version != INDEX_VERSION || page_size as usize != INDEX_PAGE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -734,13 +735,13 @@ fn read_header(file: &mut File) -> io::Result<FileHeader> {
     }
 
     Ok(FileHeader {
-        root_page: u64::from_le_bytes(buf[16..24].try_into().unwrap_or([0; 8])),
-        page_count: u64::from_le_bytes(buf[24..32].try_into().unwrap_or([0; 8])),
-        total_lines: u64::from_le_bytes(buf[32..40].try_into().unwrap_or([0; 8])),
-        total_bytes: u64::from_le_bytes(buf[40..48].try_into().unwrap_or([0; 8])),
-        source_len: u64::from_le_bytes(buf[48..56].try_into().unwrap_or([0; 8])),
-        source_mtime_ns: u64::from_le_bytes(buf[56..64].try_into().unwrap_or([0; 8])),
-        source_fingerprint: u64::from_le_bytes(buf[64..72].try_into().unwrap_or([0; 8])),
+        root_page: le_u64(&buf, 16, "qem line index header")?,
+        page_count: le_u64(&buf, 24, "qem line index header")?,
+        total_lines: le_u64(&buf, 32, "qem line index header")?,
+        total_bytes: le_u64(&buf, 40, "qem line index header")?,
+        source_len: le_u64(&buf, 48, "qem line index header")?,
+        source_mtime_ns: le_u64(&buf, 56, "qem line index header")?,
+        source_fingerprint: le_u64(&buf, 64, "qem line index header")?,
     })
 }
 
@@ -755,7 +756,7 @@ fn parse_page(buf: &[u8]) -> io::Result<Page> {
             ));
         }
     };
-    let count = u64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8])) as usize;
+    let count = le_u64(buf, 8, "qem line index page")? as usize;
     let mut entries = Vec::with_capacity(count);
     let mut cursor = INDEX_PAGE_HEADER_BYTES;
     for _ in 0..count {
@@ -766,11 +767,9 @@ fn parse_page(buf: &[u8]) -> io::Result<Page> {
             ));
         }
         entries.push(PageEntry {
-            line0: u64::from_le_bytes(buf[cursor..cursor + 8].try_into().unwrap_or([0; 8])),
-            byte0: u64::from_le_bytes(buf[cursor + 8..cursor + 16].try_into().unwrap_or([0; 8])),
-            child_page: u64::from_le_bytes(
-                buf[cursor + 16..cursor + 24].try_into().unwrap_or([0; 8]),
-            ),
+            line0: le_u64(buf, cursor, "qem line index page")?,
+            byte0: le_u64(buf, cursor + 8, "qem line index page")?,
+            child_page: le_u64(buf, cursor + 16, "qem line index page")?,
         });
         cursor += INDEX_ENTRY_BYTES;
     }

@@ -389,7 +389,13 @@ fn single_byte_engine_for(encoding: DocumentEncoding) -> &'static dyn EncodingEn
     static CACHE: OnceLock<Mutex<HashMap<&'static str, &'static SingleByteEngine>>> =
         OnceLock::new();
     let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map.lock().expect("encoding-engine cache poisoned");
+    // The cache only ever stores leaked engine references, so recovering the
+    // map after a panic in another thread is safe and keeps encoding dispatch
+    // working instead of panicking on every later open.
+    let mut guard = match map.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     let name: &'static str = encoding.name();
     *guard
         .entry(name)

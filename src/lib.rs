@@ -290,6 +290,7 @@ pub mod document;
 pub mod editor;
 pub mod index;
 pub(crate) mod piece_tree;
+pub(crate) mod sidecar;
 pub(crate) mod source_identity;
 pub mod storage;
 

@@ -47,6 +47,18 @@
 
 ### Fixed
 
+- A corrupt `.qem.editlog` sidecar whose raw (unchecksummed) header declares
+  garbage history or add counters could drive huge allocations or
+  out-of-bounds page reads while recovering a session. Page-chain lengths
+  are now bounded by the sidecar file's actual capacity and per-page entry
+  counts by the fixed page size, so recovery fails with a typed
+  `InvalidData` / `UnexpectedEof` error and the existing recovery path
+  drops the sidecar and reopens cleanly.
+- Sidecar field decoding (`.qem.lineidx` and `.qem.editlog` headers and
+  pages) no longer silently decodes truncated buffers as zeroed fields.
+  Every fixed-layout field read goes through explicit typed readers that
+  report truncation as an error; behavior for well-formed sidecars is
+  unchanged.
 - The egui demo rendered every panel and the editor twice per frame after a
   debugging leftover duplicated the whole update pass, doubling all widget
   IDs (egui painted "First use / Second use of widget ID" warnings over the
@@ -112,6 +124,9 @@
 
 ### Changed
 
+- The encoding-engine lookup cache recovers its mutex after poisoning
+  instead of panicking on every later open, matching the storage-side
+  stale-cleanup cache behavior.
 - The `frontend_session` example only reports "saved copy" when the save
   actually ran; a clean document already bound to the target path reports
   that nothing was written.
