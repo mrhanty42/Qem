@@ -1682,7 +1682,7 @@ fn read_history_entries(
     // the sidecar file can physically hold before they reach the allocation
     // and the per-page cursor below.
     let page_capacity = history_page_capacity();
-    let page_count = bounded_page_count(file, page_count);
+    let page_count = bounded_page_count(file.metadata().map(|meta| meta.len()).ok(), page_count);
     let history_len = history_len.min(page_count.saturating_mul(page_capacity));
 
     let mut out = Vec::with_capacity(history_len);
@@ -1731,7 +1731,7 @@ fn read_add_bytes(
 
     // Same raw-header bound as `read_history_entries`: the declared counters
     // cannot exceed what the sidecar file can physically hold.
-    let page_count = bounded_page_count(file, page_count);
+    let page_count = bounded_page_count(file.metadata().map(|meta| meta.len()).ok(), page_count);
     let add_len = add_len.min(page_count.saturating_mul(add_page_capacity().max(1)));
 
     let mut out = Vec::with_capacity(add_len);
@@ -1753,13 +1753,13 @@ fn read_add_bytes(
 /// Bounds a page-chain length taken from the raw editlog header by the
 /// number of pages the sidecar file can actually hold, so corrupt counters
 /// fail as typed errors instead of driving huge allocations or out-of-bounds
-/// cursors.
-fn bounded_page_count(file: &File, page_count: usize) -> usize {
-    let Ok(metadata) = file.metadata() else {
-        return page_count;
+/// cursors. When the file length is unavailable the chain is treated as
+/// empty: an unbounded counter must never reach an allocation.
+fn bounded_page_count(file_len: Option<u64>, page_count: usize) -> usize {
+    let Some(file_len) = file_len else {
+        return 0;
     };
-    let usable = metadata
-        .len()
+    let usable = file_len
         .saturating_sub(EDITLOG_HEADER_BYTES as u64)
         .saturating_div(EDITLOG_PAGE_SIZE as u64);
     let usable = usize::try_from(usable).unwrap_or(usize::MAX);
@@ -2626,5 +2626,23 @@ mod tests {
         );
         assert_eq!(stats.average_piece_bytes(), 0.0);
         assert_eq!(stats.fragmentation_ratio(), 0.0);
+    }
+
+    #[test]
+    fn bounded_page_count_caps_counters_by_physical_file_size() {
+        use super::{bounded_page_count, EDITLOG_HEADER_BYTES, EDITLOG_PAGE_SIZE};
+
+        let header_only = EDITLOG_HEADER_BYTES as u64;
+        // A sidecar that only holds the header cannot hold any pages.
+        assert_eq!(bounded_page_count(Some(header_only), 5), 0);
+        // Without a readable file length the raw counter must never reach an
+        // allocation: the chain is treated as empty instead.
+        assert_eq!(bounded_page_count(None, usize::MAX), 0);
+
+        let three_pages = header_only + (EDITLOG_PAGE_SIZE as u64) * 3;
+        assert_eq!(bounded_page_count(Some(three_pages), 100), 3);
+        assert_eq!(bounded_page_count(Some(three_pages), 2), 2);
+        // Huge files clamp to the caller-provided counter, not the other way.
+        assert_eq!(bounded_page_count(Some(u64::MAX), 7), 7);
     }
 }

@@ -70,6 +70,14 @@
 
 ### Fixed
 
+- Corrupt `.qem.lineidx` sidecars no longer hang or mis-shape the disk
+  index: checkpoint descent is bounded by a tree-depth limit, internal
+  pages reject zero child page references (page id 0 aliases page 1
+  through the on-disk offset math, so a zero reference would make the
+  descent revisit the same page forever), page entry counters are
+  bounded by the fixed page capacity, and allocated-range queries on
+  Windows fail loudly instead of silently shrinking the scanned region
+  when a range cannot be represented losslessly.
 - The crate-root support contract no longer claims that non-UTF-8 opens
   materialize a rope-backed document: since 0.8.0 they run through the
   native per-encoding engines on the mmap fast path, and only the UTF-8

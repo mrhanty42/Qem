@@ -181,7 +181,9 @@ impl FileStorage {
 
     pub fn matches_live_file_contents(&self) -> io::Result<bool> {
         let metadata = fs::metadata(self.path())?;
-        if metadata.len() as usize != self.len() {
+        // Compare in u64 so a 4 GiB live file cannot look equal to an empty
+        // in-memory view on 32-bit targets.
+        if metadata.len() != self.len() as u64 {
             return Ok(false);
         }
 
@@ -198,8 +200,10 @@ impl FileStorage {
 
 fn open_storage_backing(path: &Path) -> Result<StorageBacking, StorageOpenError> {
     let file = open_source_file(path).map_err(StorageOpenError::Open)?;
-    let len = file.metadata().map_err(StorageOpenError::Open)?.len() as usize;
-    if len == 0 {
+    // Keep the length as u64: truncating to usize would classify a 4 GiB
+    // file as empty on 32-bit targets instead of failing the open.
+    let file_len = file.metadata().map_err(StorageOpenError::Open)?.len();
+    if file_len == 0 {
         return Ok(StorageBacking::Empty);
     }
 
@@ -701,6 +705,45 @@ mod tests {
         let storage = FileStorage::open(&path).unwrap();
         assert_eq!(storage.read_range(2, 6), b"2345");
         assert_eq!(storage.read_range(7, 99), b"789");
+
+        drop(storage);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_empty_file_reports_empty_storage() {
+        let dir = test_dir("empty");
+        let path = dir.join("empty.bin");
+        fs::write(&path, b"").unwrap();
+
+        let storage = FileStorage::open(&path).unwrap();
+
+        assert!(storage.is_empty());
+        assert_eq!(storage.len(), 0);
+        assert_eq!(storage.bytes(), b"");
+        assert_eq!(storage.read_range(0, 10), b"");
+
+        drop(storage);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn matches_live_file_contents_detects_same_length_rewrites() {
+        let dir = test_dir("live-check");
+        let path = dir.join("live.bin");
+        fs::write(&path, b"abcdefgh").unwrap();
+
+        let storage = FileStorage::open(&path).unwrap();
+        assert!(storage.matches_live_file_contents().unwrap());
+
+        // The storage handle keeps FILE_SHARE_DELETE (Windows) so the live
+        // file can be swapped for a same-length rewrite; the length check
+        // alone cannot catch this, the sampled fingerprint must.
+        let backup = dir.join("live-old.bin");
+        fs::rename(&path, &backup).unwrap();
+        fs::write(&path, b"ABCDEFGH").unwrap();
+
+        assert!(!storage.matches_live_file_contents().unwrap());
 
         drop(storage);
         let _ = fs::remove_dir_all(&dir);
