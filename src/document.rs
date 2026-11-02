@@ -17,6 +17,10 @@ use rope_history::RopeHistory;
 mod alignment;
 mod commands;
 mod compaction;
+// Temporary `allow` until the Document wiring lands in the same 0.9.0
+// line: the buffer ships with its own parity suite first (ROADMAP 0.9.0).
+#[allow(dead_code)]
+mod edit_buffer;
 mod editing;
 mod encoding_engine;
 mod lifecycle;
