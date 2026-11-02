@@ -20,6 +20,11 @@ const INDEX_HEADER_BYTES: usize = 72;
 const INDEX_PAGE_HEADER_BYTES: usize = 16;
 const INDEX_ENTRY_BYTES: usize = 24;
 const INDEX_CACHE_PAGES: usize = 32;
+// Upper bound for descending the on-disk B-tree. A real tree holds ~170
+// entries per internal page, so any representable line count fits in single
+// digits of depth; the bound exists so a corrupt cycle of internal pages
+// surfaces as a typed error instead of hanging the lookup forever.
+const INDEX_MAX_TREE_DEPTH: usize = 64;
 const INDEX_BUILD_MIN_FILE_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 #[cfg(windows)]
 const INDEX_SYNC_BUILD_MAX_SCAN_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
@@ -259,7 +264,7 @@ impl ReadyDiskLineIndex {
         }
 
         let mut current_page = self.root_page;
-        loop {
+        for _ in 0..INDEX_MAX_TREE_DEPTH {
             let page = self.read_page(current_page)?;
             let Some(entry) = lookup_entry(&page.entries, line0) else {
                 return Ok(PageEntry {
@@ -273,6 +278,10 @@ impl ReadyDiskLineIndex {
             }
             current_page = entry.child_page;
         }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "qem line index page chain is too deep",
+        ))
     }
 
     fn checkpoint_for_byte(&self, byte0: u64) -> io::Result<PageEntry> {
@@ -280,7 +289,7 @@ impl ReadyDiskLineIndex {
             return self.checkpoint_for_line(0);
         }
         let mut current_page = self.root_page;
-        loop {
+        for _ in 0..INDEX_MAX_TREE_DEPTH {
             let page = self.read_page(current_page)?;
             // Checkpoint byte offsets are monotone in the same order as lines.
             let index = page.entries.partition_point(|entry| entry.byte0 <= byte0);
@@ -296,6 +305,10 @@ impl ReadyDiskLineIndex {
             }
             current_page = entry.child_page;
         }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "qem line index page chain is too deep",
+        ))
     }
 
     fn read_page(&self, page_id: u64) -> io::Result<Arc<Page>> {
@@ -524,6 +537,37 @@ fn total_scannable_bytes(ranges: &[(usize, usize)]) -> usize {
     })
 }
 
+/// Converts raw `FSCTL_QUERY_ALLOCATED_RANGES` output into scanned ranges.
+///
+/// A range that cannot be represented losslessly in `usize` must fail the
+/// whole query instead of being skipped: silently dropping it would build a
+/// line index over a shrunken scan region and report wrong checkpoints.
+/// Callers treat the error as "no allocation data" and fall back to scanning
+/// the entire file.
+#[cfg(windows)]
+fn ranges_from_allocated_buffer(
+    output: &[FileAllocatedRangeBuffer],
+) -> io::Result<Vec<(usize, usize)>> {
+    output
+        .iter()
+        .map(|range| {
+            let start = usize::try_from(range.file_offset).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid allocated range offset")
+            })?;
+            let len = usize::try_from(range.length).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid allocated range length")
+            })?;
+            let end = start.checked_add(len).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "allocated range exceeds addressable file bounds",
+                )
+            })?;
+            Ok((start, end))
+        })
+        .collect()
+}
+
 fn should_build_index_synchronously(_source_path: &Path, file_len: usize) -> bool {
     if file_len == 0 {
         return true;
@@ -624,16 +668,7 @@ fn windows_allocated_ranges(
         };
         if ok != 0 {
             let count = (returned as usize) / entry_size;
-            output.truncate(count);
-            let ranges = output
-                .into_iter()
-                .filter_map(|range| {
-                    let start = usize::try_from(range.file_offset).ok()?;
-                    let len = usize::try_from(range.length).ok()?;
-                    let end = start.checked_add(len)?;
-                    Some((start, end))
-                })
-                .collect();
+            let ranges = ranges_from_allocated_buffer(&output[..count])?;
             return Ok(merge_contiguous_ranges(ranges, file_len));
         }
 
@@ -756,7 +791,16 @@ fn parse_page(buf: &[u8]) -> io::Result<Page> {
             ));
         }
     };
+    // Index pages carry no checksum, so the raw entry counter is bounded by
+    // what a page can physically hold before it reaches the allocation below.
+    let max_entries = (INDEX_PAGE_SIZE - INDEX_PAGE_HEADER_BYTES) / INDEX_ENTRY_BYTES;
     let count = le_u64(buf, 8, "qem line index page")? as usize;
+    if count > max_entries {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "qem line index page is overfull",
+        ));
+    }
     let mut entries = Vec::with_capacity(count);
     let mut cursor = INDEX_PAGE_HEADER_BYTES;
     for _ in 0..count {
@@ -772,6 +816,16 @@ fn parse_page(buf: &[u8]) -> io::Result<Page> {
             child_page: le_u64(buf, cursor + 16, "qem line index page")?,
         });
         cursor += INDEX_ENTRY_BYTES;
+    }
+    if kind == PageKind::Internal && entries.iter().any(|entry| entry.child_page == 0) {
+        // Page id 0 aliases page 1 through the on-disk offset math, so a zero
+        // child reference in an internal page would make the checkpoint
+        // descent revisit the same page forever. Builders always emit real
+        // page ids here.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid child page reference in qem line index page",
+        ));
     }
     Ok(Page { kind, entries })
 }
@@ -814,11 +868,13 @@ fn source_metadata(path: &Path, bytes: &[u8]) -> io::Result<IndexMetadata> {
 mod tests {
     use super::{
         build_index_file, build_or_open_index, merge_contiguous_ranges, sidecar_path,
-        source_metadata, FileHeader, ReadyDiskLineIndex,
+        source_metadata, FileHeader, PageKind, ReadyDiskLineIndex, INDEX_HEADER_BYTES,
+        INDEX_PAGE_HEADER_BYTES, INDEX_PAGE_SIZE,
     };
     use crate::storage::FileStorage;
     use std::fs;
     use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Mutex;
 
     #[test]
     fn disk_line_index_builds_and_resolves_checkpoints() {
@@ -954,5 +1010,107 @@ mod tests {
             merge_contiguous_ranges(vec![(32, 48), (0, 16), (16, 32), (64, 64), (80, 96)], 128),
             vec![(0, 48), (80, 96)]
         );
+    }
+
+    #[test]
+    fn parse_page_rejects_overfull_entry_counts() {
+        // Index pages carry no checksum; a corrupt counter must surface as a
+        // typed error instead of driving the allocation below.
+        let mut buf = vec![0u8; INDEX_PAGE_SIZE];
+        buf[0] = 2; // Leaf
+        buf[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let err = super::parse_page(&buf).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parse_page_rejects_internal_pages_with_zero_child_references() {
+        let mut buf = vec![0u8; INDEX_PAGE_SIZE];
+        buf[0] = 1; // Internal
+        buf[8..16].copy_from_slice(&1u64.to_le_bytes());
+        let cursor = INDEX_PAGE_HEADER_BYTES;
+        buf[cursor + 16..cursor + 24].copy_from_slice(&0u64.to_le_bytes());
+
+        let err = super::parse_page(&buf).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parse_page_accepts_well_formed_internal_pages() {
+        let mut buf = vec![0u8; INDEX_PAGE_SIZE];
+        buf[0] = 1; // Internal
+        buf[8..16].copy_from_slice(&1u64.to_le_bytes());
+        let cursor = INDEX_PAGE_HEADER_BYTES;
+        buf[cursor..cursor + 8].copy_from_slice(&5u64.to_le_bytes());
+        buf[cursor + 8..cursor + 16].copy_from_slice(&64u64.to_le_bytes());
+        buf[cursor + 16..cursor + 24].copy_from_slice(&1u64.to_le_bytes());
+
+        let page = super::parse_page(&buf).unwrap();
+
+        assert_eq!(page.kind, PageKind::Internal);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].child_page, 1);
+    }
+
+    #[test]
+    fn checkpoint_descent_reports_corrupt_page_cycles_as_errors() {
+        let dir = std::env::temp_dir().join(format!("qem-index-cycle-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let sidecar = dir.join("sample.txt.qem.lineidx");
+        let mut page = vec![0u8; INDEX_PAGE_SIZE];
+        page[0] = 1; // Internal page that references itself.
+        page[8..16].copy_from_slice(&1u64.to_le_bytes());
+        let cursor = INDEX_PAGE_HEADER_BYTES;
+        page[cursor + 16..cursor + 24].copy_from_slice(&1u64.to_le_bytes());
+        {
+            let mut file = fs::File::create(&sidecar).unwrap();
+            file.write_all(&[0u8; INDEX_HEADER_BYTES]).unwrap();
+            file.write_all(&page).unwrap();
+        }
+
+        let ready = ReadyDiskLineIndex {
+            path: sidecar.clone(),
+            total_lines: 2,
+            root_page: 1,
+            page_count: 1,
+            cache: Mutex::new(super::PageCache::default()),
+        };
+
+        let line_err = ready.checkpoint_for_line(1).unwrap_err();
+        assert_eq!(line_err.kind(), std::io::ErrorKind::InvalidData);
+        let byte_err = ready.checkpoint_for_byte(1).unwrap_err();
+        assert_eq!(byte_err.kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn allocated_range_conversion_fails_loudly_on_unrepresentable_ranges() {
+        use super::{ranges_from_allocated_buffer, FileAllocatedRangeBuffer};
+
+        let valid = ranges_from_allocated_buffer(&[
+            FileAllocatedRangeBuffer {
+                file_offset: 0,
+                length: 4096,
+            },
+            FileAllocatedRangeBuffer {
+                file_offset: 4096,
+                length: 4096,
+            },
+        ])
+        .unwrap();
+        assert_eq!(valid, vec![(0, 4096), (4096, 8192)]);
+
+        let negative = FileAllocatedRangeBuffer {
+            file_offset: -1,
+            length: 4096,
+        };
+        let err = ranges_from_allocated_buffer(&[negative]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
