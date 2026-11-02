@@ -17,7 +17,7 @@ The primary path is UTF-8/ASCII. Explicit native support also exists for UTF-16 
 - Opens large files without materializing the whole document
 - Builds line indexes incrementally in the background
 - Reads bounded viewports for virtualized editor rendering
-- Uses rope or piece-tree backings when edits require them
+- Uses rope or piece-table backings when edits require them
 - Supports typed insert, replace, delete, selection, undo, and redo operations
 - Provides literal and regex search, including bounded and reverse search
 - Saves edited documents through streaming atomic replacement
@@ -117,7 +117,7 @@ cargo run --example typed_editing -- input.txt output.txt
 cargo run --example perf_probe -- input.txt --needle ERROR --json
 ```
 
-The examples cover low-level viewport reads, frontend session lifecycle, typed edits and search, and one-shot performance probes.
+The examples cover low-level viewport reads, `EditorTab` and `DocumentSession` background lifecycle, typed edits and search, and one-shot performance probes.
 
 ## Quality checks
 

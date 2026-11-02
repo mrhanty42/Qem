@@ -139,6 +139,15 @@ impl LargeFileDemo {
     }
 
     fn open_document(&mut self, path: PathBuf) {
+        if self.session.is_dirty() {
+            // open_file_async would replace the current document silently,
+            // discarding unsaved edits. The main editor demo never does that
+            // (it opens another tab); this single-document demo routes the
+            // user through Save or the explicit Close prompt instead.
+            self.notice =
+                String::from("Unsaved edits in the current document; save or close it first.");
+            return;
+        }
         match self.session.open_file_async(path.clone()) {
             Ok(()) => {
                 self.notice = format!("Opening {}", path.display());
@@ -383,6 +392,11 @@ impl LargeFileDemo {
                     if text.chars().any(|ch| ch.is_control()) {
                         continue;
                     }
+                    self.insert_text(&text);
+                }
+                egui::Event::Paste(text) => {
+                    // Clipboard content is an explicit paste: keep control
+                    // characters such as newlines instead of filtering them.
                     self.insert_text(&text);
                 }
                 egui::Event::Key {

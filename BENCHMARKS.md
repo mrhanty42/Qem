@@ -1,8 +1,8 @@
 # Benchmark Methodology
 
 Qem benchmark results are only useful if the workload and measurement conditions
-are explicit. This file defines the baseline methodology for `0.5.x`
-performance work.
+are explicit. This file defines the benchmark methodology for Qem performance
+work.
 
 ## Principles
 
@@ -33,6 +33,11 @@ The current benchmark families in `benches/document_perf.rs` cover:
   - bounded dense-match iterators over a representative window, also capped to the
     first `512` matches so local Criterion runs stay practical while still
     exercising the hot iterator path
+- regex search on `mmap` and `piece_table`:
+  - direct-pattern and reusable query `find_next`
+  - reusable query `find_prev` (reverse search)
+  - `no-match`
+  - capped `find_all_regex_query` iteration over the first `512` matches
 - piece-table compaction
 - full text materialization
 - typed edit commands
