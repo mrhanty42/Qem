@@ -257,6 +257,22 @@
 //!   worker result and turns the next poll into a discard/error path instead
 //!   of applying stale state.
 //!
+//! ## Threading Model
+//!
+//! - [`FileStorage`] is `Send + Sync` and may be shared between threads.
+//! - [`Document`], [`DocumentSession`], and [`EditorTab`] are `Send`: a value
+//!   may be moved to another thread, but no two threads may hold a reference
+//!   to the same document at the same time. They are deliberately not `Sync`:
+//!   the document keeps single-owner state (for example the preserve-save
+//!   error cache and the background-job receivers) without internal locking,
+//!   and the supported pattern is one owning thread - typically the UI
+//!   thread - that drives the session and polls background work.
+//! - Background open, save, and indexing work runs on Qem-owned worker
+//!   threads and reports back through the polling APIs. Callers never share
+//!   the document itself with those workers.
+//! - These auto-trait bounds are pinned by a compile-time test. A change to
+//!   them is a public contract change and must be documented here.
+//!
 //! ## Search and Typed Reads
 //!
 //! - Literal search is part of the current public contract through
@@ -310,3 +326,32 @@ pub use editor::{
     DocumentSessionStatus, EditorTab, EditorTabStatus, FileProgress, LoadPhase, SaveError,
 };
 pub use storage::{FileStorage, StorageOpenError};
+
+#[cfg(test)]
+mod thread_safety {
+    //! Compile-time pins for the threading guarantees documented in the
+    //! crate root. If one of these assertions starts failing, the public
+    //! threading contract has changed: update the "Threading Model"
+    //! contract section in the same change.
+
+    use crate::{Document, FileStorage};
+    #[cfg(feature = "editor")]
+    use crate::{DocumentSession, EditorTab};
+
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    #[test]
+    fn threading_contract_holds() {
+        assert_send::<FileStorage>();
+        assert_sync::<FileStorage>();
+        assert_send::<Document>();
+        #[cfg(feature = "editor")]
+        assert_send::<DocumentSession>();
+        #[cfg(feature = "editor")]
+        assert_send::<EditorTab>();
+        // `Document`, `DocumentSession`, and `EditorTab` deliberately do not
+        // assert `Sync`: they are single-thread-owner types. See the
+        // "Threading Model" section of the crate root documentation.
+    }
+}

@@ -4,6 +4,15 @@
 
 ### Added
 
+- A documented threading model in the crate root: `FileStorage` is
+  `Send + Sync`, while `Document`, `DocumentSession`, and `EditorTab` are
+  `Send` single-thread-owner types - movable between threads but not
+  shareable across threads, because their preserve-save error cache and
+  background-job receivers carry no internal locking. Background open,
+  save, and indexing work stays on Qem-owned worker threads and reports
+  through the polling APIs. The auto-trait bounds are pinned by a
+  compile-time test so a change to them cannot land silently.
+
 - Undo/redo history for the rope edit buffer. Small UTF-8 documents (below
   the piece-table size gate) and untitled documents edit through the rope
   buffer and previously reported "nothing to undo" even right after edits;
