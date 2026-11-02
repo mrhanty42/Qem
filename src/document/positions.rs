@@ -549,7 +549,7 @@ impl Document {
         state.position()
     }
 
-    pub(super) fn line_col_to_char_index(rope: &Rope, line0: usize, col0: usize) -> usize {
+    pub(super) fn line_col_to_char_index(rope: &EditBuffer, line0: usize, col0: usize) -> usize {
         let line0 = line0.min(rope.len_lines().saturating_sub(1));
         let line_start = rope.line_to_char(line0);
         let line_len = Self::rope_line_len_chars_without_newline(rope, line0);

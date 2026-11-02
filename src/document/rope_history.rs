@@ -32,7 +32,7 @@
 //! - A cap bounds memory: oldest entries are dropped once [`MAX_ENTRIES`]
 //!   is exceeded.
 
-use ropey::Rope;
+use super::edit_buffer::EditBuffer;
 
 /// Maximum number of undoable operations retained per rope-backed document.
 const MAX_ENTRIES: usize = 500;
@@ -143,13 +143,13 @@ impl RopeHistory {
         self.index < self.entries.len()
     }
 
-    /// Applies the inverse of the most recent applied entry to `rope`.
+    /// Applies the inverse of the most recent applied entry to `buffer`.
     ///
     /// Returns the restored cursor as a full-text char index: the end of the
     /// re-applied `before` text of the entry's first record, which for the
     /// recorded operation shapes equals the caret position the edit started
     /// from.
-    pub(crate) fn undo(&mut self, rope: &mut Rope) -> Option<usize> {
+    pub(crate) fn undo(&mut self, buffer: &mut EditBuffer) -> Option<usize> {
         if !self.can_undo() {
             return None;
         }
@@ -158,21 +158,21 @@ impl RopeHistory {
         for record in entry.iter().rev() {
             let after_end = record.start_char + record.after_len_chars();
             if record.start_char < after_end {
-                rope.remove(record.start_char..after_end);
+                buffer.remove(record.start_char..after_end);
             }
             if !record.before.is_empty() {
-                rope.insert(record.start_char, &record.before);
+                buffer.insert(record.start_char, &record.before);
             }
         }
         let first = entry.first()?;
         Some(first.start_char + first.before_len_chars())
     }
 
-    /// Re-applies the next undone entry to `rope`.
+    /// Re-applies the next undone entry to `buffer`.
     ///
     /// Returns the resulting cursor as a full-text char index: the end of
     /// the re-applied `after` text of the entry's last record.
-    pub(crate) fn redo(&mut self, rope: &mut Rope) -> Option<usize> {
+    pub(crate) fn redo(&mut self, buffer: &mut EditBuffer) -> Option<usize> {
         if !self.can_redo() {
             return None;
         }
@@ -180,10 +180,10 @@ impl RopeHistory {
         for record in entry.iter() {
             let before_end = record.start_char + record.before_len_chars();
             if record.start_char < before_end {
-                rope.remove(record.start_char..before_end);
+                buffer.remove(record.start_char..before_end);
             }
             if !record.after.is_empty() {
-                rope.insert(record.start_char, &record.after);
+                buffer.insert(record.start_char, &record.after);
             }
         }
         self.index += 1;
@@ -199,75 +199,75 @@ impl RopeHistory {
 mod tests {
     use super::*;
 
-    fn rope(text: &str) -> Rope {
-        Rope::from_str(text)
+    fn buffer(text: &str) -> EditBuffer {
+        EditBuffer::from_str(text)
     }
 
     #[test]
     fn insert_undo_redo_round_trip() {
         let mut history = RopeHistory::new();
-        let mut r = rope("hello");
-        r.insert(5, " world");
+        let mut b = buffer("hello");
+        b.insert(5, " world");
         history.record(5, String::new(), " world".to_owned());
-        assert_eq!(r.to_string(), "hello world");
+        assert_eq!(b.to_string(), "hello world");
 
-        let cursor = history.undo(&mut r).expect("undo");
-        assert_eq!(r.to_string(), "hello");
+        let cursor = history.undo(&mut b).expect("undo");
+        assert_eq!(b.to_string(), "hello");
         assert_eq!(cursor, 5);
 
-        let cursor = history.redo(&mut r).expect("redo");
-        assert_eq!(r.to_string(), "hello world");
+        let cursor = history.redo(&mut b).expect("redo");
+        assert_eq!(b.to_string(), "hello world");
         assert_eq!(cursor, 11);
     }
 
     #[test]
     fn delete_undo_restores_text_and_cursor() {
         let mut history = RopeHistory::new();
-        let mut r = rope("hello world");
-        r.remove(5..11);
+        let mut b = buffer("hello world");
+        b.remove(5..11);
         history.record(5, " world".to_owned(), String::new());
-        assert_eq!(r.to_string(), "hello");
+        assert_eq!(b.to_string(), "hello");
 
-        let cursor = history.undo(&mut r).expect("undo");
-        assert_eq!(r.to_string(), "hello world");
+        let cursor = history.undo(&mut b).expect("undo");
+        assert_eq!(b.to_string(), "hello world");
         assert_eq!(cursor, 11);
     }
 
     #[test]
     fn replace_batch_undoes_in_one_step() {
         let mut history = RopeHistory::new();
-        let mut r = rope("hello world");
+        let mut b = buffer("hello world");
         history.begin_batch();
-        r.remove(6..11);
+        b.remove(6..11);
         history.record(6, "world".to_owned(), String::new());
-        r.insert(6, "qem");
+        b.insert(6, "qem");
         history.record(6, String::new(), "qem".to_owned());
         history.end_batch();
-        assert_eq!(r.to_string(), "hello qem");
+        assert_eq!(b.to_string(), "hello qem");
 
-        let cursor = history.undo(&mut r).expect("undo");
-        assert_eq!(r.to_string(), "hello world");
+        let cursor = history.undo(&mut b).expect("undo");
+        assert_eq!(b.to_string(), "hello world");
         assert_eq!(cursor, 11);
 
-        let cursor = history.redo(&mut r).expect("redo");
-        assert_eq!(r.to_string(), "hello qem");
+        let cursor = history.redo(&mut b).expect("redo");
+        assert_eq!(b.to_string(), "hello qem");
         assert_eq!(cursor, 9);
     }
 
     #[test]
     fn fresh_edit_clears_redo_stack() {
         let mut history = RopeHistory::new();
-        let mut r = rope("a");
-        r.insert(1, "b");
+        let mut b = buffer("a");
+        b.insert(1, "b");
         history.record(1, String::new(), "b".to_owned());
-        r.insert(2, "c");
+        b.insert(2, "c");
         history.record(2, String::new(), "c".to_owned());
-        assert!(history.undo(&mut r).is_some());
+        assert!(history.undo(&mut b).is_some());
 
-        r.insert(1, "x");
+        b.insert(1, "x");
         history.record(1, String::new(), "x".to_owned());
         assert!(!history.can_redo(), "redo must be dropped after a new edit");
-        assert_eq!(r.to_string(), "axb");
+        assert_eq!(b.to_string(), "axb");
     }
 
     #[test]
@@ -281,19 +281,19 @@ mod tests {
     #[test]
     fn history_cap_drops_oldest_entries() {
         let mut history = RopeHistory::new();
-        let mut r = rope("");
+        let mut b = buffer("");
         for i in 0..(MAX_ENTRIES + 50) {
             let ch = (b'a' + (i % 26) as u8) as char;
-            r.insert(r.len_chars(), &ch.to_string());
-            history.record(r.len_chars() - 1, String::new(), ch.to_string());
+            b.insert(b.len_chars(), &ch.to_string());
+            history.record(b.len_chars() - 1, String::new(), ch.to_string());
         }
         assert_eq!(history.entries.len(), MAX_ENTRIES);
-        // Every retained undo must still restore a consistent shorter rope.
+        // Every retained undo must still restore a consistent shorter buffer.
         let mut undos = 0;
-        while history.undo(&mut r).is_some() {
+        while history.undo(&mut b).is_some() {
             undos += 1;
         }
         assert_eq!(undos, MAX_ENTRIES);
-        assert_eq!(r.len_chars(), 50);
+        assert_eq!(b.len_chars(), 50);
     }
 }

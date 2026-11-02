@@ -248,8 +248,7 @@ none.
 - `0.8.0` (shipped): regex + fast search + encoding-aware native byte
   engine + UTF-8 BOM
 - `0.9.0` (in progress): rope-path undo/redo, budget-bounded edit window,
-  far-edit support; planned: replace `ropey` with a Qem-native
-  edited-buffer structure
+  far-edit support, and the Qem-native edited buffer replacing `ropey`
 - `1.0.0`: small cleanup (module splits, drop non-critical `unsafe`,
   remove `unwrap` / `expect` on recoverable paths, sidecar typed
   outcomes, backing transition events, regression benches in CI) +

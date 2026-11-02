@@ -393,7 +393,7 @@ impl Document {
         Ok(())
     }
 
-    pub(super) fn rope_mut(&mut self) -> Result<&mut Rope, DocumentError> {
+    pub(super) fn rope_mut(&mut self) -> Result<&mut EditBuffer, DocumentError> {
         let path = self.path.clone();
         self.ensure_rope()?;
         self.mark_dirty();
@@ -406,18 +406,17 @@ impl Document {
         Ok(rope)
     }
 
-    pub(super) fn rope_line_len_chars_without_newline(rope: &Rope, line0: usize) -> usize {
+    pub(super) fn rope_line_len_chars_without_newline(rope: &EditBuffer, line0: usize) -> usize {
         let line0 = line0.min(rope.len_lines().saturating_sub(1));
-        let line = rope.line(line0);
-        let mut len = line.len_chars();
-        if len > 0 && line.char(len - 1) == '\n' {
-            len = len.saturating_sub(1);
-        }
-        len
+        // The edit buffer is LF-normalized and `line_char_range` already
+        // excludes the break, which is exactly what the previous rope
+        // slice length minus its trailing-`\n` check produced.
+        let range = rope.line_char_range(line0);
+        range.end - range.start
     }
 
     pub(super) fn rope_replace_noop_cursor(
-        rope: &Rope,
+        rope: &EditBuffer,
         line0: usize,
         col0: usize,
         len_chars: usize,
@@ -434,7 +433,7 @@ impl Document {
             (line0.saturating_add(added_lines), last_col)
         };
 
-        let existing = rope.slice(start..end).to_string();
+        let existing = rope.slice_to_string(start..end);
         (existing == normalized).then_some(cursor)
     }
 }

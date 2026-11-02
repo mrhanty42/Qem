@@ -48,7 +48,6 @@ memchr = "2.7"
 memmap2 = "0.9"
 regex = { version = "1.12", default-features = false, features = ["std", "perf", "unicode"] }
 regex-automata = "0.4.14"
-ropey = "1.6"
 
 [dev-dependencies]
 criterion = "0.5"

@@ -470,7 +470,7 @@ impl Document {
         let start = Self::line_col_to_char_index(rope, line0, start_col0);
         let end = start.saturating_add(len_chars).min(rope.len_chars());
         if end > start {
-            let removed = rope.slice(start..end).to_string();
+            let removed = rope.slice_to_string(start..end);
             rope.remove(start..end);
             self.rope_history.record(start, removed, String::new());
             self.mark_dirty();
@@ -524,7 +524,7 @@ impl Document {
             let start = Self::line_col_to_char_index(rope, line0, start_col0);
             let end = start.saturating_add(len_chars).min(rope.len_chars());
             if end > start {
-                let removed = rope.slice(start..end).to_string();
+                let removed = rope.slice_to_string(start..end);
                 rope.remove(start..end);
                 self.rope_history.record(start, removed, String::new());
                 self.mark_dirty();

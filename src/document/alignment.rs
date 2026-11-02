@@ -162,21 +162,24 @@ impl Document {
         if let Some(rope) = &self.rope {
             // Rope bytes are already in memory; slice the window out.
             // `lo` / `hi` may land mid-character, so snap them outward
-            // onto character boundaries first (`get_byte_slice`
-            // requires boundary-aligned endpoints).
+            // onto character boundaries first.
             let rope_len = rope.len_bytes();
             let mut lo = lo.min(rope_len);
-            while lo > 0 && rope.get_byte_slice(lo..lo + 1).is_none() {
+            while lo > 0 && !rope.is_char_boundary(lo) {
                 lo -= 1;
             }
             let mut hi = hi.min(rope_len);
-            while hi < rope_len && rope.get_byte_slice(hi..hi + 1).is_none() {
+            while hi < rope_len && !rope.is_char_boundary(hi) {
                 hi += 1;
             }
-            return match rope.get_byte_slice(lo..hi) {
-                Some(slice) => slice.bytes().collect(),
-                None => Vec::new(),
-            };
+            if lo >= hi {
+                return Vec::new();
+            }
+            // Convert the aligned byte window to its char range; the bytes
+            // may span chunk boundaries, so they come back owned.
+            let chars_lo = rope.byte_to_char(lo);
+            let chars_hi = rope.byte_to_char(hi);
+            return rope.slice_to_string(chars_lo..chars_hi).into_bytes();
         }
         self.mmap_bytes()[lo..hi].to_vec()
     }

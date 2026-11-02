@@ -1,13 +1,13 @@
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
+use qem::__test_support::build_edit_buffer_line_count;
 use qem::{
     CompactionPolicy, Document, LiteralSearchQuery, RegexSearchQuery, TextPosition, TextSelection,
     ViewportRequest,
 };
 #[cfg(feature = "editor")]
 use qem::{DocumentSession, EditorTab};
-use ropey::Rope;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -245,17 +245,21 @@ fn bench_small_open(c: &mut Criterion) {
             start.elapsed()
         });
     });
-    group.bench_function(BenchmarkId::new("ropey_from_reader", fixture.label), |b| {
-        b.iter_custom(|iters| {
-            let start = Instant::now();
-            for _ in 0..iters {
-                let file = File::open(&fixture.path).expect("open small ropey fixture");
-                let rope = Rope::from_reader(file).expect("load small ropey fixture");
-                black_box(rope.len_lines());
-            }
-            start.elapsed()
-        });
-    });
+    group.bench_function(
+        BenchmarkId::new("edit_buffer_builder", fixture.label),
+        |b| {
+            b.iter_custom(|iters| {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let bytes =
+                        std::fs::read(&fixture.path).expect("read small edit buffer fixture");
+                    let lines = build_edit_buffer_line_count(&bytes);
+                    black_box(lines);
+                }
+                start.elapsed()
+            });
+        },
+    );
     group.finish();
 }
 

@@ -358,7 +358,7 @@ impl Document {
     }
 
     fn line_slice_from_rope_backing(
-        rope: &Rope,
+        rope: &EditBuffer,
         line0: usize,
         start_col: usize,
         max_cols: usize,
@@ -367,24 +367,17 @@ impl Document {
             return LineSlice::new(String::new(), true);
         }
 
-        let line = rope.line(line0);
-        let mut len = line.len_chars();
-        if len > 0 && line.char(len - 1) == '\n' {
-            len = len.saturating_sub(1);
-        }
+        // LF-normalized buffer: `line_char_range` excludes the break that
+        // the previous rope slice used to carry and strip below.
+        let range = rope.line_char_range(line0);
+        let len = range.end - range.start;
         if start_col >= len {
             return LineSlice::new(String::new(), true);
         }
 
         let end_col = start_col.saturating_add(max_cols).min(len);
-        let slice = line.slice(start_col..end_col);
-        LineSlice::new(
-            slice
-                .as_str()
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| slice.to_string()),
-            true,
-        )
+        let text = rope.slice_to_string(range.start + start_col..range.start + end_col);
+        LineSlice::new(text, true)
     }
 
     fn line_slice_from_piece_table_backing(
@@ -486,7 +479,7 @@ impl Document {
     }
 
     fn line_slices_from_rope_backing(
-        rope: &Rope,
+        rope: &EditBuffer,
         first_line0: usize,
         line_count: usize,
         start_col: usize,
@@ -937,17 +930,13 @@ impl Document {
     }
 
     fn read_text_from_rope_backing(
-        rope: &Rope,
+        rope: &EditBuffer,
         start: TextPosition,
         len_chars: usize,
     ) -> TextSlice {
         let start_idx = Self::line_col_to_char_index(rope, start.line0(), start.col0());
         let end_idx = start_idx.saturating_add(len_chars).min(rope.len_chars());
-        let slice = rope.slice(start_idx..end_idx);
-        let text = slice
-            .as_str()
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| slice.to_string());
+        let text = rope.slice_to_string(start_idx..end_idx);
         TextSlice::new(text, true)
     }
 

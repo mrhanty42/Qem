@@ -423,7 +423,10 @@ fn join_roots(nodes: Vec<Node>) -> Node {
     if nodes.len() == 1 {
         nodes.into_iter().next().expect("non-empty node list")
     } else {
-        Node::internal_from_children(nodes)
+        // A large insert can split one leaf into many replacement nodes;
+        // group them bottom-up so every internal node stays within the
+        // child-count invariant.
+        build_bottom_up(nodes)
     }
 }
 

@@ -60,7 +60,10 @@ enum SaveSnapshot {
     Empty,
     Bytes(Vec<u8>),
     Mmap(FileStorage),
-    Rope { rope: Rope, line_ending: LineEnding },
+    Rope {
+        rope: EditBuffer,
+        line_ending: LineEnding,
+    },
     PieceTable(PieceTableSnapshot),
 }
 
@@ -262,7 +265,7 @@ fn write_snapshot(
 
 fn write_rope_snapshot(
     out: &mut impl Write,
-    rope: &Rope,
+    rope: &EditBuffer,
     line_ending: LineEnding,
     written: &Arc<AtomicU64>,
     total: u64,

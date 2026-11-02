@@ -1,5 +1,5 @@
+use edit_buffer::{EditBuffer, EditBufferBuilder};
 use memchr::{memchr2, memchr2_iter};
-use ropey::{Rope, RopeBuilder};
 use std::cell::Cell;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,9 +17,6 @@ use rope_history::RopeHistory;
 mod alignment;
 mod commands;
 mod compaction;
-// Temporary `allow` until the Document wiring lands in the same 0.9.0
-// line: the buffer ships with its own parity suite first (ROADMAP 0.9.0).
-#[allow(dead_code)]
 mod edit_buffer;
 mod editing;
 mod encoding_engine;
@@ -75,6 +72,19 @@ pub mod __test_support {
     pub use super::encoding_engine::{
         engine_for_encoding, EncodingEngine, SingleByteEngine, Utf8Engine, UTF8_ENGINE,
     };
+
+    /// Bulk-loads LF-normalized UTF-8 `bytes` into a Qem-native edit
+    /// buffer without the document lifecycle and returns its line count.
+    /// Used by the performance bench as the raw-buffer baseline next to
+    /// `Document::open`, the same role the ropey bulk loader played
+    /// before the 0.9.0 replacement; the count is the consumable result
+    /// that keeps the internal buffer type unexposed.
+    pub fn build_edit_buffer_line_count(bytes: &[u8]) -> usize {
+        let buffer = super::edit_buffer::EditBuffer::from_str(
+            std::str::from_utf8(bytes).expect("bench fixtures are UTF-8"),
+        );
+        buffer.len_lines()
+    }
 
     /// Aligns `offset` to the largest character-boundary offset of
     /// `doc.encoding()` that is `<= offset` (the `AlignDirection::Floor`
@@ -264,12 +274,12 @@ fn normalize_insert_text(
     (normalized, added_lines, last_col)
 }
 
-fn build_rope_from_bytes(bytes: &[u8]) -> (Rope, bool) {
+fn build_rope_from_bytes(bytes: &[u8]) -> (EditBuffer, bool) {
     if bytes.is_empty() {
-        return (Rope::new(), false);
+        return (EditBuffer::new(), false);
     }
 
-    let mut builder = RopeBuilder::new();
+    let mut builder = EditBufferBuilder::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut input = bytes;
     let mut out = [0u8; 8192];
@@ -336,18 +346,18 @@ fn normalize_decoded_text(text: &str) -> String {
     normalized
 }
 
-fn build_rope_from_decoded_text(text: &str) -> Rope {
+fn build_rope_from_decoded_text(text: &str) -> EditBuffer {
     if text.is_empty() {
-        return Rope::new();
+        return EditBuffer::new();
     }
 
     let normalized = normalize_decoded_text(text);
-    let mut builder = RopeBuilder::new();
+    let mut builder = EditBufferBuilder::new();
     builder.append(&normalized);
     builder.finish()
 }
 
-fn rope_text_with_line_endings(rope: &Rope, line_ending: LineEnding) -> String {
+fn rope_text_with_line_endings(rope: &EditBuffer, line_ending: LineEnding) -> String {
     if line_ending == LineEnding::Lf {
         return rope.to_string();
     }
@@ -398,7 +408,7 @@ fn encode_text_with_encoding(
     Ok(encoded.into_owned())
 }
 
-fn rope_save_len_bytes(rope: &Rope, line_ending: LineEnding) -> usize {
+fn rope_save_len_bytes(rope: &EditBuffer, line_ending: LineEnding) -> usize {
     let extra_per_break = match line_ending {
         LineEnding::Lf => 0,
         LineEnding::Crlf => 1,
@@ -1082,7 +1092,7 @@ pub struct Document {
     preserve_save_error_cache: Cell<Option<Option<DocumentEncodingErrorKind>>>,
 
     // Mutable text storage. When present, it becomes the source of truth for rendering/editing.
-    rope: Option<Rope>,
+    rope: Option<EditBuffer>,
     piece_table: Option<PieceTable>,
     /// In-memory undo/redo history for the rope edit buffer. The piece-tree
     /// buffer keeps its own snapshot history; this field only covers edits

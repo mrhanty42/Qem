@@ -4,6 +4,20 @@
 
 ### Added
 
+- The Qem-native edit buffer replacing `ropey::Rope` (the 0.9.0 rope
+  replacement). It is a B-tree of flat UTF-8 chunks whose internal nodes
+  carry per-child byte, char, and line-break summaries, so char/byte
+  conversion, line lookup, insert, remove, and chunk iteration for
+  streaming search are all O(log N) in the document size. It stores
+  LF-normalized text - the same contract the document layer already
+  enforced on the rope path - and takes over the small-file and
+  untitled-document paths with unchanged public behavior. `ropey` is
+  removed from `Cargo.toml`.
+- A proptest parity suite drives the new buffer against a plain `String`
+  oracle, re-checking every indexed accessor after each randomized
+  insert/remove step; the saved regression case covers a last-child
+  splice bug the suite caught before any unit test reached it.
+
 - A documented threading model in the crate root: `FileStorage` is
   `Send + Sync`, while `Document`, `DocumentSession`, and `EditorTab` are
   `Send` single-thread-owner types - movable between threads but not
@@ -138,6 +152,9 @@
 
 ### Changed
 
+- The `small_document_open` benchmark's raw-load baseline is now the
+  Qem-native edit buffer bulk loader (through the hidden test-support
+  surface) instead of the removed ropey bulk loader.
 - The encoding-engine lookup cache recovers its mutex after poisoning
   instead of panicking on every later open, matching the storage-side
   stale-cleanup cache behavior.

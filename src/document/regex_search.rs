@@ -34,13 +34,13 @@
 use std::fmt;
 use std::sync::OnceLock;
 
+use super::edit_buffer::EditBuffer;
 use regex::bytes::Regex as ByteRegex;
 use regex::Regex as TextRegex;
 use regex_automata::dfa::dense;
 use regex_automata::dfa::Automaton;
 use regex_automata::nfa::thompson;
 use regex_automata::{Input, MatchKind};
-use ropey::Rope;
 
 use super::alignment::AlignDirection;
 use super::encoding_engine::SingleByteEngine;
@@ -651,7 +651,7 @@ impl Document {
 
 fn find_next_regex_in_rope(
     doc: &Document,
-    rope: &Rope,
+    rope: &EditBuffer,
     query: &RegexSearchQuery,
     from: TextPosition,
 ) -> Option<SearchMatch> {
@@ -665,7 +665,7 @@ fn find_next_regex_in_rope(
 
 fn find_next_regex_in_rope_bounded(
     doc: &Document,
-    rope: &Rope,
+    rope: &EditBuffer,
     query: &RegexSearchQuery,
     start: TextPosition,
     end: TextPosition,
@@ -695,7 +695,7 @@ fn find_next_regex_in_rope_bounded(
 /// for piece-table chunked regex search.
 fn find_next_regex_in_rope_chunks(
     doc: &Document,
-    rope: &Rope,
+    rope: &EditBuffer,
     query: &RegexSearchQuery,
     from: TextPosition,
     start_byte: usize,
@@ -734,7 +734,7 @@ fn find_next_regex_in_rope_chunks(
             chunk_base = chunk_end;
             continue;
         }
-        // Safe: ropey chunks are valid UTF-8 and slices are aligned on
+        // Safe: edit buffer chunks are valid UTF-8 and slices are aligned on
         // char boundaries because we entered this chunk through char-aware
         // start_byte / end_byte.
         let segment = &chunk[chunk_window_start..chunk_window_end];
@@ -1052,7 +1052,7 @@ fn forward_regex_search_last_in_slice(
 /// converted directly to typed positions without rebuilding reverse windows.
 fn forward_regex_search_last_in_rope(
     doc: &Document,
-    rope: &Rope,
+    rope: &EditBuffer,
     regex: &TextRegex,
     start_char: usize,
     end_char: usize,
@@ -1061,7 +1061,7 @@ fn forward_regex_search_last_in_rope(
     if start_char >= end_char {
         return None;
     }
-    let text = rope.slice(start_char..end_char).to_string();
+    let text = rope.slice_to_string(start_char..end_char);
     let matched = regex.find_iter(&text).last()?;
     let relative_start_chars = text[..matched.start()].chars().count();
     let match_units = text[matched.start()..matched.end()].chars().count();
@@ -1078,7 +1078,7 @@ fn forward_regex_search_last_in_rope(
     ))
 }
 
-fn collect_rope_chunks_with_offsets(rope: &Rope) -> Vec<(usize, &str)> {
+fn collect_rope_chunks_with_offsets(rope: &EditBuffer) -> Vec<(usize, &str)> {
     let mut out = Vec::new();
     let mut offset = 0usize;
     for chunk in rope.chunks() {
@@ -1358,7 +1358,7 @@ fn reverse_dfa_search_in_piece_tree(
 /// literal `dfa: &dense::DFA<Vec<u32>>` from the task description.
 fn reverse_dfa_search_in_rope(
     doc: &Document,
-    rope: &Rope,
+    rope: &EditBuffer,
     query: &RegexSearchQuery,
     bound_start: TextPosition,
     bound_end: TextPosition,
@@ -1377,7 +1377,7 @@ fn reverse_dfa_search_in_rope(
     let forward_regex = query.bytes_regex();
 
     // Build a sliding byte window from the end of the requested range
-    // using `rope.chunks()` walked in reverse. Each chunk in ropey is
+    // using `chunks()` walked in reverse. Each edit buffer chunk is
     // valid UTF-8, so `chunk.as_bytes()` is a safe slice for the DFA.
     // The window is bounded to REGEX_CHUNK_BYTES + REGEX_CHUNK_OVERLAP_BYTES
     // worth of trailing rope content so peak memory stays predictable.
@@ -1460,7 +1460,7 @@ fn reverse_dfa_search_in_rope(
 /// absolute byte offsets back into char indices and `TextPosition`s.
 fn reverse_dfa_finalize_rope_window(
     doc: &Document,
-    rope: &Rope,
+    rope: &EditBuffer,
     dfa: &dense::DFA<Vec<u32>>,
     forward_regex: &ByteRegex,
     window_start_byte: usize,

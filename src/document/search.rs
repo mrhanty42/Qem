@@ -915,7 +915,7 @@ impl Document {
 
     fn find_next_in_rope(
         &self,
-        rope: &Rope,
+        rope: &EditBuffer,
         needle: &[u8],
         needle_units: usize,
         finder: &Finder<'_>,
@@ -936,7 +936,7 @@ impl Document {
 
     fn find_next_in_rope_from_offset(
         &self,
-        rope: &Rope,
+        rope: &EditBuffer,
         needle: &[u8],
         needle_units: usize,
         finder: &Finder<'_>,
@@ -1464,7 +1464,7 @@ impl Document {
 
     fn find_prev_in_rope(
         &self,
-        rope: &Rope,
+        rope: &EditBuffer,
         needle: &[u8],
         needle_units: usize,
         finder_rev: &FinderRev<'_>,
@@ -1697,7 +1697,7 @@ impl PieceTable {
 }
 
 fn find_next_in_rope_chunks(
-    rope: &Rope,
+    rope: &EditBuffer,
     start_byte: usize,
     needle_len: usize,
     finder: &Finder<'_>,
@@ -1741,7 +1741,7 @@ fn find_next_in_rope_chunks(
 }
 
 fn find_prev_in_rope_chunks(
-    rope: &Rope,
+    rope: &EditBuffer,
     end_byte: usize,
     needle_len: usize,
     finder: &FinderRev<'_>,

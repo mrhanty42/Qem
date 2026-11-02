@@ -922,7 +922,7 @@ impl Document {
                 encoding_engine: encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
                 decoding_had_errors: false,
                 preserve_save_error_cache: Cell::new(None),
-                rope: Some(Rope::new()),
+                rope: Some(EditBuffer::new()),
                 piece_table: None,
                 rope_history: RopeHistory::new(),
                 dirty: false,
