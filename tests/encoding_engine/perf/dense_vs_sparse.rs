@@ -99,8 +99,12 @@ const FIXTURE_BYTES: usize = 9 * 1024 * 1024;
 // the same machine, and the SPARSE side flaps between ~2 ms and ~90 ms
 // depending on machine cache pressure (verified 2026-10-02 and 2026-10-05:
 // dense time stays stable, only the sparse denominator swings). That makes
-// the ratio an environment probe, not a regression test. Re-enable locally
-// with `cargo test -- --ignored` when investigating search performance.
+// the ratio an environment probe, not a regression test. The CI-covered
+// deterministic guard against the forward-iterate regression this test was
+// written for lives in `src/document/regex_tests.rs::
+// find_prev_regex_reverse_dfa_visits_bounded_matches_regardless_of_density`
+// (match-visit counting, no wall clock). Re-enable locally with
+// `cargo test -- --ignored` when investigating search performance.
 #[ignore = "wall-clock ratio flaps with machine cache pressure; dense side is stable"]
 fn find_prev_regex_dense_vs_sparse_ratio_within_threshold_on_mmap() {
     // Dense fixture: every other byte holds an `X` (alternating with

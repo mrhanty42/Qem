@@ -1301,3 +1301,60 @@ fn cloned_query_recompiles_reverse_dfa_lazily() {
     let cloned_dfa_again = cloned.ensure_reverse().unwrap();
     assert!(std::ptr::eq(cloned_dfa, cloned_dfa_again));
 }
+
+#[test]
+fn find_prev_regex_reverse_dfa_visits_bounded_matches_regardless_of_density() {
+    // Deterministic replacement for the wall-clock dense/sparse ratio in
+    // tests/encoding_engine/perf/dense_vs_sparse.rs (which stays behind
+    // #[ignore] as a manual perf probe). The reverse-DFA contract is
+    // density-independent: one `find_prev_regex` call accepts at most one
+    // match per reverse window, so a dense fixture (match after match) and
+    // a sparse fixture (one match in the whole document) must produce the
+    // same tiny visit count. The legacy forward-iterate-and-keep-last
+    // reverse path visited every match (~4.5M on this dense fixture) and
+    // showed up as the historical ~80x wall-clock blowup.
+    //
+    // Both fixtures must exceed `SMALL_REVERSE_REGEX_SCAN_BYTES` (1 MiB):
+    // smaller ranges route to the small-span forward scan, which is a
+    // different (and legal) path this guard does not pin.
+    const FIXTURE_BYTES: usize = 9 * 1024 * 1024;
+    let dir = fresh_test_dir("reverse-dfa-visit-count");
+    let mut dense = Vec::with_capacity(FIXTURE_BYTES + 16);
+    while dense.len() < FIXTURE_BYTES {
+        dense.extend_from_slice(b"X\n");
+    }
+    let mut sparse = vec![b' '; FIXTURE_BYTES];
+    sparse[42] = b'X';
+    sparse.push(b'\n');
+
+    let dense_doc = open_clean_mmap_doc(&dense, &dir, "dense.bin");
+    let sparse_doc = open_clean_mmap_doc(&sparse, &dir, "sparse.bin");
+
+    let _ = dense_doc
+        .find_prev_regex("X", TextPosition::new(usize::MAX, usize::MAX))
+        .expect("dense reverse match exists");
+    let dense_visits = super::regex_search::take_reverse_match_visit_count();
+
+    let _ = sparse_doc
+        .find_prev_regex("X", TextPosition::new(usize::MAX, usize::MAX))
+        .expect("sparse reverse match exists");
+    let sparse_visits = super::regex_search::take_reverse_match_visit_count();
+
+    assert!(
+        dense_visits >= 1,
+        "reverse path accepted no matches: the visit instrumentation or the \
+         reverse-DFA accept path regressed"
+    );
+    assert!(
+        dense_visits <= sparse_visits,
+        "dense fixture visited {dense_visits} matches vs {sparse_visits} on the \
+         sparse fixture: the reverse path is density-dependent again"
+    );
+    assert!(
+        dense_visits <= 8,
+        "reverse path accepted {dense_visits} matches on the dense fixture: \
+         expected the bounded DFA walk, not forward iteration"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

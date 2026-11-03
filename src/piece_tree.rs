@@ -1140,8 +1140,17 @@ impl DiskPageStore {
             header.add_page_count as usize,
             header.add_len as usize,
         )?;
+        // The raw header field is u64; a value that does not fit the
+        // target pointer width must fail the open instead of truncating
+        // (the sidecar is dropped and rebuilt on such an error).
+        let known_byte_len = usize::try_from(header.known_byte_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog known_byte_len exceeds the addressable size",
+            )
+        })?;
         let meta = SessionMeta {
-            known_byte_len: header.known_byte_len as usize,
+            known_byte_len,
             full_index: (header.flags & EDITLOG_FLAG_FULL_INDEX) != 0,
             encoding_origin: ((header.flags & EDITLOG_FLAG_HAS_ENCODING_ORIGIN) != 0)
                 .then(|| decode_encoding_origin(header.encoding_origin))
