@@ -1169,7 +1169,7 @@ impl PieceTable {
         );
         let exact_base_line_breaks = pieces.total_line_breaks();
 
-        Self {
+        let mut this = Self {
             original,
             add: Vec::new(),
             pieces,
@@ -1187,7 +1187,10 @@ impl PieceTable {
             last_session_flush: None,
             edit_batch_depth: 0,
             edit_batch_dirty: false,
-        }
+        };
+        this.pieces
+            .set_known_boundary(this.known_byte_len, this.full_index);
+        this
     }
 
     fn from_recovered_session(
@@ -1203,7 +1206,7 @@ impl PieceTable {
             .max(1);
         let known_byte_len = meta.known_byte_len.min(total_len);
 
-        Self {
+        let mut this = Self {
             original,
             add,
             pieces,
@@ -1224,7 +1227,10 @@ impl PieceTable {
             last_session_flush: None,
             edit_batch_depth: 0,
             edit_batch_dirty: false,
-        }
+        };
+        this.pieces
+            .set_known_boundary(this.known_byte_len, this.full_index);
+        this
     }
 
     /// Builds a piece table from pre-annotated pieces whose exact line-break
@@ -2231,6 +2237,8 @@ impl PieceTable {
         } else if pos <= self.known_byte_len {
             self.known_byte_len = self.known_byte_len.saturating_add(bytes.len());
         }
+        self.pieces
+            .set_known_boundary(self.known_byte_len, self.full_index);
         self.refresh_known_line_count();
         self.schedule_session_flush()
     }
@@ -2255,6 +2263,8 @@ impl PieceTable {
         } else if known_overlap > 0 {
             self.known_byte_len = self.known_byte_len.saturating_sub(known_overlap);
         }
+        self.pieces
+            .set_known_boundary(self.known_byte_len, self.full_index);
         self.refresh_known_line_count();
         self.schedule_session_flush()
     }
@@ -2408,36 +2418,32 @@ impl PieceTable {
     }
 
     fn undo(&mut self) -> io::Result<bool> {
-        if !self.pieces.undo() {
+        let Some(restored) = self.pieces.undo((self.known_byte_len, self.full_index)) else {
             return Ok(false);
-        }
+        };
         self.total_len = self.pieces.total_len();
-        // Mirror `insert`'s known-region maintenance: a full index covers
-        // the whole document, so its known boundary moves with the length
-        // instead of clamping down. The clamp left `known_byte_len` stale
-        // after undo→redo and truncated the tail out of viewport / read
-        // answers until the next edit.
-        if self.full_index {
-            self.known_byte_len = self.total_len;
-        } else {
-            self.known_byte_len = self.known_byte_len.min(self.total_len);
-        }
+        // Every history entry carries the known-region boundary that
+        // belonged to the state it represents (both full-index and partial
+        // windows), so undo restores the exact boundary instead of
+        // clamping the stale one down.
+        self.known_byte_len = restored.0.min(self.total_len);
+        self.full_index = restored.1 && self.known_byte_len == self.total_len;
+        self.pieces
+            .set_known_boundary(self.known_byte_len, self.full_index);
         self.refresh_known_line_count();
         self.schedule_session_flush()?;
         Ok(true)
     }
 
     fn redo(&mut self) -> io::Result<bool> {
-        if !self.pieces.redo() {
+        let Some(restored) = self.pieces.redo((self.known_byte_len, self.full_index)) else {
             return Ok(false);
-        }
+        };
         self.total_len = self.pieces.total_len();
-        // Same full-index rule as `undo` above.
-        if self.full_index {
-            self.known_byte_len = self.total_len;
-        } else {
-            self.known_byte_len = self.known_byte_len.min(self.total_len);
-        }
+        self.known_byte_len = restored.0.min(self.total_len);
+        self.full_index = restored.1 && self.known_byte_len == self.total_len;
+        self.pieces
+            .set_known_boundary(self.known_byte_len, self.full_index);
         self.refresh_known_line_count();
         self.schedule_session_flush()?;
         Ok(true)

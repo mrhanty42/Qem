@@ -6475,6 +6475,47 @@ fn piece_table_undo_redo_restores_known_length_on_full_index() {
 }
 
 #[test]
+fn piece_table_partial_undo_restores_known_boundary() {
+    // A partial window (full_index = false, known < total) records its
+    // boundary in the history alongside each root; undoing a delete must
+    // restore the pre-delete boundary instead of keeping the clamped one
+    // (the clamp left the tail beyond `known` and truncated reads of the
+    // last known lines).
+    let dir = std::env::temp_dir().join(format!("qem-pt-partial-undo-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("partial.log");
+    let line = format!(
+        "{}
+",
+        "y".repeat(99)
+    );
+    std::fs::write(&path, line.repeat(4096)).unwrap();
+
+    let storage = FileStorage::open(&path).unwrap();
+    // The known region covers only the first 2000 lines: a partial window
+    // like the disk-index far-edit plan creates.
+    let mut pt = PieceTable::new(storage, vec![100; 2000], false);
+    assert_eq!(pt.total_len(), 409_600);
+    assert_eq!(pt.known_byte_len, 200_000);
+    assert!(!pt.full_index);
+
+    pt.insert_bytes(50, b"[qem]").unwrap();
+    assert_eq!(pt.known_byte_len, 200_005);
+    pt.delete_range(100_000, 50).unwrap();
+    assert_eq!(pt.known_byte_len, 199_955);
+
+    assert!(pt.undo().unwrap());
+    assert_eq!(
+        pt.known_byte_len, 200_005,
+        "undo must restore the pre-delete known boundary"
+    );
+    assert!(pt.redo().unwrap());
+    assert_eq!(pt.known_byte_len, 199_955);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn small_rope_document_undo_redo_round_trip() {
     let dir = std::env::temp_dir().join(format!("qem-undo-small-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);

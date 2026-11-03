@@ -220,6 +220,8 @@ impl PieceTable {
         self.total_len = compacted_len;
         self.known_byte_len = compacted_len;
         self.full_index = true;
+        self.pieces
+            .set_known_boundary(self.known_byte_len, self.full_index);
         self.refresh_known_line_count();
         self.schedule_session_flush()?;
         Ok(true)
