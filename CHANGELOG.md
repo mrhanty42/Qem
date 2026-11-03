@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased (1.0.0)
+
+### Changed
+
+- Removed the stale module-level `#![allow(dead_code)]` from the
+  alignment and encoding-engine modules: every item under them is
+  reachable again, so the blanket waivers are gone.
+- The no-editor build (`--no-default-features`) is warning-clean. The
+  session-driven pieces of the save/rebase machinery (the discarded-save
+  rebase chain, its saved-source span helpers, the disk-history rebuild
+  hook, and the already-saved fast path) are now explicitly
+  `editor`-feature-gated, the dead `snapshot_add_len` field is removed,
+  and CI runs clippy with `-D warnings` on the no-editor configuration
+  so this class of drift cannot land silently.
+
 ## Unreleased (0.9.0)
 
 ### Added

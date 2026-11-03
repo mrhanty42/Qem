@@ -526,6 +526,9 @@ impl PieceTree {
             .flush_session(&self.history, self.history_index, add_bytes, meta)
     }
 
+    // Editor-driven: the only caller is the discarded-save rebase in the
+    // persistence layer.
+    #[cfg(feature = "editor")]
     pub(crate) fn rebuild_history_roots_disk<F>(
         &self,
         source_path: &Path,

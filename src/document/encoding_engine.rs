@@ -13,8 +13,6 @@
 //! - `MultiByteEngine` for variable-length CJK encodings such as
 //!   Shift_JIS, GB18030 and EUC-KR.
 
-#![allow(dead_code)]
-
 use super::DocumentEncoding;
 
 /// Byte-level operations the document layer needs from a text encoding.

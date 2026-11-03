@@ -1160,6 +1160,9 @@ impl Document {
         self.path = Some(path);
     }
 
+    // Session-only: the "already saved and unchanged" fast path is driven
+    // by `DocumentSession`, which exists only under the `editor` feature.
+    #[cfg(feature = "editor")]
     pub(crate) fn can_skip_clean_preserve_save_to_path(&self, path: &Path) -> bool {
         if self.dirty || self.path.as_deref() != Some(path) || !path.exists() {
             return false;

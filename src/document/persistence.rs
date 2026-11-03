@@ -47,12 +47,12 @@ impl PieceTableSnapshot {
     }
 }
 
+// The rebase hint is produced by every piece-table save but consumed only
+// by the discarded-save rebase, which is editor-driven.
+#[cfg_attr(not(feature = "editor"), allow(dead_code))]
 #[derive(Debug, Clone)]
 enum SaveRebaseHint {
-    PieceTable {
-        snapshot_pieces: Vec<Piece>,
-        snapshot_add_len: usize,
-    },
+    PieceTable { snapshot_pieces: Vec<Piece> },
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +83,8 @@ pub(crate) struct SaveCompletion {
     pub reload_after_save: bool,
     pub encoding: DocumentEncoding,
     pub encoding_origin: DocumentEncodingOrigin,
+    // Consumed only by the editor-driven discarded-save rebase.
+    #[cfg_attr(not(feature = "editor"), allow(dead_code))]
     rebase_hint: Option<SaveRebaseHint>,
 }
 
@@ -98,7 +100,6 @@ impl PreparedSave {
         let rebase_hint = match &self.snapshot {
             SaveSnapshot::PieceTable(piece_table) => Some(SaveRebaseHint::PieceTable {
                 snapshot_pieces: piece_table.pieces.clone(),
-                snapshot_add_len: piece_table.add.len(),
             }),
             _ => None,
         };
@@ -123,6 +124,9 @@ impl PreparedSave {
     }
 }
 
+// The saved-source span helpers below serve only the discarded-save
+// rebase above, which is editor-driven.
+#[cfg(feature = "editor")]
 #[derive(Clone, Copy, Debug)]
 struct SavedSourceSpan {
     src: PieceSource,
@@ -131,6 +135,7 @@ struct SavedSourceSpan {
     saved_start: usize,
 }
 
+#[cfg(feature = "editor")]
 fn saved_source_spans(snapshot_pieces: &[Piece]) -> Vec<SavedSourceSpan> {
     let mut saved_start = 0usize;
     let mut spans = Vec::with_capacity(snapshot_pieces.len());
@@ -146,6 +151,7 @@ fn saved_source_spans(snapshot_pieces: &[Piece]) -> Vec<SavedSourceSpan> {
     spans
 }
 
+#[cfg(feature = "editor")]
 fn next_saved_source_start(
     spans: &[SavedSourceSpan],
     src: PieceSource,
@@ -158,6 +164,7 @@ fn next_saved_source_start(
         .min()
 }
 
+#[cfg(feature = "editor")]
 fn remap_discarded_history_piece(
     piece: Piece,
     spans: &[SavedSourceSpan],
@@ -357,6 +364,10 @@ impl Document {
         let _ = std::fs::remove_file(editlog_path(path));
     }
 
+    // The discarded-save rebase is driven by the session layer
+    // (`DocumentSession::poll_background_job`), which exists only under
+    // the `editor` feature.
+    #[cfg(feature = "editor")]
     pub(crate) fn handle_discarded_save_completion(&mut self, completion: &SaveCompletion) {
         let Some(path) = self.path.as_deref() else {
             return;
@@ -368,10 +379,7 @@ impl Document {
         let Some(piece_table) = self.piece_table.as_mut() else {
             return;
         };
-        let Some(SaveRebaseHint::PieceTable {
-            snapshot_pieces,
-            snapshot_add_len: _snapshot_add_len,
-        }) = completion.rebase_hint.as_ref()
+        let Some(SaveRebaseHint::PieceTable { snapshot_pieces }) = completion.rebase_hint.as_ref()
         else {
             return;
         };

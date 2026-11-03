@@ -35,7 +35,6 @@
 // Some alignment surfaces are reachable only from unit tests until the
 // last edit / regex caller is wired in. Keep clippy quiet under
 // `-D warnings`.
-#![allow(dead_code)]
 
 use super::encoding_engine::{EncodingEngine, SingleByteEngine};
 use super::Document;
