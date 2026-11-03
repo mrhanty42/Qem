@@ -185,6 +185,17 @@ none.
 
 ### Focus
 
+- **Carry-over design items from the 1.0-track audit (post-0.9.0):**
+  make literal search encoding-aware for Class A (encode the needle
+  through the document's engine before `memmem`) or return a typed
+  `Unsupported` instead of a silent miss; store the document encoding in
+  the `.qem.editlog` header (format v3) and route
+  `open_with_encoding` through session recovery; unify the
+  reverse-regex overlap semantics between the large-span DFA path and
+  the small-span forward path (pinned reproduction in
+  `regex_tests.rs`); make the non-Windows snapshot backing cheaper than
+  a full file copy; snapshot `save_async` state through `Arc` instead of
+  cloning the edit buffer on the UI thread.
 - **Small refactors for clarity**, not a rewrite. Split overgrown modules
   into focused units (history, persistence, fragmentation, core data
   structure for `piece_tree`; named lifecycle helpers around inspection,

@@ -4,6 +4,26 @@
 
 ### Fixed
 
+- The `.qem.editlog` open path truncates orphan pages past the committed
+  header size. A crash between the page append and the header rewrite
+  used to leave unreachable bytes at the tail of the sidecar; page
+  writes append at end-of-file and verify the offset against the page
+  id, so the first edit after reopening poisoned every later flush into
+  `persistence_failed` and the session silently stopped persisting for
+  the rest of its life. The header is the commit record, so open now
+  restores the exact pre-crash append position; a regression test
+  simulates the interrupted flush end to end.
+- Piece-table undo/redo restores the known-region boundary for partial
+  windows, not only for full-index documents. Every history entry now
+  carries the `(known_byte_len, full_index)` pair that belonged to the
+  state it represents; undoing a delete inside a partial window used to
+  clamp the boundary down and truncate reads of the last known lines
+  until the next edit. The regression test fails against the old
+  min-clamp behavior and passes with the history restore.
+- Line-offset scanning pairs a CRLF whose CR sits exactly on the
+  1 GiB scan-budget edge with its LF: the lookahead is bounded by the
+  buffer length instead of the budget, so the pair is no longer
+  miscounted as a lone CR plus a line.
 - `align_byte_offset` no longer returns mid-character offsets for
   rope-backed UTF-8 documents. The alignment window snapped its base
   outward onto a char boundary while the caller rebased its answer on
@@ -43,12 +63,19 @@
   UTF-8 BOM (not only UTF-16), the Class A CRLF line-offset comment now
   describes the actual skip/push split, `EditorTab::generation` documents
   that successful saves also move it, `EditorTab::open_file` #Errors
-  covers the load-in-progress rejection, BENCHMARKS.md names the real
+  covers the load-in-progress rejection, the literal-search crate-doc
+  sentence acknowledges the coexisting regex API, the Class B alignment
+  doc block is attached to `align_class_b` instead of the UTF-8 window
+  walker, BENCHMARKS.md names the real
   `session_layer_maintenance_status` group and the
   `small_document_open` / session-layer families and notes that
   `--seed-edit` inserts its text verbatim, and CI gained a
   `cargo check --workspace --all-targets` gate next to the README's
   quality-check list.
+- The reverse-regex rightmost-match semantics are documented as a known
+  inconsistency with the small-span forward path for self-overlapping
+  patterns, with a pinned reproduction behind `#[ignore]` until the
+  semantics are unified.
 
 ## Unreleased (0.9.0)
 

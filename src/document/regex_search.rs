@@ -958,6 +958,14 @@ fn finalize_byte_match(
 /// every `find_prev_*` call would require widening the public surface
 /// to return a `Result`, which is out of scope here; for now the
 /// documented behaviour is "pathological pattern returns no match".
+///
+/// **Known inconsistency (1.0 design item):** the large-span reverse-DFA
+/// path returns the *rightmost* match by start offset, which for
+/// self-overlapping patterns (e.g. `aa`) may overlap the previous match,
+/// while the small-span forward fallback returns the last non-overlapping
+/// match (`find_iter().last()`). The two agree for patterns that cannot
+/// self-overlap. A pinned reproduction lives behind `#[ignore]` in
+/// `regex_tests.rs::find_prev_regex_overlap_semantics_differ_between_span_paths`.
 fn find_prev_regex_via_reverse_dfa(
     doc: &Document,
     query: &RegexSearchQuery,

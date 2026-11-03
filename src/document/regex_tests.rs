@@ -1358,3 +1358,33 @@ fn find_prev_regex_reverse_dfa_visits_bounded_matches_regardless_of_density() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+#[ignore = "known reverse-regex inconsistency (1.0 design item): the large-span             reverse-DFA path returns the rightmost match even when it overlaps             the previous one, while the small-span forward path returns the             last non-overlapping match"]
+fn find_prev_regex_overlap_semantics_differ_between_span_paths() {
+    // Repro from the second audit: for a self-overlapping pattern (`aa`)
+    // the >1 MiB DFA path and the greedy forward iteration disagree about
+    // which match is "the previous one" at the end of the document.
+    let dir = fresh_test_dir("reverse-overlap-inconsistency");
+    let mut content = vec![b'x'; 1024 * 1024];
+    content.extend_from_slice(b"aaaaaaaaaaaaaaab");
+    let doc = open_clean_mmap_doc(&content, &dir, "overlap.bin");
+
+    let query = RegexSearchQuery::new("aa").expect("compile aa");
+    // Full-document search: the span exceeds SMALL_REVERSE_REGEX_SCAN_BYTES,
+    // so this routes through the reverse DFA (rightmost match by start).
+    let prev = doc
+        .find_prev_regex_query(&query, TextPosition::new(usize::MAX, usize::MAX))
+        .expect("reverse match exists");
+
+    // Greedy forward iteration: the last non-overlapping match.
+    let all: Vec<_> = doc.find_all_regex_query(&query).collect();
+    let last = all.last().expect("forward matches exist");
+
+    assert_ne!(
+        prev.start(), last.start(),
+        "the two paths agree now - the known inconsistency is fixed and this          test can assert the unified semantics instead"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

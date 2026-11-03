@@ -281,8 +281,9 @@
 //! - Literal search is part of the current public contract through
 //!   [`Document::find_next`], [`Document::find_prev`], [`Document::find_all`],
 //!   [`LiteralSearchQuery`], and the bounded query/range helpers.
-//! - This is a typed, case-sensitive literal search surface. It is not a
-//!   regex subsystem.
+//! - This is a typed, case-sensitive literal search surface, independent of
+//!   the typed regex search API ([`RegexSearchQuery`] and the `find_*_regex`
+//!   helpers), which lives in the same module family.
 //! - Bounded search returns only matches fully contained within the requested
 //!   typed range or boundary positions.
 //!
