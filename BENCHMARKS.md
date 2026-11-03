@@ -38,6 +38,10 @@ The current benchmark families in `benches/document_perf.rs` cover:
   - reusable query `find_prev` (reverse search)
   - `no-match`
   - capped `find_all_regex_query` iteration over the first `512` matches
+- small-document open: `Document::open` (inline indexing) against the raw
+  edit-buffer bulk loader
+- session-layer passthrough overhead: status, viewport and text reads,
+  maintenance status across `Document` / `DocumentSession` / `EditorTab`
 - piece-table compaction
 - full text materialization
 - typed edit commands
@@ -98,13 +102,13 @@ cargo bench --bench document_perf -- session_layer
 Focus on maintenance snapshot overhead for fragmented piece-table documents:
 
 ```powershell
-cargo bench --bench document_perf -- maintenance_status
+cargo bench --bench document_perf -- session_layer_maintenance_status
 ```
 
 Probe a real file outside the synthetic Criterion fixtures:
 
 ```powershell
-cargo run --example perf_probe -- .\huge.log --needle ERROR --seed-edit "[probe]\n" --save .\copy.log
+cargo run --example perf_probe -- .\huge.log --needle ERROR --seed-edit "[probe]" --save .\copy.log
 ```
 
 Probe capped `find_all` iterator throughput without waiting on full Criterion dense-match runs:
@@ -123,7 +127,7 @@ Use `perf_probe` when you want a manual matrix for `1GB / 10GB / 50GB` files:
 
 - run once after a reboot or cache flush for a cold-ish data point
 - run again immediately for a warm-cache data point
-- repeat with and without `--seed-edit` to separate clean mmap from edited paths
+- repeat with and without (the seed text is inserted verbatim, no escape processing) `--seed-edit` to separate clean mmap from edited paths
 - repeat with `--viewport-anchor head`, `middle`, and `tail` when the frontend story matters
 - keep the exact command line and machine/storage notes next to the numbers
 

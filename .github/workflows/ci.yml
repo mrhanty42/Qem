@@ -85,6 +85,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo clippy --all-targets --all-features -- -D warnings
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --all-features
       - name: cargo doc
         run: cargo doc --all-features --no-deps
 

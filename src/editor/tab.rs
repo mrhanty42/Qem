@@ -45,7 +45,10 @@ impl EditorTab {
 
     /// Returns the tab generation counter.
     ///
-    /// The counter is incremented after operations that fully replace the document.
+    /// The counter is incremented after document lifecycle operations
+    /// complete: opens, successful saves (the saved file may have rewritten
+    /// the document byte-for-byte on disk), and operations that fully
+    /// replace the document.
     pub fn generation(&self) -> u64 {
         self.core.generation()
     }
@@ -991,8 +994,10 @@ impl EditorTab {
     /// Opens a file in the tab and resets the cursor to the start of the document.
     ///
     /// # Errors
-    /// Returns [`DocumentError`] if the file cannot be opened or if a save is
-    /// already in progress for the current document.
+    /// Returns [`DocumentError`] if the file cannot be opened, if a save is
+    /// already in progress for the current document, or if a background load
+    /// is still in flight (first-job-wins: poll the active job to completion
+    /// before retrying).
     pub fn open_file(&mut self, path: PathBuf) -> Result<(), DocumentError> {
         self.core.open_file(path)?;
         self.cursor = CursorPosition::default();

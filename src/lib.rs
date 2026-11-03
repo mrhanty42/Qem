@@ -202,9 +202,10 @@
 //! - Explicit legacy-encoding open/save is supported through
 //!   [`Document::open_with_encoding`], [`Document::save_to_with_encoding`],
 //!   and the matching session/tab wrappers.
-//! - Auto-detect open currently recognizes BOM-backed UTF-16 files.
-//!   Otherwise Qem stays on the normal UTF-8 / ASCII path unless the caller
-//!   provides an explicit fallback through [`DocumentOpenOptions`].
+//! - Auto-detect open recognizes BOM-backed UTF-16 LE/BE sources and the
+//!   UTF-8 BOM; everything else stays on the normal UTF-8 / ASCII path
+//!   unless the caller provides an explicit fallback through
+//!   [`DocumentOpenOptions`].
 //! - Non-UTF8 opens run through the native per-encoding engines on the
 //!   mmap fast path (single-byte encodings, UTF-16 LE / BE, Shift_JIS,
 //!   GB18030, EUC-KR) without materializing a UTF-8 rope. Only the UTF-8

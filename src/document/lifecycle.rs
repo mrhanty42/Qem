@@ -243,8 +243,8 @@ impl Document {
 
     /// Opens a file using the lightweight auto-detect path.
     ///
-    /// This currently recognizes BOM-backed UTF-16 sources and otherwise
-    /// falls back to the default UTF-8/ASCII fast path.
+    /// This recognizes BOM-backed UTF-16 LE/BE sources and the UTF-8 BOM,
+    /// and otherwise falls back to the default UTF-8/ASCII fast path.
     pub fn open_with_auto_encoding_detection(
         path: impl Into<PathBuf>,
     ) -> Result<Self, DocumentError> {
@@ -588,11 +588,11 @@ impl Document {
         let file_len = storage.len();
 
         // Inline line-offset indexing via memchr2_iter(b'\n', b'\r', bytes).
-        // CRLF collapses to a single line break: when we see '\r', we skip
-        // it if the next byte is '\n' (the '\n' iteration handles the
-        // break); when we see '\n' that follows a '\r' we skip it because
-        // that pair was already accounted for. Lone '\n' or lone '\r' both
-        // open a new line.
+        // CRLF collapses to a single line break: the '\r' half of a CRLF
+        // pair is skipped (no offset entry), and the '\n' half that follows
+        // a '\r' is skipped too - the pair records no entry of its own, and
+        // the next line's start is recorded by the break that follows it.
+        // Lone '\n' and lone '\r' both push an offset and open a new line.
         let mut detected_line_ending: Option<LineEnding> = None;
         let line_offsets = if file_len <= u32::MAX as usize {
             let mut offsets = Vec::with_capacity(LineOffsets::capacity_for::<u32>(file_len));

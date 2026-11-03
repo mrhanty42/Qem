@@ -2,6 +2,31 @@
 
 ## Unreleased (1.0.0)
 
+### Fixed
+
+- `align_byte_offset` no longer returns mid-character offsets for
+  rope-backed UTF-8 documents. The alignment window snapped its base
+  outward onto a char boundary while the caller rebased its answer on
+  the *requested* offset, shifting every result by the snap delta; the
+  backward direction could land on a continuation byte. The window now
+  reports its actual base and both call sites rebase on it. A unit test
+  pins the boundary property on a multi-byte rope fixture.
+- Piece-table compaction is capped by the full-materialization budget
+  (128 MiB, like the rope path). Compaction copies the whole document
+  into the edit buffer, so `run_idle_compaction` - which the crate docs
+  advertise as an idle-time helper - used to attempt a full-document
+  allocation on partial-window huge documents and could abort the
+  process. The recommendation path never proposes a rewrite the
+  executor would refuse, and `compact_piece_table` documents the
+  refusal.
+- The save skip paths (nothing to write: the document is already saved
+  and byte-identical at the target) now clear the retained background
+  issue like every other successful save completion, matching the
+  crate-docs contract instead of silently keeping a stale problem.
+- The `large_file` demo binary no longer allocates a console window in
+  release builds, matching the main demo (the 0.9.0 changelog claim now
+  holds for both binaries).
+
 ### Changed
 
 - Removed the stale module-level `#![allow(dead_code)]` from the
@@ -14,6 +39,16 @@
   `editor`-feature-gated, the dead `snapshot_add_len` field is removed,
   and CI runs clippy with `-D warnings` on the no-editor configuration
   so this class of drift cannot land silently.
+- Documentation swept against the code: auto-detect recognizes the
+  UTF-8 BOM (not only UTF-16), the Class A CRLF line-offset comment now
+  describes the actual skip/push split, `EditorTab::generation` documents
+  that successful saves also move it, `EditorTab::open_file` #Errors
+  covers the load-in-progress rejection, BENCHMARKS.md names the real
+  `session_layer_maintenance_status` group and the
+  `small_document_open` / session-layer families and notes that
+  `--seed-edit` inserts its text verbatim, and CI gained a
+  `cargo check --workspace --all-targets` gate next to the README's
+  quality-check list.
 
 ## Unreleased (0.9.0)
 
