@@ -85,6 +85,20 @@
 
 ### Fixed
 
+- Rope undo/redo history no longer produces a phantom redo at the
+  history cap: after the 501st consecutive edit the just-applied entry
+  was counted as redoable, so the first redo re-applied the last edit
+  (duplicating text). The cap drain now derives the cursor from the
+  drained list length, and the cap test asserts the invariant on every
+  step instead of relying on the step-count parity that used to hide
+  the flip.
+- Piece-table undo→redo restores the known-region boundary on
+  fully-indexed documents. Undo clamped `known_byte_len` down and redo
+  never restored it, so a full-index piece table carried
+  `known < total_len` until the next edit and tail reads through the
+  boundary-clamped lookup paths could truncate the document tail. A
+  regression test pins the state invariant (known == total after
+  undo→redo) and the tail read.
 - Corrupt `.qem.lineidx` sidecars no longer hang or mis-shape the disk
   index: checkpoint descent is bounded by a tree-depth limit, internal
   pages reject zero child page references (page id 0 aliases page 1

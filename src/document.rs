@@ -2412,7 +2412,16 @@ impl PieceTable {
             return Ok(false);
         }
         self.total_len = self.pieces.total_len();
-        self.known_byte_len = self.known_byte_len.min(self.total_len);
+        // Mirror `insert`'s known-region maintenance: a full index covers
+        // the whole document, so its known boundary moves with the length
+        // instead of clamping down. The clamp left `known_byte_len` stale
+        // after undo→redo and truncated the tail out of viewport / read
+        // answers until the next edit.
+        if self.full_index {
+            self.known_byte_len = self.total_len;
+        } else {
+            self.known_byte_len = self.known_byte_len.min(self.total_len);
+        }
         self.refresh_known_line_count();
         self.schedule_session_flush()?;
         Ok(true)
@@ -2423,7 +2432,12 @@ impl PieceTable {
             return Ok(false);
         }
         self.total_len = self.pieces.total_len();
-        self.known_byte_len = self.known_byte_len.min(self.total_len);
+        // Same full-index rule as `undo` above.
+        if self.full_index {
+            self.known_byte_len = self.total_len;
+        } else {
+            self.known_byte_len = self.known_byte_len.min(self.total_len);
+        }
         self.refresh_known_line_count();
         self.schedule_session_flush()?;
         Ok(true)

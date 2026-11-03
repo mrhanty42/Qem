@@ -121,16 +121,19 @@ impl RopeHistory {
         if records.is_empty() {
             return;
         }
-        // A fresh edit invalidates every redoable entry past the cursor.
+        // A fresh edit invalidates every redoable entry past the cursor,
+        // so after the truncate the cursor always sits at the end of the
+        // entry list. The newly pushed entry is applied, and after the
+        // cap drain the cursor is simply the new list length: deriving it
+        // from the pre-drain cursor instead left the just-applied entry
+        // counted as redoable (a phantom redo re-applied the last edit).
         self.entries.truncate(self.index);
         self.entries.push(records);
         if self.entries.len() > MAX_ENTRIES {
             let drop_count = self.entries.len() - MAX_ENTRIES;
             self.entries.drain(0..drop_count);
-            self.index = self.index.saturating_sub(drop_count);
-        } else {
-            self.index += 1;
         }
+        self.index = self.entries.len();
     }
 
     /// Returns `true` when there is nothing to undo.
@@ -286,6 +289,11 @@ mod tests {
             let ch = (b'a' + (i % 26) as u8) as char;
             b.insert(b.len_chars(), &ch.to_string());
             history.record(b.len_chars() - 1, String::new(), ch.to_string());
+            // A fresh edit must never leave the just-applied entry counted
+            // as redoable, no matter where the cap drain lands (the
+            // off-by-one here used to flip with the parity of the step
+            // count and made the first redo re-apply the last edit).
+            assert!(!history.can_redo(), "phantom redo after edit {}", i);
         }
         assert_eq!(history.entries.len(), MAX_ENTRIES);
         // Every retained undo must still restore a consistent shorter buffer.

@@ -1333,12 +1333,12 @@ fn find_prev_regex_reverse_dfa_visits_bounded_matches_regardless_of_density() {
     let _ = dense_doc
         .find_prev_regex("X", TextPosition::new(usize::MAX, usize::MAX))
         .expect("dense reverse match exists");
-    let dense_visits = super::regex_search::take_reverse_match_visit_count();
+    let dense_visits = super::regex_search::reverse_visit_counter::take();
 
     let _ = sparse_doc
         .find_prev_regex("X", TextPosition::new(usize::MAX, usize::MAX))
         .expect("sparse reverse match exists");
-    let sparse_visits = super::regex_search::take_reverse_match_visit_count();
+    let sparse_visits = super::regex_search::reverse_visit_counter::take();
 
     assert!(
         dense_visits >= 1,

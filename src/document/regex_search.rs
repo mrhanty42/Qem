@@ -1133,33 +1133,6 @@ fn utf8_floor_boundary_bytes(bytes: &[u8], byte: usize) -> usize {
 // edits.
 // ---------------------------------------------------------------------------
 
-// Test-only instrumentation for the deterministic dense/sparse perf
-// guard (`regex_tests::find_prev_regex_reverse_dfa_visits_bounded_...`):
-// it counts the matches the reverse path accepts, so a regression back
-// to forward-iterate-and-keep-last shows up as a huge count instead of
-// a flaky wall-clock ratio.
-#[cfg(test)]
-mod reverse_visit_counter {
-    use std::cell::Cell;
-
-    thread_local! {
-        static VISITS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    pub(super) fn record() {
-        VISITS.with(|v| v.set(v.get() + 1));
-    }
-
-    pub(super) fn take() -> usize {
-        VISITS.with(Cell::take)
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn take_reverse_match_visit_count() -> usize {
-    reverse_visit_counter::take()
-}
-
 /// Returns the leftmost-start-of-rightmost-match `(start, end)` byte
 /// offsets relative to `slice` for `dfa` + `forward_regex`, or `None` when
 /// no match exists in `slice`.
@@ -1894,4 +1867,32 @@ fn build_class_b_search_match(
         }
     }
     Some(SearchMatch::new(TextRange::new(start_pos, units), end_pos))
+}
+
+// Test-only instrumentation for the deterministic dense/sparse perf
+// guard (`regex_tests::find_prev_regex_reverse_dfa_visits_bounded_...`):
+// it counts the matches the reverse path accepts, so a regression back
+// to forward-iterate-and-keep-last shows up as a huge count instead of
+// a flaky wall-clock ratio.
+#[cfg(test)]
+pub(crate) mod reverse_visit_counter {
+    //! Test-only instrumentation for the deterministic dense/sparse perf
+    //! guard (`regex_tests::find_prev_regex_reverse_dfa_visits_bounded_...`):
+    //! it counts the matches the reverse path accepts, so a regression back
+    //! to forward-iterate-and-keep-last shows up as a huge count instead of
+    //! a flaky wall-clock ratio.
+
+    use std::cell::Cell;
+
+    thread_local! {
+        static VISITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn record() {
+        VISITS.with(|v| v.set(v.get() + 1));
+    }
+
+    pub(crate) fn take() -> usize {
+        VISITS.with(Cell::take)
+    }
 }

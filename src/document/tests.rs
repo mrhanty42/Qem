@@ -6405,6 +6405,76 @@ fn try_backspace_at_encoded_shift_jis_walks_back_one_kanji_cell() {
 }
 
 #[test]
+fn piece_table_undo_redo_restores_known_length_on_full_index() {
+    // A file above `PIECE_TABLE_MIN_BYTES` gets a fully indexed piece
+    // table on first edit. Regression: undo clamped `known_byte_len` down
+    // and redo never restored it, so `line_range` ended the last line at
+    // the stale boundary and the document tail disappeared from
+    // viewport / read answers until the next edit.
+    let dir = std::env::temp_dir().join(format!("qem-undo-full-index-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("full-index.log");
+    let content = format!("{}\nTAIL\n", "x".repeat(1_600_000));
+    std::fs::write(&path, &content).unwrap();
+
+    let mut doc = Document::open(&path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while doc.is_indexing() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    doc.try_insert(TextPosition::new(0, 0), "[qem]\n").unwrap();
+    assert!(
+        doc.piece_table.is_some(),
+        "precondition: the edit created a piece table"
+    );
+    assert!(
+        doc.piece_table.as_ref().unwrap().full_index,
+        "precondition: the line table fits the budget and is fully indexed"
+    );
+
+    doc.try_undo().unwrap();
+    doc.try_redo().unwrap();
+
+    // The state-level invariant behind the read-path damage: a full-index
+    // piece table must track the document length exactly after undo->redo.
+    {
+        let pt = doc.piece_table.as_ref().unwrap();
+        assert_eq!(
+            pt.known_byte_len,
+            pt.total_len(),
+            "full-index known boundary went stale across undo->redo"
+        );
+    }
+
+    let marker_line0 = doc
+        .line_count()
+        .exact()
+        .expect("full-index document knows its exact line count")
+        // The trailing newline means the exact count includes one virtual
+        // empty line after `TAIL`; the marker sits one above it.
+        .saturating_sub(2);
+    let viewport = doc.read_viewport(ViewportRequest::new(marker_line0, 1));
+    let row = viewport.rows().first().expect("marker line row");
+    assert_eq!(
+        row.text(),
+        "TAIL",
+        "undo→redo must keep the last content line intact"
+    );
+
+    // The line/col → byte mapping clamps its backward scan at the known
+    // region boundary; a stale boundary must not truncate the tail.
+    let tail = doc.read_text(TextRange::new(TextPosition::new(marker_line0, 0), 4));
+    assert_eq!(
+        tail.text(),
+        "TAIL",
+        "read_text from line/col must see the tail"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn small_rope_document_undo_redo_round_trip() {
     let dir = std::env::temp_dir().join(format!("qem-undo-small-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
