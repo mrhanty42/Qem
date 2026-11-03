@@ -236,7 +236,7 @@ impl Document {
                     idx + 1
                 }
             }
-            // Deg-fallback: if no line break is reachable inside the
+            // Degenerate fallback: if no line break is reachable inside the
             // window, fall back to `scan_floor`. The forward walk may
             // overshoot `target` when the heuristic anchor is not on a
             // character boundary; the alignment then collapses to the
@@ -247,22 +247,6 @@ impl Document {
     }
 }
 
-/// Class B scan-from-anchor alignment.
-///
-/// Walks the engine's [`EncodingEngine::step`] forward from `anchor` until
-/// the cursor lands on or moves past `target`:
-///
-/// - If the cursor lands exactly on `target`, that offset is already on a
-///   character boundary and is returned as both the backward and forward
-///   answer.
-/// - Otherwise the cursor that stepped past `target` is the smallest
-///   boundary `>= target` (the `Forward` answer), and the cursor's
-///   previous position is the largest boundary `<= target` (the
-///   `Backward` answer).
-///
-/// The walk is progress-safe even if an engine violates its contract:
-/// a zero or non-advancing step consumes one byte as malformed input rather
-/// than returning a repeated cursor to its caller.
 /// UTF-8 boundary walks over a bounded window of a UTF-8 document.
 ///
 /// The window passed by `align_byte_offset` comes from a document whose
@@ -289,6 +273,22 @@ fn align_utf8_window_forward(bytes: &[u8], offset: usize) -> usize {
     aligned
 }
 
+/// Class B scan-from-anchor alignment.
+///
+/// Walks the engine's [`EncodingEngine::step`] forward from `anchor` until
+/// the cursor lands on or moves past `target`:
+///
+/// - If the cursor lands exactly on `target`, that offset is already on a
+///   character boundary and is returned as both the backward and forward
+///   answer.
+/// - Otherwise the cursor that stepped past `target` is the smallest
+///   boundary `>= target` (the `Forward` answer), and the cursor's
+///   previous position is the largest boundary `<= target` (the
+///   `Backward` answer).
+///
+/// The walk is progress-safe even if an engine violates its contract:
+/// a zero or non-advancing step consumes one byte as malformed input rather
+/// than returning a repeated cursor to its caller.
 fn align_class_b(
     engine: &dyn EncodingEngine,
     bytes: &[u8],
