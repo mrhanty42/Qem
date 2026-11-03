@@ -96,11 +96,16 @@ impl Document {
         // each side cover the walk without materializing the document.
         if encoding.is_utf8() {
             let back = offset.saturating_sub(8);
-            let window = self.alignment_window(back, offset.saturating_add(8).min(file_len));
-            let rel = offset - back;
+            // The window base can be snapped outward by the backing (the
+            // rope branch aligns it to a char boundary); every answer below
+            // must be rebased on the *actual* window start, not the
+            // requested one, or the result shifts by the snap delta.
+            let (window_base, window) =
+                self.alignment_window(back, offset.saturating_add(8).min(file_len));
+            let rel = offset - window_base;
             return match dir {
-                AlignDirection::Backward => back + align_utf8_window_backward(&window, rel),
-                AlignDirection::Forward => back + align_utf8_window_forward(&window, rel),
+                AlignDirection::Backward => window_base + align_utf8_window_backward(&window, rel),
+                AlignDirection::Forward => window_base + align_utf8_window_forward(&window, rel),
             };
         }
 
@@ -135,8 +140,9 @@ impl Document {
         // target and the forward walk overshoots the target by at most
         // one character, so doubling the backtrack plus a small forward
         // margin bounds everything the scan can touch.
-        let lo = offset.saturating_sub(super::APPROX_LINE_BACKTRACK_BYTES * 2);
-        let window = self.alignment_window(lo, offset.saturating_add(4096).min(file_len));
+        let requested_lo = offset.saturating_sub(super::APPROX_LINE_BACKTRACK_BYTES * 2);
+        let (lo, window) =
+            self.alignment_window(requested_lo, offset.saturating_add(4096).min(file_len));
         let target = offset - lo;
 
         let engine = self.encoding_engine();
@@ -153,10 +159,10 @@ impl Document {
     /// Copying the whole document per alignment call — multi-GB for the
     /// mmap and piece-tree backings this engine targets — is therefore
     /// neither necessary nor survivable on huge files.
-    fn alignment_window(&self, lo: usize, hi: usize) -> Vec<u8> {
+    fn alignment_window(&self, lo: usize, hi: usize) -> (usize, Vec<u8>) {
         debug_assert!(lo < hi);
         if let Some(piece_table) = &self.piece_table {
-            return piece_table.read_range(lo, hi);
+            return (lo, piece_table.read_range(lo, hi));
         }
         if let Some(rope) = &self.rope {
             // Rope bytes are already in memory; slice the window out.
@@ -172,15 +178,16 @@ impl Document {
                 hi += 1;
             }
             if lo >= hi {
-                return Vec::new();
+                return (lo, Vec::new());
             }
             // Convert the aligned byte window to its char range; the bytes
             // may span chunk boundaries, so they come back owned.
             let chars_lo = rope.byte_to_char(lo);
             let chars_hi = rope.byte_to_char(hi);
-            return rope.slice_to_string(chars_lo..chars_hi).into_bytes();
+            let window = rope.slice_to_string(chars_lo..chars_hi).into_bytes();
+            return (lo, window);
         }
-        self.mmap_bytes()[lo..hi].to_vec()
+        (lo, self.mmap_bytes()[lo..hi].to_vec())
     }
 
     /// Reads the document's current bytes into an owned `Vec<u8>` for
@@ -498,5 +505,43 @@ mod tests {
         assert_eq!(doc.align_byte_offset(1, AlignDirection::Forward), 1);
         assert_eq!(doc.align_byte_offset(3, AlignDirection::Backward), 3);
         assert_eq!(doc.align_byte_offset(3, AlignDirection::Forward), 3);
+    }
+}
+
+#[cfg(test)]
+mod rope_window_tests {
+    use super::Document;
+    use crate::TextPosition;
+
+    #[test]
+    fn utf8_rope_backward_alignment_lands_on_char_boundary_mid_char() {
+        // Regression for the alignment-window base desync: the rope branch
+        // snaps the window base outward onto a char boundary, but the UTF-8
+        // caller used to add its answers to the *unsnapped* base, shifting
+        // the result whenever `offset - 8` landed inside a multi-byte char.
+        let mut doc = Document::new();
+        doc.try_insert(TextPosition::new(0, 0), "жжжжжжжжжжжж\n")
+            .expect("seeded multibyte rope insert");
+        // Offset 3 = the start of the second `ж` (each is 2 bytes). The
+        // window base `offset - 8 = -5` clamps to 0 here, so use a bigger
+        // document to put `offset - 8` strictly inside a char.
+        let mut big = String::new();
+        for _ in 0..8 {
+            big.push_str("жжжж\n");
+        }
+        let mut doc = Document::new();
+        doc.try_insert(TextPosition::new(0, 0), &big)
+            .expect("seeded big multibyte rope insert");
+        let offset = 11; // inside the 4th `ж` (bytes 8..10 are the 3rd, 10..12 the 4th)
+        let aligned = doc.align_byte_offset(offset, super::AlignDirection::Backward);
+        let bytes = doc.bytes_for_alignment();
+        assert!(
+            aligned <= offset,
+            "backward alignment must not move forward: {aligned} > {offset}"
+        );
+        assert!(
+            bytes.get(aligned).is_none_or(|b| b & 0xC0 != 0x80),
+            "backward alignment landed mid-char: {aligned} is a continuation byte"
+        );
     }
 }

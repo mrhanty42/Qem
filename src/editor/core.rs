@@ -498,6 +498,10 @@ impl SessionCore {
             return Err(SaveError::NoPath);
         };
         if self.doc.can_skip_clean_preserve_save_to_path(&path) {
+            // A successful (no-op) save completes the operation, so the
+            // crate-docs contract applies: the retained background issue is
+            // cleared like on every other save completion.
+            self.last_background_issue = None;
             return Ok(());
         }
         self.doc.save_to(&path).map_err(SaveError::Io)?;
@@ -533,6 +537,8 @@ impl SessionCore {
             crate::SaveEncodingPolicy::Preserve
         ) && self.doc.can_skip_clean_preserve_save_to_path(&path)
         {
+            // Same successful-completion contract as `save` above.
+            self.last_background_issue = None;
             return Ok(());
         }
         self.doc.save_to_with_options(&path, options)?;
@@ -704,6 +710,8 @@ impl SessionCore {
             crate::SaveEncodingPolicy::Preserve
         ) && self.doc.can_skip_clean_preserve_save_to_path(&path)
         {
+            // Same successful-completion contract as `save` above.
+            self.last_background_issue = None;
             return Ok(false);
         }
 

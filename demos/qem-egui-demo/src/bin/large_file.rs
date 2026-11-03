@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use eframe::egui::{
     self, Align, Color32, CornerRadius, DragValue, FontFamily, FontId, Id, Key, Layout, Margin,
     Modal, ProgressBar, Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, Vec2,

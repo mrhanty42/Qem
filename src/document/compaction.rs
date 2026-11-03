@@ -126,8 +126,10 @@ impl Document {
     ///
     /// This does not create a new undo step. Older undo history remains intact,
     /// while the current history entry is rewritten into a compact representation.
-    /// Returns `Ok(false)` when the document is not piece-table backed or is
-    /// already compact enough that no rewrite is needed.
+    /// Returns `Ok(false)` when the document is not piece-table backed, is
+    /// already compact enough that no rewrite is needed, or exceeds the
+    /// full-materialization size budget (compaction copies the whole
+    /// document into the edit buffer, so it is capped like the rope path).
     pub fn compact_piece_table(&mut self) -> io::Result<bool> {
         let Some(piece_table) = self.piece_table.as_mut() else {
             return Ok(false);
@@ -188,6 +190,16 @@ impl PieceTable {
             return Ok(false);
         }
 
+        // Compaction materializes the whole document into the add buffer
+        // (this is where `full_index` becomes true), so it carries the same
+        // size budget as every other full-materialization path. Refusing
+        // above the cap keeps `run_idle_compaction` - which the crate docs
+        // advertise as an idle-time helper - from aborting the process on
+        // a partial-window huge document.
+        if self.total_len > super::MAX_ROPE_EDIT_FILE_BYTES {
+            return Ok(false);
+        }
+
         let mut compacted = self.read_range(0, self.total_len);
         let compacted_len = compacted.len();
         let line_breaks = count_line_breaks_in_bytes(&compacted);
@@ -218,6 +230,12 @@ impl PieceTable {
         policy: CompactionPolicy,
     ) -> Option<CompactionRecommendation> {
         if self.total_len < policy.min_total_bytes {
+            return None;
+        }
+        // Never recommend a rewrite the executor would refuse: compaction
+        // materializes the whole document and is capped like every other
+        // full-materialization path.
+        if self.total_len > super::MAX_ROPE_EDIT_FILE_BYTES {
             return None;
         }
 
