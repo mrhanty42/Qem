@@ -256,9 +256,8 @@ impl Document {
 
     /// Opens a file using an explicit text encoding.
     ///
-    /// This explicitly reinterprets the source bytes through `encoding`.
-    /// Non-UTF8 opens currently transcode the source into a rope-backed
-    /// document instead of using the mmap fast path.
+    /// This drives the native per-encoding engine for `encoding` over the
+    /// mmap fast path; nothing is transcoded into a UTF-8 rope.
     pub fn open_with_encoding(
         path: impl Into<PathBuf>,
         encoding: DocumentEncoding,
@@ -589,10 +588,10 @@ impl Document {
 
         // Inline line-offset indexing via memchr2_iter(b'\n', b'\r', bytes).
         // CRLF collapses to a single line break: the '\r' half of a CRLF
-        // pair is skipped (no offset entry), and the '\n' half that follows
-        // a '\r' is skipped too - the pair records no entry of its own, and
-        // the next line's start is recorded by the break that follows it.
-        // Lone '\n' and lone '\r' both push an offset and open a new line.
+        // pair is skipped, and the '\n' half that follows a '\r' matches the
+        // empty arm and falls through to the push below - that fall-through
+        // is what records the next line's start for the pair. Lone '\n' and
+        // lone '\r' also push an offset and open a new line.
         let mut detected_line_ending: Option<LineEnding> = None;
         let line_offsets = if file_len <= u32::MAX as usize {
             let mut offsets = Vec::with_capacity(LineOffsets::capacity_for::<u32>(file_len));
@@ -999,7 +998,7 @@ impl Document {
 
                         if b == b'\r' {
                             // Treat lone '\r' as a newline (old-Mac). Skip CRLF: '\n' will handle it.
-                            if i + 1 < scan_limit && bytes[i + 1] == b'\n' {
+                            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
                                 continue;
                             }
                         }
@@ -1061,7 +1060,7 @@ impl Document {
 
                         if b == b'\r' {
                             // Treat lone '\r' as a newline (old-Mac). Skip CRLF: '\n' will handle it.
-                            if i + 1 < scan_limit && bytes[i + 1] == b'\n' {
+                            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
                                 continue;
                             }
                         }
