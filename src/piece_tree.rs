@@ -288,6 +288,7 @@ pub(crate) struct PieceTree {
     store: PageStore,
     root: Option<ChildRef>,
     history: Vec<RootEntry>,
+    known_history: Vec<(usize, bool)>,
     history_index: usize,
     history_batch_depth: usize,
     history_batch_dirty: bool,
@@ -298,6 +299,7 @@ impl PieceTree {
         Self {
             store: PageStore::default(),
             root: None,
+            known_history: Vec::new(),
             history: vec![RootEntry { root: None }],
             history_index: 0,
             history_batch_depth: 0,
@@ -309,6 +311,7 @@ impl PieceTree {
         let mut this = Self::new();
         this.root = this.build_tree_from_pieces(filter_zero_len(pieces));
         this.history = vec![RootEntry { root: this.root }];
+        this.known_history = vec![(0, false)];
         this.history_index = 0;
         this
     }
@@ -318,12 +321,14 @@ impl PieceTree {
             store: PageStore::Disk(DiskPageStore::create(source_path)?),
             root: None,
             history: Vec::new(),
+            known_history: Vec::new(),
             history_index: 0,
             history_batch_depth: 0,
             history_batch_dirty: false,
         };
         this.root = this.build_tree_from_pieces(filter_zero_len(pieces));
         this.history = vec![RootEntry { root: this.root }];
+        this.known_history = vec![(0, false)];
         this.history_index = 0;
         this.flush_session(&[], SessionMeta::default())?;
         Ok(this)
@@ -344,11 +349,13 @@ impl PieceTree {
             .copied()
             .unwrap_or(RootEntry { root: None })
             .root;
+        let known_history = vec![(meta.known_byte_len, meta.full_index); history.len()];
         Ok(Some((
             Self {
                 store: PageStore::Disk(store),
                 root,
                 history,
+                known_history,
                 history_index,
                 history_batch_depth: 0,
                 history_batch_dirty: false,
@@ -560,14 +567,21 @@ impl PieceTree {
             store: PageStore::Disk(DiskPageStore::create(source_path)?),
             root: None,
             history: Vec::with_capacity(remapped_history.len()),
+            known_history: Vec::with_capacity(remapped_history.len()),
             history_index: history_index.min(remapped_history.len().saturating_sub(1)),
             history_batch_depth: 0,
             history_batch_dirty: false,
         };
 
+        let rebuilt_boundary = self
+            .known_history
+            .get(self.history_index)
+            .copied()
+            .unwrap_or((0, false));
         for pieces in remapped_history {
             let root = rebuilt.build_tree_from_pieces(filter_zero_len(pieces));
             rebuilt.history.push(RootEntry { root });
+            rebuilt.known_history.push(rebuilt_boundary);
         }
 
         rebuilt.root = rebuilt
@@ -599,22 +613,32 @@ impl PieceTree {
         *self = Self::from_pieces(pieces);
     }
 
-    pub(crate) fn undo(&mut self) -> bool {
+    pub(crate) fn undo(&mut self, current_boundary: (usize, bool)) -> Option<(usize, bool)> {
         if self.history_index == 0 {
-            return false;
+            return None;
         }
         self.history_index = self.history_index.saturating_sub(1);
         self.root = self.history[self.history_index].root;
-        true
+        Some(
+            self.known_history
+                .get(self.history_index)
+                .copied()
+                .unwrap_or(current_boundary),
+        )
     }
 
-    pub(crate) fn redo(&mut self) -> bool {
+    pub(crate) fn redo(&mut self, current_boundary: (usize, bool)) -> Option<(usize, bool)> {
         if self.history_index + 1 >= self.history.len() {
-            return false;
+            return None;
         }
         self.history_index += 1;
         self.root = self.history[self.history_index].root;
-        true
+        Some(
+            self.known_history
+                .get(self.history_index)
+                .copied()
+                .unwrap_or(current_boundary),
+        )
     }
 
     pub(crate) fn begin_batch_edit(&mut self) {
@@ -652,8 +676,30 @@ impl PieceTree {
             return;
         }
         self.history.truncate(self.history_index.saturating_add(1));
+        self.known_history
+            .truncate(self.history_index.saturating_add(1));
         self.history.push(next);
+        let fallback = self.known_history.last().copied().unwrap_or((0, false));
+        self.known_history.push(fallback);
         self.history_index = self.history.len().saturating_sub(1);
+    }
+
+    /// Patches the known-region boundary of the current history entry.
+    /// Callers invoke this right after they adjust their own boundary, so
+    /// every history entry carries the boundary that belonged to the state
+    /// it represents.
+    pub(crate) fn set_known_boundary(&mut self, known: usize, full_index: bool) {
+        while self.known_history.len() < self.history.len() {
+            let fallback = self
+                .known_history
+                .last()
+                .copied()
+                .unwrap_or((known, full_index));
+            self.known_history.push(fallback);
+        }
+        if let Some(entry) = self.known_history.get_mut(self.history_index) {
+            *entry = (known, full_index);
+        }
     }
 
     fn page(&self, page_id: u64) -> Option<Arc<PiecePage>> {
@@ -1157,6 +1203,20 @@ impl DiskPageStore {
                 .flatten(),
             decoding_had_errors: (header.flags & EDITLOG_FLAG_DECODING_HAD_ERRORS) != 0,
         };
+
+        // The header is the commit record: pages appended after the last
+        // committed `page_count` are orphans from a crash between the page
+        // append and the header rewrite. Page writes go through
+        // `SeekFrom::End` and assert the append offset against the page id,
+        // so orphan bytes would poison every later flush into
+        // `persistence_failed` and silently kill persistence for the rest
+        // of the session. Truncating to the committed size restores the
+        // exact pre-crash append position.
+        let committed_len = EDITLOG_HEADER_BYTES as u64
+            + header.page_count.saturating_mul(EDITLOG_PAGE_SIZE as u64);
+        if file.metadata()?.len() > committed_len {
+            file.set_len(committed_len)?;
+        }
 
         Ok(Some((
             Self {
@@ -2464,6 +2524,96 @@ mod tests {
                 (PieceSource::Add, 10, 2, 1),
                 (PieceSource::Original, 3, 3, 1),
             ]
+        );
+
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_open_truncates_orphan_pages_from_an_interrupted_flush() {
+        // A crash between the page append and the header rewrite leaves
+        // orphan pages past the committed size. Page writes append at
+        // `SeekFrom::End` and assert the offset against the page id, so the
+        // orphans would poison every later flush into `persistence_failed`
+        // and silently disable persistence for the session. Open must
+        // truncate back to the committed size (the header is the commit
+        // record; the orphans are unreachable by design).
+        let dir = std::env::temp_dir().join(format!(
+            "qem-piece-tree-orphan-pages-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef\n").unwrap();
+        let mut tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 7,
+                line_breaks: 1,
+            }],
+        )
+        .unwrap();
+        let mut split = |piece: Piece, left_len: usize| {
+            let left = Piece {
+                src: piece.src,
+                start: piece.start,
+                len: left_len,
+                line_breaks: 0,
+            };
+            let right = Piece {
+                src: piece.src,
+                start: piece.start + left_len,
+                len: piece.len - left_len,
+                line_breaks: piece.line_breaks,
+            };
+            (Some(left), Some(right))
+        };
+        tree.insert(
+            3,
+            Piece {
+                src: PieceSource::Add,
+                start: 10,
+                len: 2,
+                line_breaks: 1,
+            },
+            &mut split,
+        );
+        tree.flush_session(b"ignored-by-test", SessionMeta::default())
+            .unwrap();
+        drop(tree);
+
+        let sidecar = editlog_path(&source);
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&sidecar).unwrap();
+            file.write_all(&[0u8; 2 * 4096]).unwrap();
+        }
+
+        let mut reopened = PieceTree::open_disk(&source).unwrap();
+        reopened.insert(
+            1,
+            Piece {
+                src: PieceSource::Add,
+                start: 12,
+                len: 1,
+                line_breaks: 0,
+            },
+            &mut split,
+        );
+        reopened
+            .flush_session(b"ignored-by-test", SessionMeta::default())
+            .unwrap();
+        drop(reopened);
+
+        let again = PieceTree::open_disk(&source).unwrap();
+        assert_eq!(
+            again.total_len(),
+            10,
+            "the post-orphan edit must persist; a poisoned editlog would have \
+             recovered the pre-edit session instead"
         );
 
         let _ = fs::remove_file(&sidecar);
