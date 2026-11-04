@@ -4209,6 +4209,7 @@ fn try_insert_rejects_large_piece_table_promotion_to_rope() {
                 len: 1,
                 line_breaks: 0,
             }]),
+            engine: encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
             known_line_count: 1,
             exact_base_line_breaks: None,
             exact_base_total_lines: None,
@@ -5882,6 +5883,7 @@ fn edit_capability_reports_partial_piece_table_promotion_limits() {
                 len: 1,
                 line_breaks: 0,
             }]),
+            engine: encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
             known_line_count: 1,
             exact_base_line_breaks: None,
             exact_base_total_lines: None,
@@ -6511,6 +6513,101 @@ fn piece_table_partial_undo_restores_known_boundary() {
     );
     assert!(pt.redo().unwrap());
     assert_eq!(pt.known_byte_len, 199_955);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Regression for the third audit round: a windows-1251 (Class A)
+// document edited into a piece table must decode its line reads through
+// the document's engine. The naive UTF-8 decode returned U+FFFD garbage
+// for every non-UTF-8 piece-table line after the first edit.
+#[test]
+fn non_utf8_piece_table_line_reads_decode_through_engine() {
+    let dir = std::env::temp_dir().join(format!("qem-cp1251-piece-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("cp1251.txt");
+    // windows-1251 for the word "привет" followed by four exclamation marks.
+    std::fs::write(
+        &path,
+        [0xEF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2, 0x21, 0x21, 0x21, 0x21],
+    )
+    .unwrap();
+
+    let mut doc = Document::open_with_encoding(
+        &path,
+        DocumentEncoding::from_label("windows-1251").expect("cp1251 label"),
+    )
+    .unwrap();
+    doc.try_insert(TextPosition::new(0, 0), "[qem]").unwrap();
+    assert!(
+        doc.piece_table.is_some(),
+        "precondition: non-UTF-8 edits create a piece table"
+    );
+
+    // Columns are bytes for Class A: 5 + 6 + 4 = 15 text units.
+    assert_eq!(doc.line_len_chars(0), 15);
+
+    let slice = doc.read_viewport(ViewportRequest::new(0, 1));
+    assert_eq!(
+        slice.rows().first().map(|r| r.text().to_owned()).as_deref(),
+        Some("[qem]\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}!!!!")
+    );
+
+    // Inserting at column 5 lands after "[qem]п" - Class A
+    // columns are bytes, so the cursor and the rendered line are exact.
+    let cursor = doc.try_insert(TextPosition::new(0, 5), "|").unwrap();
+    assert_eq!(cursor, TextPosition::new(0, 6));
+    let slice = doc.read_viewport(ViewportRequest::new(0, 1));
+    assert_eq!(
+        slice.rows().first().map(|r| r.text().to_owned()).as_deref(),
+        Some("[qem]|\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}!!!!")
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn piece_table_composite_undo_restores_partial_known_boundary() {
+    // Regression for the batch-boundary bug: a composite replace (delete +
+    // insert inside one edit batch) used to overwrite the pre-batch
+    // history entry's known boundary, so undoing the composite restored a
+    // stale boundary on partial-window documents. Both directions are
+    // pinned: undo -> pre-batch boundary, redo -> post-batch boundary.
+    let dir = std::env::temp_dir().join(format!("qem-pt-composite-undo-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("partial.log");
+    let line = format!(
+        "{}
+",
+        "y".repeat(99)
+    );
+    std::fs::write(&path, line.repeat(4096)).unwrap();
+
+    let storage = FileStorage::open(&path).unwrap();
+    // Partial window: known covers only the first 2000 of 4096 lines.
+    let mut pt = PieceTable::new(storage, vec![100; 2000], false);
+    assert_eq!(pt.known_byte_len, 200_000);
+
+    // Composite replace inside the known region with ins != del:
+    // 60 bytes deleted, 5 bytes inserted. The line at the edit point is
+    // line 1000 (bytes 100_000..100_100); the replace spans 60 bytes
+    // starting at column 0 of that line, so it stays inside the line.
+    let line0 = 1000;
+    pt.replace_range_at(LineEnding::Lf, line0, 0, 60, "[qem]")
+        .unwrap();
+    let post_batch = pt.known_byte_len;
+    assert_ne!(
+        post_batch, 200_000,
+        "precondition: the batch changed the boundary"
+    );
+
+    assert!(pt.undo().unwrap());
+    assert_eq!(
+        pt.known_byte_len, 200_000,
+        "undo must restore the pre-batch boundary, got the post-batch one"
+    );
+    assert!(pt.redo().unwrap());
+    assert_eq!(pt.known_byte_len, post_batch);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

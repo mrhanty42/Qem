@@ -672,14 +672,31 @@ impl PieceTree {
             .copied()
             .map(|entry| entry == next)
             .unwrap_or(false);
+        // A pending boundary (written by `set_known_boundary` while a batch
+        // was active) is detected by the known history carrying exactly one
+        // extra entry; it must survive the truncate below and become the
+        // boundary of the newly committed root.
+        let pending = if self.known_history.len() == self.history.len() + 1 {
+            Some(self.known_history[self.history_index + 1])
+        } else {
+            None
+        };
         if is_same {
+            // A no-op batch: the pending boundary describes the same state,
+            // so fold it into the current entry and drop the pending slot.
+            if let Some(pending) = pending {
+                self.known_history[self.history_index] = pending;
+                self.known_history.truncate(self.history_index + 1);
+            }
             return;
         }
         self.history.truncate(self.history_index.saturating_add(1));
         self.known_history
             .truncate(self.history_index.saturating_add(1));
         self.history.push(next);
-        let fallback = self.known_history.last().copied().unwrap_or((0, false));
+        let fallback = pending
+            .or_else(|| self.known_history.last().copied())
+            .unwrap_or((0, false));
         self.known_history.push(fallback);
         self.history_index = self.history.len().saturating_sub(1);
     }
@@ -689,7 +706,18 @@ impl PieceTree {
     /// every history entry carries the boundary that belonged to the state
     /// it represents.
     pub(crate) fn set_known_boundary(&mut self, known: usize, full_index: bool) {
-        while self.known_history.len() < self.history.len() {
+        // Inside an edit batch the root push is deferred, so the boundary
+        // that belongs to the batch's final state must land in the
+        // *pending* slot (`history_index + 1`), not in the current one:
+        // the current entry describes the pre-batch state that undo must
+        // restore. `push_history_root` picks the pending value up when the
+        // deferred root is committed.
+        let target = if self.history_batch_depth > 0 {
+            self.history_index + 1
+        } else {
+            self.history_index
+        };
+        while self.known_history.len() <= target {
             let fallback = self
                 .known_history
                 .last()
@@ -697,7 +725,7 @@ impl PieceTree {
                 .unwrap_or((known, full_index));
             self.known_history.push(fallback);
         }
-        if let Some(entry) = self.known_history.get_mut(self.history_index) {
+        if let Some(entry) = self.known_history.get_mut(target) {
             *entry = (known, full_index);
         }
     }

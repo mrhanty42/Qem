@@ -951,12 +951,16 @@ impl Document {
         else {
             return TextSlice::new(String::new(), false);
         };
-        let end_offset = piece_table.advance_offset_by_text_units(start_offset, len_chars);
+        // Engine-aware cell walking and decoding: the naive UTF-8 variants
+        // corrupted every non-UTF-8 piece-table read (U+FFFD garbage).
+        let engine = self.encoding_engine();
+        let end_offset =
+            piece_table.advance_offset_by_text_units_with_engine(start_offset, len_chars, engine);
         let end = piece_table.position_for_byte_offset_from(start_offset, start, end_offset);
         let exact_end = self.read_position_is_exact(end);
         let bytes = piece_table.read_range(start_offset, end_offset);
         TextSlice::new(
-            String::from_utf8_lossy(&bytes).into_owned(),
+            decode_window_for_engine(engine, &bytes),
             exact_start && exact_end,
         )
     }

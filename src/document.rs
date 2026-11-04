@@ -1106,6 +1106,11 @@ pub(crate) struct PieceTable {
     original: FileStorage,
     add: Vec<u8>,
     pieces: PieceTree,
+    /// The document's byte-movement engine. Non-UTF-8 piece tables must
+    /// drive every column / text-unit / decode walk through this engine:
+    /// the `utf8_step`-based variants only stay correct for UTF-8 and
+    /// single-byte documents whose text units are bytes.
+    engine: &'static dyn encoding_engine::EncodingEngine,
     known_line_count: usize,
     exact_base_line_breaks: Option<usize>,
     exact_base_total_lines: Option<usize>,
@@ -1148,11 +1153,35 @@ impl PieceTable {
 
     fn new_with_encoding_state(
         original: FileStorage,
+        line_lengths: Vec<usize>,
+        full_index: bool,
+        exact_base_total_lines: Option<usize>,
+        encoding_origin: DocumentEncodingOrigin,
+        decoding_had_errors: bool,
+    ) -> Self {
+        Self::new_with_encoding_state_for_engine(
+            original,
+            line_lengths,
+            full_index,
+            exact_base_total_lines,
+            encoding_origin,
+            decoding_had_errors,
+            encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
+        )
+    }
+
+    /// Builds the piece table with the document's engine wired in, so
+    /// column / text-unit arithmetic and line decoding stay encoding-aware
+    /// for non-UTF-8 documents.
+    #[allow(clippy::too_many_arguments)] // mirrors the encoding-state constructor shape
+    fn new_with_encoding_state_for_engine(
+        original: FileStorage,
         mut line_lengths: Vec<usize>,
         full_index: bool,
         exact_base_total_lines: Option<usize>,
         encoding_origin: DocumentEncodingOrigin,
         decoding_had_errors: bool,
+        engine: &'static dyn encoding_engine::EncodingEngine,
     ) -> Self {
         let total_len = original.len();
         if line_lengths.is_empty() {
@@ -1173,6 +1202,7 @@ impl PieceTable {
             original,
             add: Vec::new(),
             pieces,
+            engine,
             known_line_count,
             exact_base_line_breaks: Some(exact_base_line_breaks),
             exact_base_total_lines: exact_base_total_lines
@@ -1193,11 +1223,30 @@ impl PieceTable {
         this
     }
 
+    /// Rebuilds a piece table from a persisted session. Recovered sessions
+    /// are only created for UTF-8 documents, so the UTF-8 engine is used.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn from_recovered_session(
         original: FileStorage,
         add: Vec<u8>,
         pieces: PieceTree,
         meta: SessionMeta,
+    ) -> Self {
+        Self::from_recovered_session_with_engine(
+            original,
+            add,
+            pieces,
+            meta,
+            encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
+        )
+    }
+
+    fn from_recovered_session_with_engine(
+        original: FileStorage,
+        add: Vec<u8>,
+        pieces: PieceTree,
+        meta: SessionMeta,
+        engine: &'static dyn encoding_engine::EncodingEngine,
     ) -> Self {
         let total_len = pieces.total_len();
         let known_line_count = pieces
@@ -1210,6 +1259,7 @@ impl PieceTable {
             original,
             add,
             pieces,
+            engine,
             known_line_count,
             exact_base_line_breaks: meta
                 .full_index
@@ -1233,15 +1283,8 @@ impl PieceTable {
         this
     }
 
-    /// Builds a piece table from pre-annotated pieces whose exact line-break
-    /// counts cover everything below `known_byte_len` (a document line
-    /// boundary). Used by the checkpoint-window edit path when the first
-    /// edit lands far beyond the in-memory line-offset prefix: the pieces
-    /// carry true per-piece break counts, so the piece tree can navigate to
-    /// the edit target without materializing a per-line length vector for
-    /// the whole span. `pieces` must end with one pristine tail piece
-    /// covering `[known_byte_len .. total_len)` with `line_breaks: 0`.
-    fn from_annotated_pieces(
+    #[allow(clippy::too_many_arguments)] // mirrors the encoding-state constructor shape
+    fn from_annotated_pieces_with_engine(
         original: FileStorage,
         pieces: Vec<Piece>,
         known_byte_len: usize,
@@ -1249,6 +1292,7 @@ impl PieceTable {
         exact_base_total_lines: Option<usize>,
         encoding_origin: DocumentEncodingOrigin,
         decoding_had_errors: bool,
+        engine: &'static dyn encoding_engine::EncodingEngine,
     ) -> Self {
         let total_len: usize = pieces.iter().map(|piece| piece.len).sum();
         let pieces = if total_len >= PIECE_TREE_DISK_MIN_BYTES {
@@ -1261,6 +1305,7 @@ impl PieceTable {
             original,
             add: Vec::new(),
             pieces,
+            engine,
             known_line_count,
             exact_base_line_breaks: Some(known_line_count),
             exact_base_total_lines,
@@ -1583,33 +1628,7 @@ impl PieceTable {
     }
 
     pub(crate) fn line_len_chars(&self, line0: usize) -> usize {
-        let (start, end) = self.line_range(line0);
-        if start >= end {
-            return 0;
-        }
-        let mut col = 0usize;
-        let mut done = false;
-        self.pieces
-            .visit_range(start, end, |piece, local_start, local_end| {
-                if done {
-                    return;
-                }
-                let seg_start = piece.start + local_start;
-                let seg_end = piece.start + local_end;
-                let src = self.source_bytes(piece.src);
-                let mut i = seg_start;
-                while i < seg_end {
-                    let b = src[i];
-                    if b == b'\n' || b == b'\r' {
-                        done = true;
-                        return;
-                    }
-                    let step = utf8_step(src, i, seg_end);
-                    col += 1;
-                    i += step;
-                }
-            });
-        col
+        self.line_len_chars_with_engine(line0, self.engine)
     }
 
     /// Encoding-aware variant of [`PieceTable::line_len_chars`].
@@ -1659,10 +1678,14 @@ impl PieceTable {
             return String::new();
         }
 
+        // Collect the requested columns as raw bytes and let the
+        // document's engine decode them. Decoding the bytes as UTF-8
+        // here corrupted every non-UTF-8 document: a windows-1251 or
+        // UTF-16 cell is not valid UTF-8, so the whole line came back
+        // as U+FFFD replacement characters.
         let mut out = Vec::with_capacity(max_cols.min(4096).saturating_mul(4));
         let mut cols = 0usize;
-        let _ = self
-            .pieces
+        self.pieces
             .visit_range_while(start, line_end, |piece, local_start, local_end| {
                 if cols >= max_cols {
                     return false;
@@ -1678,7 +1701,15 @@ impl PieceTable {
                     if b == b'\n' || b == b'\r' {
                         return false;
                     }
-                    let step = utf8_step(src, i, seg_end);
+                    let step = self.engine.step(src, i, seg_end);
+                    if step == 0 || i.saturating_add(step) > seg_end {
+                        // A piece boundary may split an encoded cell (for
+                        // example the first half of a UTF-16 unit). Do not
+                        // spin on a zero-step engine result; the next piece
+                        // owns the remaining bytes and its decode window
+                        // will handle the complete cell.
+                        return false;
+                    }
                     out.extend_from_slice(&src[i..i + step]);
                     cols += 1;
                     if cols >= max_cols {
@@ -1690,8 +1721,23 @@ impl PieceTable {
                 true
             });
 
-        String::from_utf8(out)
-            .unwrap_or_else(|err| String::from_utf8_lossy(&err.into_bytes()).into_owned())
+        self.decode_bytes(&out)
+    }
+
+    /// Decodes a byte buffer with the document's engine. UTF-8 documents
+    /// keep the strict UTF-8 path (lossy only on genuinely invalid
+    /// bytes); every other encoding goes through the encoding crate's
+    /// decoder so the text is interpreted in the document's own charset.
+    fn decode_bytes(&self, bytes: &[u8]) -> String {
+        if self.engine.encoding().is_utf8() {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        let (decoded, _had_errors) = self
+            .engine
+            .encoding()
+            .as_encoding()
+            .decode_with_bom_removal(bytes);
+        decoded.into_owned()
     }
 
     pub(crate) fn line_slices_exact(
@@ -2004,34 +2050,7 @@ impl PieceTable {
     }
 
     fn byte_offset_for_col(&self, line0: usize, col0: usize) -> usize {
-        let (start, end) = self.line_range(line0);
-        if col0 == 0 || start >= end {
-            return start;
-        }
-        let mut col = 0usize;
-        let mut offset = start;
-        self.pieces
-            .visit_range(start, end, |piece, local_start, local_end| {
-                if col >= col0 {
-                    return;
-                }
-                let seg_start = piece.start + local_start;
-                let seg_end = piece.start + local_end;
-                let src = self.source_bytes(piece.src);
-                let mut i = seg_start;
-                while i < seg_end && col < col0 {
-                    let b = src[i];
-                    if b == b'\n' || b == b'\r' {
-                        col = col0;
-                        return;
-                    }
-                    let step = utf8_step(src, i, seg_end);
-                    col += 1;
-                    i += step;
-                    offset += step;
-                }
-            });
-        offset.min(end)
+        self.byte_offset_for_col_with_engine(line0, col0, self.engine)
     }
 
     /// Encoding-aware variant of [`PieceTable::byte_offset_for_col`].
@@ -2156,33 +2175,64 @@ impl PieceTable {
         if text_units == 0 || start >= self.total_len {
             return start;
         }
-        let bytes = self.read_range(start, self.total_len);
-        let bytes_len = bytes.len();
+        // Walk the piece range in bounded chunks instead of materializing
+        // the whole tail: a replace near the start of a multi-gigabyte
+        // document used to allocate the entire remaining document here.
+        // Each chunk carries one extra byte of context so a CRLF split
+        // across the chunk boundary still collapses into one text unit.
+        const CHUNK_BYTES: usize = 64 * 1024;
         let mut local = 0usize;
         let mut remaining = text_units;
         let mut pending_cr = false;
-        while local < bytes_len && (remaining > 0 || pending_cr) {
-            let next_step = engine.step(&bytes, local, bytes_len);
-            if pending_cr {
-                pending_cr = false;
-                // CRLF collapses to a single text unit when the engine
-                // recognises both halves as 1-byte ASCII cells.
-                if next_step == 1 && bytes[local] == b'\n' {
-                    local += 1;
-                    continue;
-                }
+        loop {
+            let chunk_start = start.saturating_add(local);
+            if chunk_start >= self.total_len {
+                break;
             }
+            let chunk_end = self
+                .total_len
+                .min(chunk_start.saturating_add(CHUNK_BYTES + 1));
+            let bytes = self.read_range(chunk_start, chunk_end);
+            if bytes.is_empty() {
+                break;
+            }
+            let bytes_len = bytes.len();
+            let mut chunk_local = 0usize;
+            while chunk_local < bytes_len && (remaining > 0 || pending_cr) {
+                let next_step = engine.step(&bytes, chunk_local, bytes_len);
+                if pending_cr {
+                    pending_cr = false;
+                    // CRLF collapses to a single text unit when the engine
+                    // recognises both halves as 1-byte ASCII cells.
+                    if next_step == 1 && bytes[chunk_local] == b'\n' {
+                        chunk_local += 1;
+                        continue;
+                    }
+                }
+                if remaining == 0 {
+                    break;
+                }
+                if next_step == 0 {
+                    break;
+                }
+                if next_step == 1 && bytes[chunk_local] == b'\r' {
+                    pending_cr = true;
+                }
+                chunk_local += next_step;
+                remaining -= 1;
+            }
+            local += chunk_local;
             if remaining == 0 {
                 break;
             }
-            if next_step == 0 {
+            if chunk_local + 1 < bytes_len || chunk_end == self.total_len {
+                // The walker stopped mid-chunk (zero step) or reached the
+                // end of the document: no further progress is possible.
                 break;
             }
-            if next_step == 1 && bytes[local] == b'\r' {
-                pending_cr = true;
-            }
-            local += next_step;
-            remaining -= 1;
+            // The chunk was consumed to its edge; continue with the next
+            // chunk, re-walking the one context byte already visited.
+            local = local.saturating_sub(1);
         }
         start.saturating_add(local).min(self.total_len)
     }
@@ -2190,12 +2240,14 @@ impl PieceTable {
     /// Returns the byte range `[start, end)` covering line `line0` in the
     /// piece-tree backing.
     ///
-    /// Line offsets are tracked through raw `0x0A` / `0x0D` byte scans,
-    /// which are encoding-aware-correct for every supported encoding:
-    /// line-ending bytes never appear inside a multi-byte cell (UTF-8
-    /// continuation bytes are `0b10xx_xxxx`, UTF-16 keeps line endings
-    /// on even offsets, and CJK trail bytes never include `0x0A` or
-    /// `0x0D`).
+    /// Line offsets are tracked through raw `0x0A` / `0x0D` byte scans.
+    /// These scans are byte-exact for UTF-8 and Class A encodings, where
+    /// line-ending bytes can never appear inside a multi-byte cell. For
+    /// UTF-16 a raw `0x0A` / `0x0D` byte can be the low or high half of a
+    /// non-line-ending code unit (e.g. `U+0A0A`), and for CJK a trail byte
+    /// can coincide with them, so multi-byte-cell documents must not rely
+    /// on this byte model for line indexing - tracked as a 1.0 design
+    /// item in ROADMAP.
     pub(crate) fn line_byte_range(&self, line0: usize) -> (usize, usize) {
         self.line_range(line0)
     }

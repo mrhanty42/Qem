@@ -274,13 +274,14 @@ impl Document {
                 // Editing should stay responsive: stop the background indexer once
                 // we switch to a mutable buffer.
                 self.indexing.store(false, Ordering::Relaxed);
-                self.piece_table = Some(PieceTable::new_with_encoding_state(
+                self.piece_table = Some(PieceTable::new_with_encoding_state_for_engine(
                     storage,
                     line_lengths,
                     full_index,
                     self.raw_disk_index_total_lines(),
                     self.encoding_origin,
                     self.decoding_had_errors,
+                    encoding_engine::engine_for_encoding(self.encoding),
                 ));
                 Ok(())
             }
@@ -292,7 +293,7 @@ impl Document {
                 exact_total_lines,
             } => {
                 self.indexing.store(false, Ordering::Relaxed);
-                self.piece_table = Some(PieceTable::from_annotated_pieces(
+                self.piece_table = Some(PieceTable::from_annotated_pieces_with_engine(
                     storage,
                     pieces,
                     known_byte_len,
@@ -300,6 +301,7 @@ impl Document {
                     exact_total_lines,
                     self.encoding_origin,
                     self.decoding_had_errors,
+                    encoding_engine::engine_for_encoding(self.encoding),
                 ));
                 Ok(())
             }

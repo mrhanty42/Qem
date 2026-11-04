@@ -803,9 +803,10 @@ impl Document {
     ///
     /// At column 0 the path collapses onto line-merge: the previous
     /// line's terminating LF / CR / CRLF is removed verbatim. Line
-    /// endings are 1-byte ASCII in every supported encoding, so the
-    /// existing `PieceTable::backspace_at` line-merge path is reused
-    /// as-is in that case.
+    /// endings are 1-byte ASCII for UTF-8 and Class A documents (the
+    /// supported scope of this path), so the existing
+    /// `PieceTable::backspace_at` line-merge path is reused as-is in
+    /// that case.
     ///
     /// Document content is never transcoded into UTF-8.
     fn try_backspace_at_encoded(

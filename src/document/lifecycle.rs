@@ -886,8 +886,16 @@ impl Document {
                         decoding_had_errors: meta.decoding_had_errors,
                         preserve_save_error_cache: Cell::new(None),
                         rope: None,
-                        piece_table: Some(PieceTable::from_recovered_session(
-                            storage, add, pieces, meta,
+                        // Persistent sessions are only created for UTF-8
+                        // documents, so the recovered piece table uses the
+                        // UTF-8 engine, matching the document's own
+                        // `encoding` above.
+                        piece_table: Some(PieceTable::from_recovered_session_with_engine(
+                            storage,
+                            add,
+                            pieces,
+                            meta,
+                            encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
                         )),
                         rope_history: RopeHistory::new(),
                         dirty: true,
