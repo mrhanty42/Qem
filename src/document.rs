@@ -944,7 +944,13 @@ fn align_piece_split_offset_backward(
     if !encoding.is_utf8() {
         if matches!(encoding.name(), "UTF-16LE" | "UTF-16BE") {
             let mut aligned = offset.min(bytes.len());
-            if (aligned ^ source_start) & 1 == 1 && aligned > 0 {
+            // Snap only a split that creates a right piece: a slice at the
+            // very end of an odd-length piece (truncated file tail) has no
+            // boundary to align, and snapping it backward would carve a
+            // one-byte, mid-cell right piece - the exact invariant break
+            // this grid exists to prevent. Mirrors the forward twin's
+            // `.min(bytes.len())` clamp.
+            if (aligned ^ source_start) & 1 == 1 && aligned > 0 && aligned < bytes.len() {
                 aligned -= 1;
             }
             return aligned;

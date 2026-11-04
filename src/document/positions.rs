@@ -480,9 +480,10 @@ impl Document {
 
         // Mirror `edit_buffer_plan_for_line`: non-UTF-8 storage-backed
         // documents promote to the piece tree on the first edit regardless
-        // of size (the rope-decode bridge is not their fallback), so the
-        // capability surface must advertise the same plan the edit path
-        // will actually take.
+        // of size (the rope-decode bridge is only their residual fallback
+        // when line-length information is unavailable), so the capability
+        // surface must advertise the same plan the edit path will
+        // actually take.
         let use_piece_table = if self.encoding.is_utf8() {
             self.storage.is_some() && self.file_len >= PIECE_TABLE_MIN_BYTES
         } else {

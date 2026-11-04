@@ -1704,13 +1704,20 @@ fn scan_class_b_regex_candidates(
     let requires_even_alignment = class_b_requires_even_alignment(doc_encoding);
 
     // Round chunk start up to an even byte for UTF-16 so each window
-    // starts on a UTF-16 code-unit cell. For CJK
+    // starts on a UTF-16 code-unit cell (a valid match can never begin
+    // on an odd byte, so rounding up cannot skip one). Callers normally
+    // provide an even start through `search_byte_offset_for_position`;
+    // this guards a truncated odd-length file tail. For CJK
     // multibyte the start can be any byte: callers ensure the initial
     // `start_offset` lands on a character boundary by going through
     // `search_byte_offset_for_position`, and subsequent chunks slide
     // forward by `chunk_size - overlap` which preserves whatever
     // alignment the encoding requires.
-    let mut chunk_start = start_offset;
+    let mut chunk_start = if requires_even_alignment {
+        start_offset.saturating_add(start_offset & 1)
+    } else {
+        start_offset
+    };
     let mut first_chunk = true;
     while chunk_start < end_offset {
         let chunk_end = chunk_start
@@ -1763,47 +1770,39 @@ fn scan_class_b_regex_candidates(
             // continuation chunks; they were either already returned or
             // will be returned by an earlier window.
             if first_chunk || m.end() > overlap_already_matched_decoded {
+                // Map the decoded match back to source bytes. A mapping
+                // failure (not currently reachable: `find` offsets are
+                // always char boundaries inside `decoded`) must not abort
+                // the whole scan - in `keep_last` mode that would discard
+                // a match already accumulated on an earlier window - so
+                // fall through to the window slide and keep scanning.
                 let prefix_source_len =
-                    class_b_source_bytes_for_decoded_prefix(doc_encoding, &decoded, m.start())?;
-                let match_source_len = class_b_source_bytes_for_decoded_prefix(
-                    doc_encoding,
-                    &decoded[m.start()..],
-                    m.end() - m.start(),
-                )?;
-                let absolute_match_start = chunk_start.saturating_add(prefix_source_len);
-                let absolute_match_end = absolute_match_start.saturating_add(match_source_len);
-
-                // 2-byte alignment post-filter for UTF-16 only.
-                // UTF-16 character boundaries are always at even byte
-                // offsets, so any candidate landing on an odd offset is
-                // necessarily straddling a U+FFFD injected by the
-                // decoder for ill-formed input and must be rejected.
-                // CJK multibyte has no such global alignment
-                // grid so the post-filter is skipped.
-                let alignment_ok = if requires_even_alignment {
-                    absolute_match_start & 1 == 0 && absolute_match_end & 1 == 0
-                } else {
-                    true
-                };
-                if alignment_ok && prefix_source_len + match_source_len <= window.len() {
-                    let match_bytes: Vec<u8> =
-                        window[prefix_source_len..(prefix_source_len + match_source_len)].to_vec();
-                    let candidate = (absolute_match_start, absolute_match_end, match_bytes);
-                    if keep_last {
-                        last_match = Some(candidate);
-                    } else {
+                    class_b_source_bytes_for_decoded_prefix(doc_encoding, &decoded, m.start());
+                let match_source_len = prefix_source_len.and_then(|_| {
+                    class_b_source_bytes_for_decoded_prefix(
+                        doc_encoding,
+                        &decoded[m.start()..],
+                        m.end() - m.start(),
+                    )
+                });
+                if let (Some(prefix_source_len), Some(match_source_len)) =
+                    (prefix_source_len, match_source_len)
+                {
+                    // Forward mode: a returned candidate is the answer.
+                    // Reverse mode (`keep_last = true`) records it and
+                    // keeps scanning until the range is exhausted.
+                    if let Some(candidate) = map_and_keep_class_b_candidate(
+                        requires_even_alignment,
+                        keep_last,
+                        &mut last_match,
+                        chunk_start,
+                        prefix_source_len,
+                        match_source_len,
+                        &window,
+                    ) {
                         return Some(candidate);
                     }
                 }
-                // Misaligned (UTF-16) or out-of-window match — fall
-                // through to continue scanning subsequent chunks.
-                // Since `find` returns only the first match in the
-                // window, a misaligned hit here means the earliest
-                // valid match (if any) lies past it; we step the
-                // window forward via the overlap-slide and try again.
-                // This is rare in practice (only on ill-formed
-                // surrogate-pair input or U+FFFD-substituted CJK
-                // sequences).
             }
         }
 
@@ -1830,6 +1829,59 @@ fn scan_class_b_regex_candidates(
     }
 
     last_match
+}
+
+/// Maps a decoded-window regex match to absolute source-byte offsets and
+/// either returns the candidate (forward, `keep_last = false`) or records
+/// it as the running last match (reverse, `keep_last = true`).
+///
+/// Shared tail of [`scan_class_b_regex_candidates`]: the alignment
+/// post-filter and the `keep_last` bookkeeping live here so the window
+/// loop itself stays linear even when a candidate must be skipped.
+#[allow(clippy::too_many_arguments)]
+fn map_and_keep_class_b_candidate(
+    requires_even_alignment: bool,
+    keep_last: bool,
+    last_match: &mut Option<(usize, usize, Vec<u8>)>,
+    chunk_start: usize,
+    prefix_source_len: usize,
+    match_source_len: usize,
+    window: &[u8],
+) -> Option<(usize, usize, Vec<u8>)> {
+    let absolute_match_start = chunk_start.saturating_add(prefix_source_len);
+    let absolute_match_end = absolute_match_start.saturating_add(match_source_len);
+
+    // 2-byte alignment post-filter for UTF-16 only.
+    // UTF-16 character boundaries are always at even byte
+    // offsets, so any candidate landing on an odd offset is
+    // necessarily straddling a U+FFFD injected by the
+    // decoder for ill-formed input and must be rejected.
+    // CJK multibyte has no such global alignment
+    // grid so the post-filter is skipped.
+    let alignment_ok = if requires_even_alignment {
+        absolute_match_start & 1 == 0 && absolute_match_end & 1 == 0
+    } else {
+        true
+    };
+    if !alignment_ok || prefix_source_len + match_source_len > window.len() {
+        // Misaligned (UTF-16) or out-of-window match — tell the caller to
+        // continue scanning subsequent chunks. Since `find` returns only
+        // the first match in the window, a misaligned hit here means the
+        // earliest valid match (if any) lies past it; the caller steps
+        // the window forward via the overlap-slide and tries again.
+        // This is rare in practice (only on ill-formed surrogate-pair
+        // input or U+FFFD-substituted CJK sequences).
+        return None;
+    }
+    let match_bytes: Vec<u8> =
+        window[prefix_source_len..(prefix_source_len + match_source_len)].to_vec();
+    let candidate = (absolute_match_start, absolute_match_end, match_bytes);
+    if keep_last {
+        *last_match = Some(candidate);
+        None
+    } else {
+        Some(candidate)
+    }
 }
 
 /// Returns the largest decoded-byte prefix length whose corresponding

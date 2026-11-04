@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- Class B regex window hardening: the chunked decode scan now actually
+  rounds the window start up to the UTF-16 cell grid as its contract
+  documents (guards a truncated odd-length file tail), and a
+  decoded-to-source mapping failure can no longer abort the scan and
+  discard a match already accumulated on an earlier window by the
+  reverse keep-last path. Piece-split backward alignment no longer snaps
+  a slice at the very end of an odd-length piece, which would have
+  carved a one-byte mid-cell right piece. None of these paths is
+  reachable through the public API today; the hardening pins the
+  documented contracts instead of relying on that.
 - Bounded literal search on non-UTF-8 piece tables is engine-aware.
   `find_next_in_range` / `find_prev_in_range` / `find_all_in_range` (and
   the `_between` variants) used to walk the range end and its fallback
