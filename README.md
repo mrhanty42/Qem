@@ -43,7 +43,7 @@ qem = { version = "0.8.1", default-features = false }
 ### Features
 
 - `editor` — `DocumentSession`, `EditorTab`, cursor state, and async open/save helpers
-- `tmp-auto` — chooses a writable scratch location automatically
+- `tmp-auto` — explicit marker for the default scratch policy: with none of the other `tmp-*` features (and no `QEM_TMP_POLICY` override) qem already chooses a writable scratch location automatically; the flag itself adds no code path
 - `tmp-source-dir` — keeps scratch files beside the source file
 - `tmp-system-dir` — uses the OS temporary directory
 - `tmp-exe-dir` — uses the executable directory

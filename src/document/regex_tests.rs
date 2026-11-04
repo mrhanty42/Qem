@@ -1388,3 +1388,142 @@ fn find_prev_regex_overlap_semantics_differ_between_span_paths() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Reverse regex on Class B + engine-aware match units
+//
+// Regression pins for the audit fixes:
+//
+//  * `find_prev_regex*` on UTF-16 / CJK multibyte documents must route
+//    through the chunked decode path like the forward direction. The
+//    byte-engine regex over raw UTF-16LE bytes never sees the ASCII run
+//    `TARGET` (the `0x00` filler bytes sit between every character), so
+//    the old routing silently answered `None`.
+//  * `finalize_byte_match` must count match units through the document's
+//    engine. The old `std::str::from_utf8(..).unwrap_or("")` walk answered
+//    `0` units for a windows-1251 match whose bytes are not valid UTF-8,
+//    and grouped a cp1251 "collision pair" (two bytes that happen to parse
+//    as one UTF-8 sequence) into a single unit.
+// ---------------------------------------------------------------------------
+
+fn wait_until_indexed(doc: &Document) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while doc.is_indexing() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn find_prev_regex_finds_ascii_target_in_utf16le_document() {
+    let dir = fresh_test_dir("utf16le-regex-prev");
+    let path = dir.join("source.txt");
+    let text = "first\nsecond TARGET line\nthird\n";
+    let mut encoded: Vec<u8> = Vec::with_capacity(text.len() * 2);
+    for unit in text.encode_utf16() {
+        encoded.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(&path, &encoded).unwrap();
+
+    let doc = Document::open_with_encoding(&path, DocumentEncoding::utf16le()).unwrap();
+    wait_until_indexed(&doc);
+
+    let m = doc
+        .find_prev_regex("TARGET", TextPosition::new(usize::MAX, usize::MAX))
+        .unwrap()
+        .expect("expected previous TARGET match in UTF-16LE document");
+    assert_eq!(m.start(), TextPosition::new(1, 7));
+    assert_eq!(m.end(), TextPosition::new(1, 13));
+    assert_eq!(m.len_chars(), 6);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn find_prev_regex_finds_cjk_target_in_shift_jis_document() {
+    let dir = fresh_test_dir("shift-jis-regex-prev");
+    let path = dir.join("source.txt");
+    // Non-ASCII needle: the UTF-8 encoding of the needle never appears in
+    // Shift_JIS storage bytes, so the old raw-byte reverse regex answered
+    // `None` even though the decoded document contains the phrase.
+    let source_text = "first\nsecond \u{65E5}\u{672C}\u{8A9E} line\nthird\n";
+    let (encoded, used, had_errors) = SHIFT_JIS.encode(source_text);
+    assert_eq!(used, SHIFT_JIS);
+    assert!(!had_errors, "shift_jis fixture must round-trip cleanly");
+    fs::write(&path, encoded.as_ref()).unwrap();
+
+    let doc =
+        Document::open_with_encoding(&path, DocumentEncoding::from_label("shift_jis").unwrap())
+            .unwrap();
+    wait_until_indexed(&doc);
+
+    let m = doc
+        .find_prev_regex(
+            "\u{65E5}\u{672C}\u{8A9E}",
+            TextPosition::new(usize::MAX, usize::MAX),
+        )
+        .unwrap()
+        .expect("expected previous CJK match in Shift_JIS document");
+    assert_eq!(m.start(), TextPosition::new(1, 7));
+    assert_eq!(m.end(), TextPosition::new(1, 10));
+    assert_eq!(m.len_chars(), 3);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn find_next_regex_match_units_are_engine_aware_on_class_a() {
+    let dir = fresh_test_dir("cp1251-regex-units");
+    let path = dir.join("source.txt");
+    // Two adjacent windows-1251 "Р" bytes: as UTF-8 this is an invalid
+    // sequence (a 0xD0 lead followed by another lead byte), so the old
+    // `from_utf8(..).unwrap_or("")` unit walk answered 0 units.
+    let bytes = vec![0xD0u8, 0xD0, b'\n', b'a', b'b', b'\n'];
+    fs::write(&path, &bytes).unwrap();
+
+    let doc =
+        Document::open_with_encoding(&path, DocumentEncoding::from_label("windows-1251").unwrap())
+            .unwrap();
+
+    let query = RegexSearchQuery::new(r"(?-u:..)").expect("two-byte pattern compiles");
+    let m = doc
+        .find_next_regex_query(&query, TextPosition::new(0, 0))
+        .expect("expected a two-byte match on line 0");
+    assert_eq!(m.start(), TextPosition::new(0, 0));
+    assert_eq!(m.end(), TextPosition::new(0, 2));
+    assert_eq!(
+        m.len_chars(),
+        2,
+        "two cp1251 bytes are two text units, not zero"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn find_next_regex_match_units_count_collision_pairs_per_byte() {
+    let dir = fresh_test_dir("cp1251-regex-collision-units");
+    let path = dir.join("source.txt");
+    // windows-1251 "collision pair": 0xD0 0x90 happens to parse as one
+    // valid UTF-8 sequence, but in a Class A document every byte is its
+    // own text unit, so the match spans exactly two units.
+    let bytes = vec![0xD0u8, 0x90, b'\n', b'a', b'b', b'\n'];
+    fs::write(&path, &bytes).unwrap();
+
+    let doc =
+        Document::open_with_encoding(&path, DocumentEncoding::from_label("windows-1251").unwrap())
+            .unwrap();
+
+    let query = RegexSearchQuery::new(r"(?-u:..)").expect("two-byte pattern compiles");
+    let m = doc
+        .find_next_regex_query(&query, TextPosition::new(0, 0))
+        .expect("expected a two-byte match on line 0");
+    assert_eq!(m.start(), TextPosition::new(0, 0));
+    assert_eq!(m.end(), TextPosition::new(0, 2));
+    assert_eq!(
+        m.len_chars(),
+        2,
+        "a collision pair is two Class A text units, not one"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -43,7 +43,7 @@ fn next_piece_table_scan_line_range(
     })
 }
 
-fn count_text_units_in_bytes(
+pub(super) fn count_text_units_in_bytes(
     engine: &dyn super::encoding_engine::EncodingEngine,
     bytes: &[u8],
 ) -> usize {
@@ -478,7 +478,16 @@ impl Document {
             };
         }
 
-        let use_piece_table = self.storage.is_some() && self.file_len >= PIECE_TABLE_MIN_BYTES;
+        // Mirror `edit_buffer_plan_for_line`: non-UTF-8 storage-backed
+        // documents promote to the piece tree on the first edit regardless
+        // of size (the rope-decode bridge is not their fallback), so the
+        // capability surface must advertise the same plan the edit path
+        // will actually take.
+        let use_piece_table = if self.encoding.is_utf8() {
+            self.storage.is_some() && self.file_len >= PIECE_TABLE_MIN_BYTES
+        } else {
+            self.storage.is_some()
+        };
         if use_piece_table
             && self
                 .piece_table_line_lengths_for_edit(position.line0())

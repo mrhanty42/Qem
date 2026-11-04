@@ -44,7 +44,7 @@ use regex_automata::{Input, MatchKind};
 
 use super::alignment::AlignDirection;
 use super::encoding_engine::SingleByteEngine;
-use super::search::{advance_position_by_bytes, search_text_units};
+use super::search::advance_position_by_bytes;
 use super::{Document, SearchMatch, TextPosition, TextRange};
 use crate::DocumentEncoding;
 
@@ -836,11 +836,10 @@ fn find_next_regex_in_bytes(
     // UTF-8 and Class A keep the existing byte-engine fast path below.
     let encoding = doc.encoding();
     if !encoding.is_utf8() && !SingleByteEngine::supports(encoding) {
-        return find_next_regex_in_class_b_chunked(doc, query, start_offset, end_offset).and_then(
-            |(match_start, match_end, match_bytes)| {
+        return scan_class_b_regex_candidates(doc, query, start_offset, end_offset, false)
+            .and_then(|(match_start, match_end, match_bytes)| {
                 build_class_b_search_match(doc, match_start, match_end, &match_bytes, end)
-            },
-        );
+            });
     }
 
     // Mmap backing: zero-copy. The regex engine walks the mmap slice
@@ -927,7 +926,12 @@ fn finalize_byte_match(
 ) -> Option<SearchMatch> {
     let engine = doc.encoding_engine();
     let start_pos = advance_position_by_bytes(from, prefix_bytes, engine);
-    let match_units = search_text_units(std::str::from_utf8(match_bytes).unwrap_or(""));
+    // Count match units through the document's engine, matching the
+    // `advance_offset_by_text_units` semantics that `SearchMatch::range`
+    // callers rely on when they widen a range by `len_chars`. The previous
+    // UTF-8-only walk answered `0` for Class A matches (cp1251 high bytes
+    // are not valid UTF-8) and grouped collision pairs as one unit.
+    let match_units = super::positions::count_text_units_in_bytes(engine, match_bytes);
     let end_pos = advance_position_by_bytes(start_pos, match_bytes, engine);
     if let Some(end_bound) = end {
         if end_pos > end_bound {
@@ -1004,6 +1008,27 @@ fn find_prev_regex_via_reverse_dfa(
     let end_off = doc.search_byte_offset_for_position(bound_end);
     if start_off >= end_off {
         return None;
+    }
+    // Class B routing, mirroring `find_next_regex_in_bytes`: the reverse
+    // DFA and the small-span byte fallback both run the byte-engine regex
+    // over raw storage bytes, which on UTF-16 / CJK multibyte documents
+    // silently misses Unicode-class matches, mis-anchors on `0x00` filler
+    // bytes, and fakes `0x0A` / `0x0D` anchors on CJK trail bytes. Decode
+    // chunked windows through the document's encoding instead and keep the
+    // last non-overlapping match, like the small-span byte fallback does.
+    let encoding = doc.encoding();
+    if !encoding.is_utf8() && !SingleByteEngine::supports(encoding) {
+        return scan_class_b_regex_candidates(doc, query, start_off, end_off, true).and_then(
+            |(match_start, match_end, match_bytes)| {
+                build_class_b_search_match(
+                    doc,
+                    match_start,
+                    match_end,
+                    &match_bytes,
+                    Some(bound_end),
+                )
+            },
+        );
     }
     let span = end_off.saturating_sub(start_off);
     if span <= SMALL_REVERSE_REGEX_SCAN_BYTES {
@@ -1650,17 +1675,29 @@ fn class_b_requires_even_alignment(encoding: DocumentEncoding) -> bool {
 /// previous-chunk overlap, mirroring the byte-engine pattern used by
 /// `find_next_regex_in_bytes` for piece-tree backings.
 ///
+/// `keep_last` selects the match the scan keeps: `false` returns the
+/// first valid match (forward search), `true` scans the whole range and
+/// returns the last non-overlapping match (reverse search). Reverse
+/// search uses this decode path instead of the reverse DFA for the same
+/// reason forward does — the reverse DFA is a byte-engine artifact and
+/// cannot run over raw UTF-16 / CJK multibyte bytes — and it shares the
+/// last-non-overlapping semantics of the small-span byte fallback rather
+/// than the rightmost-match semantics of the reverse DFA (the documented
+/// 1.0 overlap inconsistency only spans the byte-engine backends).
+///
 /// Returns `Some((absolute_start, absolute_end, match_bytes))` for the
-/// first accepted match, or `None` if none of the chunks contained one.
-fn find_next_regex_in_class_b_chunked(
+/// accepted match, or `None` if none of the chunks contained one.
+fn scan_class_b_regex_candidates(
     doc: &Document,
     query: &RegexSearchQuery,
     start_offset: usize,
     end_offset: usize,
+    keep_last: bool,
 ) -> Option<(usize, usize, Vec<u8>)> {
     if start_offset >= end_offset {
         return None;
     }
+    let mut last_match: Option<(usize, usize, Vec<u8>)> = None;
 
     let doc_encoding = doc.encoding();
     let encoding = doc_encoding.as_encoding();
@@ -1751,7 +1788,12 @@ fn find_next_regex_in_class_b_chunked(
                 if alignment_ok && prefix_source_len + match_source_len <= window.len() {
                     let match_bytes: Vec<u8> =
                         window[prefix_source_len..(prefix_source_len + match_source_len)].to_vec();
-                    return Some((absolute_match_start, absolute_match_end, match_bytes));
+                    let candidate = (absolute_match_start, absolute_match_end, match_bytes);
+                    if keep_last {
+                        last_match = Some(candidate);
+                    } else {
+                        return Some(candidate);
+                    }
                 }
                 // Misaligned (UTF-16) or out-of-window match — fall
                 // through to continue scanning subsequent chunks.
@@ -1787,7 +1829,7 @@ fn find_next_regex_in_class_b_chunked(
         first_chunk = false;
     }
 
-    None
+    last_match
 }
 
 /// Returns the largest decoded-byte prefix length whose corresponding

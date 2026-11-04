@@ -910,11 +910,69 @@ fn scan_cursor_position_bytes(
                 state.col0 = state.col0.saturating_add(1);
                 // Engine-aware cell stepping: for Class A every byte is one
                 // text unit, so columns are byte-exact; for UTF-8 the engine
-                // matches `utf8_step` behavior.
-                i += engine.step(bytes, i, bytes.len());
+                // matches `utf8_step` behavior. The `.max(1)` guard keeps the
+                // scan moving when an engine reports a zero-byte step at a
+                // truncated tail cell (e.g. an odd-length UTF-16 segment) —
+                // mirroring `scan_position_bytes`, which has the same guard.
+                let step = engine.step(bytes, i, bytes.len()).max(1);
+                i = i.saturating_add(step).min(bytes.len());
             }
         }
     }
+}
+
+/// Aligns a piece-split offset backward to a character boundary of the
+/// document's encoding.
+///
+/// UTF-8 keeps the whole-slice UTF-8 boundary walk. Non-UTF-8 backings
+/// must not run that walk at all: offsets reaching a piece split are
+/// already cell-aligned by the encoded edit paths, and a UTF-8 *validity*
+/// gate is not an encoding gate — a pure-ASCII UTF-16LE stream (or the
+/// `\u{C241}\u{C280}` cell pair `41 C2 80 C2`) is also valid UTF-8, and
+/// re-aligning by `is_char_boundary` would pull the split into the middle
+/// of a code unit. UTF-16 keeps the 2-byte cell grid anchored at the
+/// piece start (source offsets and document offsets share parity because
+/// every piece is cell-aligned); Class A and CJK multibyte keep the
+/// offset verbatim, exactly like the previous `from_utf8` rejection path.
+fn align_piece_split_offset_backward(
+    bytes: &[u8],
+    source_start: usize,
+    offset: usize,
+    engine: &dyn encoding_engine::EncodingEngine,
+) -> usize {
+    let encoding = engine.encoding();
+    if !encoding.is_utf8() {
+        if matches!(encoding.name(), "UTF-16LE" | "UTF-16BE") {
+            let mut aligned = offset.min(bytes.len());
+            if (aligned ^ source_start) & 1 == 1 && aligned > 0 {
+                aligned -= 1;
+            }
+            return aligned;
+        }
+        return offset.min(bytes.len());
+    }
+    align_utf8_boundary_backward(bytes, offset)
+}
+
+/// Forward twin of [`align_piece_split_offset_backward`].
+fn align_piece_split_offset_forward(
+    bytes: &[u8],
+    source_start: usize,
+    offset: usize,
+    engine: &dyn encoding_engine::EncodingEngine,
+) -> usize {
+    let encoding = engine.encoding();
+    if !encoding.is_utf8() {
+        if matches!(encoding.name(), "UTF-16LE" | "UTF-16BE") {
+            let mut aligned = offset.min(bytes.len());
+            if (aligned ^ source_start) & 1 == 1 {
+                aligned = aligned.saturating_add(1).min(bytes.len());
+            }
+            return aligned;
+        }
+        return offset.min(bytes.len());
+    }
+    align_utf8_boundary_forward(bytes, offset)
 }
 
 fn align_utf8_boundary_backward(bytes: &[u8], offset: usize) -> usize {
@@ -1071,6 +1129,16 @@ pub struct Document {
     encoding_engine: &'static dyn encoding_engine::EncodingEngine,
     decoding_had_errors: bool,
     preserve_save_error_cache: Cell<Option<Option<DocumentEncodingErrorKind>>>,
+    /// Cached save length for rope-backed non-UTF-8 documents.
+    ///
+    /// `file_len` for that combination has no O(chunks) formula: the only
+    /// exact answer is a full render + re-encode of the rope, which made
+    /// every status poll / edit-capability check on a promoted document
+    /// allocate the whole encoded copy. The cache holds the last computed
+    /// encoded length and is cleared by the same invalidation discipline
+    /// as `preserve_save_error_cache` (edits, encoding contract changes,
+    /// backing swaps).
+    rope_file_len_cache: Cell<Option<usize>>,
 
     // Mutable text storage. When present, it becomes the source of truth for rendering/editing.
     rope: Option<EditBuffer>,
@@ -2267,8 +2335,9 @@ impl PieceTable {
         };
         let original = &self.original;
         let add = &self.add;
+        let engine = self.engine();
         let mut split_piece = |piece: Piece, left_len: usize| {
-            split_piece_with_sources(original, add, piece, left_len)
+            split_piece_with_sources(original, add, piece, left_len, engine)
         };
         self.pieces
             .insert(pos.min(self.total_len), new_piece, &mut split_piece);
@@ -2297,8 +2366,9 @@ impl PieceTable {
             .saturating_sub(start.min(self.known_byte_len));
         let original = &self.original;
         let add = &self.add;
+        let engine = self.engine();
         let mut trim_piece = |piece: Piece, local_start: usize, local_end: usize| {
-            trim_piece_with_sources(original, add, piece, local_start, local_end)
+            trim_piece_with_sources(original, add, piece, local_start, local_end, engine)
         };
         self.pieces.delete_range(start, len, &mut trim_piece);
         self.total_len = self.pieces.total_len();
@@ -2734,11 +2804,17 @@ fn split_piece_with_sources(
     add: &[u8],
     piece: Piece,
     left_len: usize,
+    engine: &dyn encoding_engine::EncodingEngine,
 ) -> (Option<Piece>, Option<Piece>) {
     let bytes = piece_source_bytes(original, add, piece.src);
     let start = piece.start.min(bytes.len());
     let end = piece.start.saturating_add(piece.len).min(bytes.len());
-    let left_len = align_utf8_boundary_backward(&bytes[start..end], left_len.min(piece.len));
+    let left_len = align_piece_split_offset_backward(
+        &bytes[start..end],
+        piece.start,
+        left_len.min(piece.len),
+        engine,
+    );
     let right_len = piece.len.saturating_sub(left_len);
     let left = (left_len > 0).then_some(Piece {
         src: piece.src,
@@ -2763,13 +2839,24 @@ fn trim_piece_with_sources(
     piece: Piece,
     local_start: usize,
     local_end: usize,
+    engine: &dyn encoding_engine::EncodingEngine,
 ) -> (Option<Piece>, Option<Piece>) {
     let bytes = piece_source_bytes(original, add, piece.src);
     let start = piece.start.min(bytes.len());
     let end = piece.start.saturating_add(piece.len).min(bytes.len());
     let piece_bytes = &bytes[start..end];
-    let left_len = align_utf8_boundary_backward(piece_bytes, local_start.min(piece.len));
-    let right_start = align_utf8_boundary_forward(piece_bytes, local_end.min(piece.len));
+    let left_len = align_piece_split_offset_backward(
+        piece_bytes,
+        piece.start,
+        local_start.min(piece.len),
+        engine,
+    );
+    let right_start = align_piece_split_offset_forward(
+        piece_bytes,
+        piece.start,
+        local_end.min(piece.len),
+        engine,
+    );
     let right_len = piece.len.saturating_sub(right_start);
     let left = (left_len > 0).then_some(Piece {
         src: piece.src,

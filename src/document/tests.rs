@@ -463,6 +463,7 @@ fn precise_piece_table_line_lengths_require_complete_index() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -495,6 +496,7 @@ fn precise_piece_table_line_lengths_reject_large_line_arrays() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -531,6 +533,7 @@ fn piece_table_line_lengths_for_edit_builds_partial_prefix() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -670,6 +673,7 @@ fn piece_table_line_lengths_for_edit_supports_large_exact_prefix() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -718,6 +722,7 @@ fn piece_table_line_lengths_for_edit_full_index_beyond_legacy_cap() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -762,6 +767,7 @@ fn edit_beyond_window_reports_bounded_edit_window_error() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -809,6 +815,7 @@ fn insert_uses_partial_piece_table_before_full_index_finishes() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -858,6 +865,7 @@ fn insert_fully_indexes_medium_unindexed_piece_table_documents() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -901,6 +909,7 @@ fn partial_piece_table_can_report_exact_total_lines_without_precise_line_lengths
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new_with_encoding_state(
@@ -1293,6 +1302,7 @@ fn document_compact_piece_table_preserves_recovery_and_clears_recommendation() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(piece_table),
@@ -1463,6 +1473,7 @@ fn prepare_save_with_forced_compaction_policy_compacts_before_snapshotting() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(piece_table),
@@ -2113,6 +2124,7 @@ fn incomplete_mmap_singular_line_read_uses_exact_scan_for_existing_line() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -2147,6 +2159,7 @@ fn incomplete_mmap_single_row_batch_reads_match_singular_line_lookup() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -2222,6 +2235,7 @@ fn checkpoint_viewport_fixture(path: &Path, ending: &str) -> Document {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -2350,6 +2364,7 @@ fn partial_piece_table_line_reads_follow_current_text_after_prefix_edit() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5, 4], false)),
@@ -2408,6 +2423,7 @@ fn singular_partial_piece_table_line_slice_does_not_fall_back_to_stale_mmap() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -2456,6 +2472,7 @@ fn partial_piece_table_find_prev_does_not_return_match_after_unresolved_before_p
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -2505,6 +2522,7 @@ fn partial_piece_table_find_next_does_not_start_before_unresolved_from_position(
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -2553,6 +2571,7 @@ fn partial_piece_table_find_next_and_iterators_do_not_relabel_match_before_unres
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -2607,6 +2626,7 @@ fn partial_piece_table_find_next_can_start_on_scannable_incomplete_line() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -2673,6 +2693,7 @@ fn partial_piece_table_line_slice_stays_exact_on_scannable_incomplete_prefix() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -2725,6 +2746,7 @@ fn partial_piece_table_find_prev_can_end_on_scannable_incomplete_line() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -2775,6 +2797,7 @@ fn partial_piece_table_empty_typed_reads_stay_exact_on_scannable_incomplete_line
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -2823,6 +2846,7 @@ fn selection_read_stays_exact_when_partial_piece_table_head_is_scannable_incompl
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -2870,6 +2894,7 @@ fn typed_range_read_matches_selection_exactness_on_scannable_incomplete_partial_
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -2919,6 +2944,7 @@ fn partial_piece_table_bounded_search_does_not_escape_unresolved_end_position() 
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -2973,6 +2999,7 @@ fn partial_piece_table_bounded_search_does_not_expand_unresolved_end_line_to_eof
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -3027,6 +3054,7 @@ fn partial_piece_table_find_next_in_range_does_not_rewind_unresolved_start() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -3073,6 +3101,7 @@ fn partial_piece_table_line_slices_do_not_invent_trailing_empty_line_without_new
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -3122,6 +3151,7 @@ fn partial_piece_table_position_helpers_do_not_fall_back_to_stale_mmap_beyond_sc
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -3366,6 +3396,7 @@ fn line_slices_near_tail_read_from_file_end_before_full_index() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -3408,6 +3439,7 @@ fn line_slices_near_tail_do_not_invent_empty_eof_row_without_trailing_newline() 
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -3469,6 +3501,7 @@ fn line_slices_bail_out_when_next_line_scan_would_be_unbounded() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -3508,6 +3541,7 @@ fn indexing_progress_reports_inflight_state() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -4198,6 +4232,7 @@ fn try_insert_rejects_large_piece_table_promotion_to_rope() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable {
@@ -4403,6 +4438,7 @@ fn partial_piece_table_position_helpers_follow_current_text_after_prefix_edit() 
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5, 4], false)),
@@ -4457,6 +4493,7 @@ fn partial_piece_table_clamp_position_preserves_scannable_lines_beyond_estimated
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![2], false)),
@@ -4510,6 +4547,7 @@ fn partial_piece_table_position_helpers_do_not_invent_text_units_past_safe_bound
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -4550,6 +4588,7 @@ fn incomplete_mmap_position_helpers_clamp_to_eof_instead_of_inventing_lines() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -4590,6 +4629,7 @@ fn incomplete_mmap_line_len_chars_does_not_invent_tail_columns() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -4694,6 +4734,7 @@ fn selection_read_is_inexact_when_partial_piece_table_head_is_unresolved() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -4738,6 +4779,7 @@ fn selection_read_stays_exact_on_long_exact_partial_piece_table_line() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -4785,6 +4827,7 @@ fn empty_range_read_is_inexact_when_partial_piece_table_start_is_unresolved() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -4820,6 +4863,7 @@ fn incomplete_mmap_nonempty_range_read_past_eof_is_empty_and_inexact() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -4863,6 +4907,7 @@ fn incomplete_mmap_typed_read_uses_exact_start_offset_instead_of_heuristic_line_
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -5366,6 +5411,7 @@ fn selection_replace_promotes_partial_piece_table_before_clamping_unresolved_hea
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -5412,6 +5458,7 @@ fn selection_edit_capability_requires_promotion_for_unresolved_partial_piece_tab
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable::new(storage, vec![5], false)),
@@ -5537,6 +5584,7 @@ fn document_status_reports_pending_exact_line_count() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -5576,6 +5624,7 @@ fn wait_for_exact_line_count_observes_background_disk_index_completion() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -5872,6 +5921,7 @@ fn edit_capability_reports_partial_piece_table_promotion_limits() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: Some(PieceTable {
@@ -6915,6 +6965,7 @@ fn partial_piece_table_window_does_not_claim_exact_line_count() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         piece_table: Some(piece_table),
         rope_history: RopeHistory::new(),
@@ -6972,6 +7023,7 @@ fn partial_piece_table_covering_whole_file_keeps_exact_count() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         piece_table: Some(piece_table),
         rope_history: RopeHistory::new(),
@@ -7021,6 +7073,7 @@ fn windowed_piece_table_edits_far_lines_via_disk_index() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -7127,6 +7180,7 @@ fn recovered_far_edit_session_reads_beyond_annotated_region() {
         encoding_engine: super::encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
         decoding_had_errors: false,
         preserve_save_error_cache: Cell::new(None),
+        rope_file_len_cache: Cell::new(None),
         rope: None,
         rope_history: RopeHistory::new(),
         piece_table: None,
@@ -7182,5 +7236,255 @@ fn recovered_far_edit_session_reads_beyond_annotated_region() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("log.qem.editlog"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Audit regression pins
+//
+// Engine-aware bounded literal search on non-UTF-8 piece tables, the
+// Class B trailing-line model, cell-aligned piece splits on UTF-16, the
+// edit-capability plan parity for non-UTF-8 documents, the rope-backed
+// non-UTF-8 `file_len` cache, and the zero-step cursor scan guard.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bounded_literal_search_respects_range_on_cp1251_piece_table() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cp1251-bounded.txt");
+    // Five windows-1251 collision pairs (0xD0 0x90: two single-byte
+    // characters that also parse as one UTF-8 sequence) then "XY\nF\n".
+    // The old UTF-8-stepping range advance swallowed every pair into one
+    // unit, pushed the range end past line 0 into line 1, and surfaced
+    // the "F" match that lives outside the requested range.
+    let mut bytes = Vec::new();
+    for _ in 0..5 {
+        bytes.extend_from_slice(&[0xD0u8, 0x90]);
+    }
+    bytes.extend_from_slice(b"XY\nF\n");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+    let mut doc = Document::open_with_encoding(path.clone(), encoding).unwrap();
+    // One edit promotes the document to the piece-tree backing, which is
+    // where the bounded-range arithmetic used to run UTF-8 stepping.
+    doc.try_insert_text_at(0, 0, "Z").unwrap();
+
+    // The range covers 11 text units from (0, 0): "Z" plus the ten
+    // collision-pair bytes plus "X" - it ends mid-line 0. "F" on line 1
+    // lies outside the requested range in both search directions.
+    let range = TextRange::new(TextPosition::new(0, 0), 11);
+    assert!(
+        doc.find_next_in_range("F", range).is_none(),
+        "F on line 1 is outside the requested range (forward)"
+    );
+    assert!(
+        doc.find_prev_in_range("F", range).is_none(),
+        "F on line 1 is outside the requested range (reverse)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn class_b_native_open_counts_trailing_empty_line_like_utf8() {
+    let dir = tempdir().unwrap();
+
+    let utf16le_encode = |text: &str| -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    };
+    let wait_indexed = |doc: &Document| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while doc.is_indexing() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+
+    let trailing = dir.path().join("utf16le-trailing.txt");
+    std::fs::write(&trailing, utf16le_encode("AB\n")).unwrap();
+    let doc = Document::open_with_encoding(&trailing, DocumentEncoding::utf16le()).unwrap();
+    wait_indexed(&doc);
+    assert_eq!(doc.text_lossy(), "AB\n");
+    assert_eq!(
+        doc.display_line_count(),
+        2,
+        "a trailing UTF-16 line break opens an empty last line, like UTF-8"
+    );
+
+    let no_trailing = dir.path().join("utf16le-no-trailing.txt");
+    std::fs::write(&no_trailing, utf16le_encode("AB")).unwrap();
+    let doc = Document::open_with_encoding(&no_trailing, DocumentEncoding::utf16le()).unwrap();
+    wait_indexed(&doc);
+    assert_eq!(
+        doc.display_line_count(),
+        1,
+        "no phantom trailing line without a line break"
+    );
+
+    let (sj, used, had_errors) = SHIFT_JIS.encode("AB\n");
+    assert_eq!(used, SHIFT_JIS);
+    assert!(!had_errors);
+    let sj_trailing = dir.path().join("shift-jis-trailing.txt");
+    std::fs::write(&sj_trailing, sj.as_ref()).unwrap();
+    let doc = Document::open_with_encoding(
+        &sj_trailing,
+        DocumentEncoding::from_label("shift_jis").unwrap(),
+    )
+    .unwrap();
+    wait_indexed(&doc);
+    assert_eq!(
+        doc.display_line_count(),
+        2,
+        "a trailing Shift_JIS line break opens an empty last line, like UTF-8"
+    );
+
+    let (sj_plain, used, had_errors) = SHIFT_JIS.encode("AB");
+    assert_eq!(used, SHIFT_JIS);
+    assert!(!had_errors);
+    let sj_no_trailing = dir.path().join("shift-jis-no-trailing.txt");
+    std::fs::write(&sj_no_trailing, sj_plain.as_ref()).unwrap();
+    let doc = Document::open_with_encoding(
+        &sj_no_trailing,
+        DocumentEncoding::from_label("shift_jis").unwrap(),
+    )
+    .unwrap();
+    wait_indexed(&doc);
+    assert_eq!(doc.display_line_count(), 1);
+
+    // Reference: the UTF-8 inline scanner model on identical content.
+    let utf8_ref = dir.path().join("utf8-trailing.txt");
+    std::fs::write(&utf8_ref, b"AB\n").unwrap();
+    let doc = Document::open_with_encoding(&utf8_ref, DocumentEncoding::utf8()).unwrap();
+    wait_indexed(&doc);
+    assert_eq!(doc.display_line_count(), 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn utf16le_piece_table_split_stays_cell_aligned() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf16le-split.txt");
+    // Byte stream `41 00 41 C2 80 C2 80 01 42 00`: a valid UTF-16LE cell
+    // sequence AND simultaneously valid UTF-8 - exactly the input that
+    // made the old piece-split aligner (gated on `from_utf8` validity
+    // instead of on the document encoding) pull a UTF-16 split into the
+    // middle of a code unit.
+    let text = "A\u{C241}\u{C280}\u{0180}B";
+    let mut bytes = Vec::new();
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    assert_eq!(
+        bytes,
+        vec![0x41, 0x00, 0x41, 0xC2, 0x80, 0xC2, 0x80, 0x01, 0x42, 0x00]
+    );
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut doc = Document::open_with_encoding(&path, DocumentEncoding::utf16le()).unwrap();
+    // Inserting at (0, 2) splits the original piece at byte offset 4.
+    doc.try_insert_text_at(0, 2, "X").unwrap();
+
+    assert_eq!(doc.text_lossy(), "A\u{C241}X\u{C280}\u{0180}B");
+    let piece_table = doc
+        .piece_table
+        .as_ref()
+        .expect("edit promotes to piece table");
+    assert_eq!(
+        piece_table.line_visible_segment(0, 0, 40),
+        "A\u{C241}X\u{C280}\u{0180}B",
+        "the viewport line must decode across every piece boundary"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn edit_capability_advertises_piece_table_for_small_non_utf8_documents() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cp1251-capability.txt");
+    let (bytes, used, had_errors) = WINDOWS_1251.encode("данные\n");
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    std::fs::write(&path, bytes.as_ref()).unwrap();
+
+    let doc = Document::open_with_encoding(
+        path.clone(),
+        DocumentEncoding::from_label("windows-1251").unwrap(),
+    )
+    .unwrap();
+    // The first edit creates a piece table for non-UTF-8 documents
+    // regardless of size, so the capability surface must advertise the
+    // same plan instead of promising a rope promotion.
+    match doc.edit_capability_at(TextPosition::new(0, 0)) {
+        EditCapability::RequiresPromotion {
+            to: DocumentBacking::PieceTable,
+            ..
+        } => {}
+        other => panic!("expected RequiresPromotion to PieceTable, got {other:?}"),
+    }
+
+    // UTF-8 twin keeps the rope contract for small files.
+    let utf8_path = dir.path().join("utf8-capability.txt");
+    std::fs::write(&utf8_path, b"abc\n").unwrap();
+    let doc = Document::open_with_encoding(utf8_path, DocumentEncoding::utf8()).unwrap();
+    match doc.edit_capability_at(TextPosition::new(0, 0)) {
+        EditCapability::RequiresPromotion {
+            to: DocumentBacking::Rope,
+            ..
+        } => {}
+        other => panic!("expected RequiresPromotion to Rope for a small UTF-8 file, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_cursor_position_bytes_advances_over_zero_step_tail_cells() {
+    // A one-byte tail of a truncated UTF-16 segment: `Utf16Engine::step`
+    // answers 0 (remaining < 2), so the cursor scan must clamp the step
+    // to 1 instead of re-counting the same byte once per remaining unit.
+    let bytes = [0x41u8];
+    let engine = super::encoding_engine::engine_for_encoding(DocumentEncoding::utf16le());
+    let mut state = CursorScanState::new(3);
+    scan_cursor_position_bytes(&bytes, &mut state, engine);
+    assert_eq!(
+        state.position(),
+        (0, 1),
+        "one truncated UTF-16 cell counts as one text unit"
+    );
+}
+
+#[test]
+fn file_len_tracks_rope_backed_non_utf8_documents() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("big5-rope.txt");
+    let (bytes, used, had_errors) = encoding_rs::BIG5.encode("你好");
+    assert_eq!(used, encoding_rs::BIG5);
+    assert!(!had_errors);
+    std::fs::write(&path, bytes.as_ref()).unwrap();
+
+    // big5 is neither Class A nor a supported Class B encoding, so open
+    // materializes the decoded rope; `file_len` must answer the encoded
+    // length of the current content and keep tracking edits - the cache
+    // behind it must not go stale across mark_dirty boundaries.
+    let mut doc =
+        Document::open_with_encoding(path, DocumentEncoding::from_label("big5").unwrap()).unwrap();
+    assert_eq!(doc.backing(), DocumentBacking::Rope);
+    assert_eq!(doc.file_len(), 4);
+    doc.try_insert_text_at(0, 0, "A").unwrap();
+    assert_eq!(
+        doc.file_len(),
+        5,
+        "file_len tracks edits after the cached read"
+    );
+    doc.try_insert_text_at(0, 0, "XY").unwrap();
+    assert_eq!(doc.file_len(), 7);
+    assert_eq!(doc.text_lossy(), "XYA你好");
+
     let _ = std::fs::remove_dir_all(&dir);
 }

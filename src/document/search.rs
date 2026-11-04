@@ -860,9 +860,19 @@ impl Document {
             let start_offset = piece_table.byte_offset_for_col(start.line0(), start.col0());
             let start_offset = scanned_piece_table_byte_offset_for_position(piece_table, start)
                 .unwrap_or(start_offset);
-            let end_offset =
-                piece_table.advance_offset_by_text_units(start_offset, range.len_chars());
-            let end = piece_table.position_for_byte_offset_from(start_offset, start, end_offset);
+            // Engine-aware bounds: the piece table may hold raw non-UTF-8
+            // bytes (Class A / UTF-16 / CJK), so the range end must be
+            // walked through the document's engine, not UTF-8 stepping that
+            // would swallow collision pairs as one unit and overshoot the
+            // requested range.
+            let engine = piece_table.engine();
+            let end_offset = piece_table.advance_offset_by_text_units_with_engine(
+                start_offset,
+                range.len_chars(),
+                engine,
+            );
+            let end =
+                piece_table.position_for_byte_offset_from(start_offset, start, end_offset, engine);
             return (start, end);
         }
 
@@ -1109,6 +1119,7 @@ impl Document {
         finder_rev: &FinderRev<'_>,
         before: TextPosition,
     ) -> Option<SearchMatch> {
+        let engine = piece_table.engine();
         let mut search_before = before;
         let mut end_offset = if let Some(offset) =
             scanned_piece_table_byte_offset_for_position(piece_table, before)
@@ -1120,7 +1131,7 @@ impl Document {
             // caller's logical `before` position, so fall back to the last known
             // safe boundary instead.
             let fallback = piece_table.known_byte_len.min(piece_table.total_len);
-            search_before = piece_table.position_for_byte_offset(fallback);
+            search_before = piece_table.position_for_byte_offset(fallback, engine);
             fallback
         };
         if memchr::memchr2(b'\n', b'\r', needle).is_none() {
@@ -1131,11 +1142,15 @@ impl Document {
                 end_offset = adjusted_end_offset;
             }
         }
-        let engine = piece_table.engine();
         let match_start = piece_table.find_literal_prev(end_offset, needle.len(), finder_rev)?;
         let start_pos = piece_table
-            .position_for_byte_offset_before_same_line(end_offset, search_before, match_start)
-            .unwrap_or_else(|| piece_table.position_for_byte_offset(match_start));
+            .position_for_byte_offset_before_same_line(
+                end_offset,
+                search_before,
+                match_start,
+                engine,
+            )
+            .unwrap_or_else(|| piece_table.position_for_byte_offset(match_start, engine));
         let end_pos = advance_position_by_bytes(start_pos, needle, engine);
         Some(SearchMatch::new(
             TextRange::new(start_pos, needle_units),
@@ -1532,6 +1547,7 @@ impl PieceTable {
         anchor_offset: usize,
         anchor_position: TextPosition,
         byte_offset: usize,
+        engine: &dyn super::encoding_engine::EncodingEngine,
     ) -> Option<TextPosition> {
         let anchor_offset = anchor_offset.min(self.total_len);
         let target = byte_offset.min(anchor_offset);
@@ -1553,16 +1569,18 @@ impl PieceTable {
         let mut i = 0usize;
         while i < bytes.len() {
             units = units.saturating_add(1);
-            let step = super::encoding_engine::Utf8Engine
-                .step(&bytes, i, bytes.len())
-                .max(1);
+            let step = engine.step(&bytes, i, bytes.len()).max(1);
             i = i.saturating_add(step).min(bytes.len());
         }
         (units <= anchor_position.col0())
             .then(|| TextPosition::new(anchor_position.line0(), anchor_position.col0() - units))
     }
 
-    fn position_for_byte_offset(&self, byte_offset: usize) -> TextPosition {
+    fn position_for_byte_offset(
+        &self,
+        byte_offset: usize,
+        engine: &dyn super::encoding_engine::EncodingEngine,
+    ) -> TextPosition {
         let target = byte_offset.min(self.total_len);
         if target == 0 {
             return TextPosition::new(0, 0);
@@ -1574,11 +1592,7 @@ impl PieceTable {
                 let seg_start = piece.start + local_start;
                 let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
-                scan_position_bytes(
-                    &super::encoding_engine::Utf8Engine,
-                    &src[seg_start..seg_end],
-                    &mut state,
-                );
+                scan_position_bytes(engine, &src[seg_start..seg_end], &mut state);
             });
         state.position()
     }
@@ -1588,6 +1602,7 @@ impl PieceTable {
         anchor_offset: usize,
         anchor_position: TextPosition,
         byte_offset: usize,
+        engine: &dyn super::encoding_engine::EncodingEngine,
     ) -> TextPosition {
         let anchor_offset = anchor_offset.min(self.total_len);
         let target = byte_offset.min(self.total_len);
@@ -1601,11 +1616,7 @@ impl PieceTable {
                 let seg_start = piece.start + local_start;
                 let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
-                scan_position_bytes(
-                    &super::encoding_engine::Utf8Engine,
-                    &src[seg_start..seg_end],
-                    &mut state,
-                );
+                scan_position_bytes(engine, &src[seg_start..seg_end], &mut state);
             });
         state.position()
     }

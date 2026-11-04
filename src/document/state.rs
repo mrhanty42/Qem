@@ -393,16 +393,18 @@ impl Document {
         )
     }
 
-    pub(super) fn invalidate_preserve_save_error_cache(&self) {
+    pub(super) fn invalidate_cached_content_values(&self) {
         self.preserve_save_error_cache.set(None);
+        self.rope_file_len_cache.set(None);
     }
 
     /// Atomically updates the encoding contract for the document.
     ///
     /// Sets `encoding`, `encoding_origin` and `encoding_engine` together so
     /// the byte-movement engine never lags behind the encoding contract.
-    /// Also invalidates the cached preserve-save validation result
-    /// because that cache is keyed off the current encoding.
+    /// Also invalidates the cached content-derived values (the preserve-save
+    /// validation result and the rope-backed non-UTF-8 save length) because
+    /// both caches are keyed off the current encoding and content.
     ///
     /// All call sites that mutate `self.encoding` should funnel through this
     /// helper; direct field assignment is intentionally avoided.
@@ -414,11 +416,11 @@ impl Document {
         self.encoding = encoding;
         self.encoding_origin = origin;
         self.encoding_engine = super::encoding_engine::engine_for_encoding(encoding);
-        self.invalidate_preserve_save_error_cache();
+        self.invalidate_cached_content_values();
     }
 
     pub(super) fn mark_dirty(&mut self) {
-        self.invalidate_preserve_save_error_cache();
+        self.invalidate_cached_content_values();
         self.dirty = true;
     }
 
@@ -463,10 +465,20 @@ impl Document {
             if self.encoding.is_utf8() {
                 return rope_save_len_bytes(rope, self.line_ending);
             }
+            // Non-UTF-8 ropes have no O(chunks) length formula: the exact
+            // answer requires a full render + re-encode. Cache it behind
+            // the same invalidation discipline as the preserve-save cache
+            // so status polls / edit-capability checks on a promoted
+            // document stop re-encoding the whole document per call.
+            if let Some(cached) = self.rope_file_len_cache.get() {
+                return cached;
+            }
             let rendered = rope_text_with_line_endings(rope, self.line_ending);
-            return encode_text_with_encoding(&rendered, self.encoding)
+            let len = encode_text_with_encoding(&rendered, self.encoding)
                 .map(|bytes| bytes.len())
                 .unwrap_or_else(|_| rendered.len());
+            self.rope_file_len_cache.set(Some(len));
+            return len;
         }
         self.file_len
     }

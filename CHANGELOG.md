@@ -4,6 +4,85 @@
 
 ### Fixed
 
+- Bounded literal search on non-UTF-8 piece tables is engine-aware.
+  `find_next_in_range` / `find_prev_in_range` / `find_all_in_range` (and
+  the `_between` variants) used to walk the range end and its fallback
+  typed positions with plain UTF-8 stepping, so on a windows-1251 piece
+  table a "collision pair" (two adjacent bytes that also parse as one
+  UTF-8 sequence) was swallowed into a single unit and the search range
+  overshot into the next line, surfacing matches outside the requested
+  range. The range bounds now advance through
+  `advance_offset_by_text_units_with_engine`, and
+  `position_for_byte_offset` / `position_for_byte_offset_from` / the
+  reverse fast-path scan take the document's engine instead of a
+  hard-coded `Utf8Engine`. Regression test pins both directions with a
+  five-pair fixture.
+- Regex match lengths are engine-aware. `finalize_byte_match` counted
+  `SearchMatch::len_chars` with `std::str::from_utf8(..).unwrap_or("")`,
+  which answered `0` units for a windows-1251 match whose bytes are not
+  valid UTF-8 and grouped a cp1251 collision pair into one unit, while
+  the match's start/end positions were already engine-aware. The unit
+  count now walks the matched bytes through the document's engine, so
+  the reported range stays self-consistent for `replace`-style
+  consumers. Two regression tests pin the invalid-UTF-8 and
+  collision-pair fixtures.
+- `find_prev_regex*` (including `_in_range` / `_between`) on UTF-16 and
+  CJK multibyte documents routes through the same chunked decode path as
+  the forward direction instead of running the byte-engine regex over
+  raw storage bytes. The old routing silently answered `None` for ASCII
+  needles on UTF-16 (`0x00` filler bytes sit between the characters),
+  mis-anchored on filler bytes, and never matched non-ASCII needles on
+  Shift_JIS / GB18030 / EUC-KR, while forward `find_next_regex` on the
+  same document found them. The reverse decode scan keeps the
+  last-non-overlapping match, matching the small-span byte fallback's
+  semantics. Regression tests pin UTF-16LE and Shift_JIS documents.
+- Class B native open records the trailing empty line when the file ends
+  with a line break. The UTF-16 / CJK inline line scanner stopped at
+  `next == file_len` without pushing the offset, so `"AB\n"` in UTF-16LE
+  reported one line where the identical content as UTF-8 (and through
+  the piece-tree break counters) reports two. The scanner now
+  distinguishes a line break ending at EOF from plain end-of-text via
+  the engine's `trim_trailing_line_break` and keeps the line model
+  consistent across encoding classes. Regression test pins UTF-16LE,
+  Shift_JIS, and the UTF-8 reference.
+- Piece-tree splits stay cell-aligned for non-UTF-8 documents. The split
+  / trim aligner ran a UTF-8 boundary walk gated on `from_utf8` *byte
+  validity* instead of on the document encoding, so a UTF-16LE stream
+  that is also valid UTF-8 (any pure-ASCII file, or cells like
+  `41 C2 80 C2`) had its insert/delete splits pulled into the middle of
+  a code unit, breaking every later piece-local decode in that window.
+  Piece-level alignment now dispatches on the document's engine:
+  UTF-16 keeps the 2-byte cell grid anchored at the piece start, Class A
+  and CJK multibyte keep the already cell-aligned edit offsets verbatim,
+  and the UTF-8 walk applies to UTF-8 only. Regression test pins a
+  UTF-16LE insert whose byte stream is simultaneously valid UTF-8.
+- `edit_capability_at` mirrors the real edit plan for non-UTF-8
+  documents. It used to promise `RequiresPromotion(Rope)` for small
+  storage-backed non-UTF-8 files, while the first edit actually creates
+  a piece tree (`edit_buffer_plan_for_line` drops the size gate for
+  them). The capability fork now follows the same encoding dispatch.
+  Regression test pins the windows-1251 and UTF-8 twins.
+- The cursor position scan never stalls on a zero-step engine cell.
+  `scan_cursor_position_bytes` (piece-table `position_for_char_index`)
+  lacked the `.max(1)` guard its twin `scan_position_bytes` got in the
+  0.8.1 zero-step fix, so an odd-length UTF-16 segment (truncated file
+  or a piece boundary inside a code unit) re-counted the same tail byte
+  once per remaining unit and inflated the column. Regression test pins
+  a one-byte truncated UTF-16 cell.
+- `file_len` for rope-backed non-UTF-8 documents is cached behind the
+  existing content-cache invalidation discipline. That combination has
+  no O(chunks) length formula - the exact answer required a full render
+  plus re-encode on every status poll, edit-capability check, and
+  edit-offset alignment of a promoted document. The encoded length is
+  now computed once per edit generation; a regression test tracks it
+  across successive edits on a big5 document.
+
+### Changed
+
+- README documents `tmp-auto` as the explicit marker for the default
+  scratch policy: the flag itself has no code hook, the automatic
+  writable-location fallback already applies when none of the other
+  `tmp-*` features (and no `QEM_TMP_POLICY` override) are set.
 - Piece-table documents now carry their encoding engine: column
   arithmetic (`line_len_chars`, `byte_offset_for_col`), line-segment
   decoding, and `read_text` from line/col positions all go through the

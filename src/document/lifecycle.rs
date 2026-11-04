@@ -214,6 +214,7 @@ impl Document {
             encoding_engine: encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
             decoding_had_errors: false,
             preserve_save_error_cache: Cell::new(None),
+            rope_file_len_cache: Cell::new(None),
             rope: None,
             piece_table: None,
             rope_history: RopeHistory::new(),
@@ -551,6 +552,7 @@ impl Document {
             encoding_engine: encoding_engine::engine_for_encoding(encoding),
             decoding_had_errors,
             preserve_save_error_cache: Cell::new(None),
+            rope_file_len_cache: Cell::new(None),
             rope: Some(rope),
             piece_table: None,
             rope_history: RopeHistory::new(),
@@ -664,6 +666,7 @@ impl Document {
             encoding_engine: encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
             decoding_had_errors: false,
             preserve_save_error_cache: Cell::new(None),
+            rope_file_len_cache: Cell::new(None),
             rope: None,
             piece_table: None,
             rope_history: RopeHistory::new(),
@@ -730,14 +733,32 @@ impl Document {
             let mut cursor = 0usize;
             loop {
                 let next = engine.next_line_start(bytes, file_len, cursor);
-                if next >= file_len || next == cursor {
+                if next == cursor {
                     break;
                 }
-                if detected_line_ending.is_none() {
-                    detected_line_ending = classify_class_b_line_ending(bytes, encoding, next);
+                if next < file_len {
+                    if detected_line_ending.is_none() {
+                        detected_line_ending = classify_class_b_line_ending(bytes, encoding, next);
+                    }
+                    offsets.push(next as u32);
+                    cursor = next;
+                    continue;
                 }
-                offsets.push(next as u32);
-                cursor = next;
+                // `next == file_len` is ambiguous: a line break ending
+                // exactly at EOF opens a trailing empty line — the UTF-8 /
+                // Class A inline scanner records it by pushing `pos + 1` —
+                // but so does plain end-of-text with no break at all.
+                // Trim the engine-aware trailing line-ending cell to tell
+                // the two apart so the trailing-line model stays consistent
+                // across encoding classes.
+                if engine.trim_trailing_line_break(bytes, cursor, file_len) < file_len {
+                    if detected_line_ending.is_none() {
+                        detected_line_ending =
+                            classify_class_b_line_ending(bytes, encoding, file_len);
+                    }
+                    offsets.push(file_len as u32);
+                }
+                break;
             }
             LineOffsets::U32(offsets)
         } else {
@@ -746,14 +767,27 @@ impl Document {
             let mut cursor = 0usize;
             loop {
                 let next = engine.next_line_start(bytes, file_len, cursor);
-                if next >= file_len || next == cursor {
+                if next == cursor {
                     break;
                 }
-                if detected_line_ending.is_none() {
-                    detected_line_ending = classify_class_b_line_ending(bytes, encoding, next);
+                if next < file_len {
+                    if detected_line_ending.is_none() {
+                        detected_line_ending = classify_class_b_line_ending(bytes, encoding, next);
+                    }
+                    offsets.push(next as u64);
+                    cursor = next;
+                    continue;
                 }
-                offsets.push(next as u64);
-                cursor = next;
+                // Same trailing-line rule as the u32 branch above: a line
+                // break ending exactly at EOF opens a trailing empty line.
+                if engine.trim_trailing_line_break(bytes, cursor, file_len) < file_len {
+                    if detected_line_ending.is_none() {
+                        detected_line_ending =
+                            classify_class_b_line_ending(bytes, encoding, file_len);
+                    }
+                    offsets.push(file_len as u64);
+                }
+                break;
             }
             LineOffsets::U64(offsets)
         };
@@ -804,6 +838,7 @@ impl Document {
             encoding_engine: encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
             decoding_had_errors,
             preserve_save_error_cache: Cell::new(None),
+            rope_file_len_cache: Cell::new(None),
             rope: None,
             piece_table: None,
             rope_history: RopeHistory::new(),
@@ -885,6 +920,7 @@ impl Document {
                         ),
                         decoding_had_errors: meta.decoding_had_errors,
                         preserve_save_error_cache: Cell::new(None),
+                        rope_file_len_cache: Cell::new(None),
                         rope: None,
                         // Persistent sessions are only created for UTF-8
                         // documents, so the recovered piece table uses the
@@ -929,6 +965,7 @@ impl Document {
                 encoding_engine: encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
                 decoding_had_errors: false,
                 preserve_save_error_cache: Cell::new(None),
+                rope_file_len_cache: Cell::new(None),
                 rope: Some(EditBuffer::new()),
                 piece_table: None,
                 rope_history: RopeHistory::new(),
@@ -956,6 +993,7 @@ impl Document {
                 encoding_engine: encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
                 decoding_had_errors: inline_analysis.utf8_had_errors,
                 preserve_save_error_cache: Cell::new(None),
+                rope_file_len_cache: Cell::new(None),
                 rope: None,
                 piece_table: None,
                 rope_history: RopeHistory::new(),
@@ -1150,6 +1188,7 @@ impl Document {
             encoding_engine: encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
             decoding_had_errors: false,
             preserve_save_error_cache: Cell::new(None),
+            rope_file_len_cache: Cell::new(None),
             rope: None,
             piece_table: None,
             rope_history: RopeHistory::new(),
@@ -1194,7 +1233,7 @@ impl Document {
 
     /// Clears the unsaved-changes flag.
     pub fn mark_clean(&mut self) {
-        self.invalidate_preserve_save_error_cache();
+        self.invalidate_cached_content_values();
         self.dirty = false;
     }
 

@@ -355,7 +355,7 @@ impl Document {
         };
         if had_errors && !self.decoding_had_errors {
             self.decoding_had_errors = true;
-            self.invalidate_preserve_save_error_cache();
+            self.invalidate_cached_content_values();
         }
         self.rope = Some(rope);
         Ok(())
@@ -389,7 +389,7 @@ impl Document {
         };
         if had_errors && !self.decoding_had_errors {
             self.decoding_had_errors = true;
-            self.invalidate_preserve_save_error_cache();
+            self.invalidate_cached_content_values();
         }
         self.rope = Some(rope);
         Ok(())
