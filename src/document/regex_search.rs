@@ -848,7 +848,13 @@ fn find_next_regex_in_bytes(
     // so this stays interactive on multi-gigabyte files.
     if let Some(slice) = doc.mmap_search_slice(start_offset, end_offset) {
         let m = query.bytes_regex().find(slice)?;
-        return finalize_byte_match(from, &slice[..m.start()], &slice[m.start()..m.end()], end);
+        return finalize_byte_match(
+            doc,
+            from,
+            &slice[..m.start()],
+            &slice[m.start()..m.end()],
+            end,
+        );
     }
 
     // Piece-table backing: chunked streaming with overlap. We iterate
@@ -889,7 +895,7 @@ fn find_next_regex_in_bytes(
                     from
                 } else {
                     let prefix_into_chunk = &chunk[..0];
-                    advance_position_by_bytes(from, prefix_into_chunk)
+                    advance_position_by_bytes(from, prefix_into_chunk, doc.encoding_engine())
                 };
                 let absolute_match_start = chunk_start.saturating_add(m.start());
                 let absolute_match_end = chunk_start.saturating_add(m.end());
@@ -897,7 +903,7 @@ fn find_next_regex_in_bytes(
                     doc.piece_table_uncapped_range(start_offset, absolute_match_start)?;
                 let match_bytes =
                     doc.piece_table_uncapped_range(absolute_match_start, absolute_match_end)?;
-                return finalize_byte_match(from_for_chunk, &prefix_bytes, &match_bytes, end);
+                return finalize_byte_match(doc, from_for_chunk, &prefix_bytes, &match_bytes, end);
             }
         }
 
@@ -913,14 +919,16 @@ fn find_next_regex_in_bytes(
 }
 
 fn finalize_byte_match(
+    doc: &Document,
     from: TextPosition,
     prefix_bytes: &[u8],
     match_bytes: &[u8],
     end: Option<TextPosition>,
 ) -> Option<SearchMatch> {
-    let start_pos = advance_position_by_bytes(from, prefix_bytes);
+    let engine = doc.encoding_engine();
+    let start_pos = advance_position_by_bytes(from, prefix_bytes, engine);
     let match_units = search_text_units(std::str::from_utf8(match_bytes).unwrap_or(""));
-    let end_pos = advance_position_by_bytes(start_pos, match_bytes);
+    let end_pos = advance_position_by_bytes(start_pos, match_bytes, engine);
     if let Some(end_bound) = end {
         if end_pos > end_bound {
             return None;
@@ -1048,6 +1056,7 @@ fn forward_regex_search_last_in_slice(
         .min(slice.len());
     let rebased_end = aligned_end.saturating_sub(slice_start_off).min(slice.len());
     finalize_byte_match(
+        doc,
         bound_start,
         &slice[..rebased_start],
         &slice[rebased_start..rebased_end],
@@ -1252,6 +1261,7 @@ fn reverse_dfa_search_in_slice(
         return None;
     }
     finalize_byte_match(
+        doc,
         bound_start,
         &slice[..rebased_start],
         &slice[rebased_start..rebased_end],
@@ -1317,9 +1327,13 @@ fn reverse_dfa_search_in_piece_tree(
                 // path uses for piece-tree backings.
                 let prefix_bytes = doc.piece_table_uncapped_range(start_off, aligned_start)?;
                 let match_bytes = doc.piece_table_uncapped_range(aligned_start, aligned_end)?;
-                if let Some(found) =
-                    finalize_byte_match(bound_start, &prefix_bytes, &match_bytes, Some(bound_end))
-                {
+                if let Some(found) = finalize_byte_match(
+                    doc,
+                    bound_start,
+                    &prefix_bytes,
+                    &match_bytes,
+                    Some(bound_end),
+                ) {
                     return Some(found);
                 }
             }
