@@ -196,6 +196,18 @@ none.
   `regex_tests.rs`); make the non-Windows snapshot backing cheaper than
   a full file copy; snapshot `save_async` state through `Arc` instead of
   cloning the edit buffer on the UI thread.
+- **Engine-aware line model for multi-byte-cell piece tables (1.0):**
+  the piece-table line model scans raw `0x0A` / `0x0D` bytes, which is
+  byte-exact for UTF-8 and Class A but wrong for UTF-16 (a `0x0A` byte
+  can be the low or high half of a non-line-ending code unit) and CJK
+  (a trail byte can coincide with a line-ending byte). Class A is fixed
+  end to end (engine-owned decode + column arithmetic, 1.0.0); the
+  remaining design work is to drive the piece-table line indexing,
+  `local_offset_after_break`, `scan_line_lengths_from`,
+  `scan_cursor_position_bytes`, and the partial-window scan fallbacks
+  through `EncodingEngine::next_line_start` / cell-aware break
+  detection (a full trace of affected sites was compiled during the
+  1.0-track audit).
 - **Small refactors for clarity**, not a rewrite. Split overgrown modules
   into focused units (history, persistence, fragmentation, core data
   structure for `piece_tree`; named lifecycle helpers around inspection,

@@ -4,6 +4,25 @@
 
 ### Fixed
 
+- Piece-table documents now carry their encoding engine: column
+  arithmetic (`line_len_chars`, `byte_offset_for_col`), line-segment
+  decoding, and `read_text` from line/col positions all go through the
+  document's engine instead of UTF-8 stepping and UTF-8 lossy decoding.
+  Before this, a windows-1251 (or any Class A) document edited into a
+  piece table rendered every viewport line as U+FFFD garbage after the
+  first edit. Regression tests cover the cp1251 read path end to end.
+- `advance_offset_by_text_units_with_engine` no longer materializes the
+  document tail: the engine-aware walker reads bounded 64 KiB chunks
+  with one byte of CRLF context, so a replace near the start of a
+  multi-gigabyte non-UTF-8 document no longer allocates the entire
+  remaining document per edit.
+- Composite edits (replace = delete + insert inside one edit batch) no
+  longer corrupt the known-region boundary history: the batch-aware
+  `set_known_boundary` writes to the pending history slot and the
+  deferred root commit picks it up, so undoing a composite replace on a
+  partial-window document restores the pre-batch boundary instead of
+  the post-batch one. The regression test fails against the old
+  behavior (verified: 199945 vs 200000) and passes with the fix.
 - The `.qem.editlog` open path truncates orphan pages past the committed
   header size. A crash between the page append and the header rewrite
   used to leave unreachable bytes at the tail of the sidecar; page
