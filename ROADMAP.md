@@ -207,7 +207,13 @@ none.
   `scan_cursor_position_bytes`, and the partial-window scan fallbacks
   through `EncodingEngine::next_line_start` / cell-aware break
   detection (a full trace of affected sites was compiled during the
-  1.0-track audit).
+  1.0-track audit). When this lands, the 64 KiB bounded-read context in
+  `advance_offset_by_text_units_with_engine` must also become
+  engine-aware (2 bytes for UTF-16, up to 4 for gb18030) instead of the
+  current single CRLF-context byte, and
+  `advance_position_by_bytes` / `scan_cursor_position_bytes` callers
+  must switch from raw-byte line-break detection to cell-aware
+  detection for multi-byte-cell documents.
 - **Small refactors for clarity**, not a rewrite. Split overgrown modules
   into focused units (history, persistence, fragmentation, core data
   structure for `piece_tree`; named lifecycle helpers around inspection,

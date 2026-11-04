@@ -10,7 +10,14 @@
   document's engine instead of UTF-8 stepping and UTF-8 lossy decoding.
   Before this, a windows-1251 (or any Class A) document edited into a
   piece table rendered every viewport line as U+FFFD garbage after the
-  first edit. Regression tests cover the cp1251 read path end to end.
+  first edit. Regression tests cover the cp1251 viewport/edit path end
+  to end, including the UTF-8 "collision pair" case where two adjacent
+  cp1251 bytes form a valid UTF-8 sequence and the old column scan
+  silently swallowed one. Search and `position_for_char_index` on
+  Class A piece tables are engine-aware too (`advance_position_by_bytes`
+  and the cursor scan now take the document's engine); line-indexed
+  reads for multi-byte-cell documents (UTF-16/CJK) remain a documented
+  1.0 item - see the line-model entry in ROADMAP.
 - `advance_offset_by_text_units_with_engine` no longer materializes the
   document tail: the engine-aware walker reads bounded 64 KiB chunks
   with one byte of CRLF context, so a replace near the start of a

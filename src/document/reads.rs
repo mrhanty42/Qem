@@ -257,7 +257,12 @@ fn scanned_piece_table_offset_for_position(
     }
 
     let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
-    let offset = byte_offset_for_text_col_in_bytes(&bytes, scanned.range, position.col0());
+    let offset = byte_offset_for_text_col_with_engine(
+        &bytes,
+        scanned.range,
+        position.col0(),
+        piece_table.engine(),
+    );
     Some((
         scan_start.saturating_add(offset),
         doc.piece_table_position_is_representable(piece_table, position),

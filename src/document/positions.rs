@@ -170,7 +170,12 @@ impl Document {
     ) -> Option<(usize, bool)> {
         let scanned = Self::scanned_piece_table_line_range(piece_table, position.line0())?;
         let bytes = piece_table.read_range(scanned.range.0, scanned.range.1);
-        let offset = byte_offset_for_text_col_in_bytes(&bytes, (0, bytes.len()), position.col0());
+        let offset = byte_offset_for_text_col_with_engine(
+            &bytes,
+            (0, bytes.len()),
+            position.col0(),
+            piece_table.engine(),
+        );
         Some((
             scanned.range.0.saturating_add(offset),
             self.piece_table_position_is_representable(piece_table, position),
@@ -545,7 +550,7 @@ impl Document {
         }
 
         let mut state = CursorScanState::new(char_index);
-        scan_cursor_position_bytes(self.mmap_bytes(), &mut state);
+        scan_cursor_position_bytes(self.mmap_bytes(), &mut state, self.encoding_engine());
         state.position()
     }
 

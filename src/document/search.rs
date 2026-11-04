@@ -96,9 +96,13 @@ pub(super) fn search_text_units(text: &str) -> usize {
     units
 }
 
-pub(super) fn advance_position_by_bytes(start: TextPosition, bytes: &[u8]) -> TextPosition {
+pub(super) fn advance_position_by_bytes(
+    start: TextPosition,
+    bytes: &[u8],
+    engine: &dyn super::encoding_engine::EncodingEngine,
+) -> TextPosition {
     let mut state = PositionScanState::new(start.line0(), start.col0());
-    scan_position_bytes(&super::encoding_engine::Utf8Engine, bytes, &mut state);
+    scan_position_bytes(engine, bytes, &mut state);
     state.position()
 }
 
@@ -186,11 +190,14 @@ fn scanned_piece_table_byte_offset_for_position(
     }
 
     let range = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
-    Some(scan_start.saturating_add(byte_offset_for_text_col_in_bytes(
-        &bytes,
-        range.range,
-        position.col0(),
-    )))
+    Some(
+        scan_start.saturating_add(byte_offset_for_text_col_with_engine(
+            &bytes,
+            range.range,
+            position.col0(),
+            piece_table.engine(),
+        )),
+    )
 }
 
 fn line_offsets_anchor_for_line(offsets: &LineOffsets, line0: usize) -> (usize, usize) {
@@ -395,12 +402,14 @@ impl Iterator for LiteralSearchIter<'_> {
                 advance_position_by_bytes(
                     self.next_from,
                     &buffered.bytes[buffered.next_rel_offset..match_start_rel],
+                    self.doc.encoding_engine(),
                 )
             };
             let match_end_rel = match_start_rel
                 .saturating_add(query.bytes().len())
                 .min(buffered.bytes.len());
-            let end_pos = advance_position_by_bytes(start_pos, query.bytes());
+            let end_pos =
+                advance_position_by_bytes(start_pos, query.bytes(), self.doc.encoding_engine());
             buffered.next_rel_offset = match_end_rel;
             self.next_from = end_pos;
             self.next_offset = buffered.base_offset.saturating_add(match_end_rel);
@@ -927,7 +936,8 @@ impl Document {
         let match_start = find_next_in_rope_chunks(rope, start_byte, needle.len(), finder)?;
         let start_char = rope.byte_to_char(match_start);
         let start_pos = self.position_for_char_index(start_char);
-        let end_pos = advance_position_by_bytes(start_pos, needle);
+        let end_pos =
+            advance_position_by_bytes(start_pos, needle, &super::encoding_engine::Utf8Engine);
         Some(SearchMatch::new(
             TextRange::new(start_pos, needle_units),
             end_pos,
@@ -951,7 +961,8 @@ impl Document {
             let start_char = rope.byte_to_char(match_start);
             self.position_for_char_index(start_char)
         };
-        let end_pos = advance_position_by_bytes(start_pos, needle);
+        let end_pos =
+            advance_position_by_bytes(start_pos, needle, &super::encoding_engine::Utf8Engine);
         let match_end = match_start
             .saturating_add(needle.len())
             .min(rope.len_bytes());
@@ -994,6 +1005,7 @@ impl Document {
         from: TextPosition,
         start_offset: usize,
     ) -> Option<(SearchMatch, usize)> {
+        let engine = self.encoding_engine();
         let bytes = self.mmap_bytes();
         let file_len = self.file_len.min(bytes.len());
         if file_len == 0 {
@@ -1005,7 +1017,7 @@ impl Document {
         let match_start = start_offset.saturating_add(rel);
         let match_end = match_start.saturating_add(needle.len()).min(file_len);
         let start_pos = self.mmap_position_for_byte_offset_from(start_offset, from, match_start);
-        let end_pos = advance_position_by_bytes(start_pos, needle);
+        let end_pos = advance_position_by_bytes(start_pos, needle, engine);
         Some((
             SearchMatch::new(TextRange::new(start_pos, needle_units), end_pos),
             match_end,
@@ -1046,6 +1058,7 @@ impl Document {
     ) -> Option<SearchMatch> {
         let start_col0 = from.col0();
         let start_pos = TextPosition::new(from.line0(), start_col0);
+        let engine = piece_table.engine();
         let start_offset = scanned_piece_table_byte_offset_for_position(piece_table, start_pos)
             .unwrap_or_else(|| piece_table.byte_offset_for_col(from.line0(), start_col0));
         let (start_pos, _) = piece_table.find_literal_next_from_position(
@@ -1054,7 +1067,7 @@ impl Document {
             needle.len(),
             finder,
         )?;
-        let end_pos = advance_position_by_bytes(start_pos, needle);
+        let end_pos = advance_position_by_bytes(start_pos, needle, engine);
         Some(SearchMatch::new(
             TextRange::new(start_pos, needle_units),
             end_pos,
@@ -1071,6 +1084,7 @@ impl Document {
         start_offset: usize,
     ) -> Option<(SearchMatch, usize)> {
         let start_offset = start_offset.min(piece_table.total_len);
+        let engine = piece_table.engine();
         let (start_pos, match_start) = piece_table.find_literal_next_from_position(
             start_offset,
             from,
@@ -1080,7 +1094,7 @@ impl Document {
         let match_end = match_start
             .saturating_add(needle.len())
             .min(piece_table.total_len);
-        let end_pos = advance_position_by_bytes(start_pos, needle);
+        let end_pos = advance_position_by_bytes(start_pos, needle, engine);
         Some((
             SearchMatch::new(TextRange::new(start_pos, needle_units), end_pos),
             match_end,
@@ -1117,11 +1131,12 @@ impl Document {
                 end_offset = adjusted_end_offset;
             }
         }
+        let engine = piece_table.engine();
         let match_start = piece_table.find_literal_prev(end_offset, needle.len(), finder_rev)?;
         let start_pos = piece_table
             .position_for_byte_offset_before_same_line(end_offset, search_before, match_start)
             .unwrap_or_else(|| piece_table.position_for_byte_offset(match_start));
-        let end_pos = advance_position_by_bytes(start_pos, needle);
+        let end_pos = advance_position_by_bytes(start_pos, needle, engine);
         Some(SearchMatch::new(
             TextRange::new(start_pos, needle_units),
             end_pos,
@@ -1476,7 +1491,8 @@ impl Document {
         let match_start = find_prev_in_rope_chunks(rope, end_byte, needle.len(), finder_rev)?;
         let start_char = rope.byte_to_char(match_start);
         let start_pos = self.position_for_char_index(start_char);
-        let end_pos = advance_position_by_bytes(start_pos, needle);
+        let end_pos =
+            advance_position_by_bytes(start_pos, needle, &super::encoding_engine::Utf8Engine);
         Some(SearchMatch::new(
             TextRange::new(start_pos, needle_units),
             end_pos,
@@ -1627,7 +1643,7 @@ impl PieceTable {
                     let match_position = if rel == 0 {
                         overlap_position
                     } else {
-                        advance_position_by_bytes(overlap_position, &window[..rel])
+                        advance_position_by_bytes(overlap_position, &window[..rel], self.engine)
                     };
                     found = Some((match_position, overlap_start.saturating_add(rel)));
                     return false;
@@ -1636,8 +1652,11 @@ impl PieceTable {
                 let keep = needle_len.saturating_sub(1).min(window.len());
                 let consumed = window.len().saturating_sub(keep);
                 if consumed > 0 {
-                    overlap_position =
-                        advance_position_by_bytes(overlap_position, &window[..consumed]);
+                    overlap_position = advance_position_by_bytes(
+                        overlap_position,
+                        &window[..consumed],
+                        self.engine,
+                    );
                 }
                 overlap.clear();
                 overlap.extend_from_slice(&window[window.len().saturating_sub(keep)..]);

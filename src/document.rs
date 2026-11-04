@@ -880,7 +880,11 @@ impl CursorScanState {
     }
 }
 
-fn scan_cursor_position_bytes(bytes: &[u8], state: &mut CursorScanState) {
+fn scan_cursor_position_bytes(
+    bytes: &[u8],
+    state: &mut CursorScanState,
+    engine: &dyn encoding_engine::EncodingEngine,
+) {
     let mut i = 0usize;
     while i < bytes.len() && !state.is_done() {
         match bytes[i] {
@@ -904,7 +908,10 @@ fn scan_cursor_position_bytes(bytes: &[u8], state: &mut CursorScanState) {
                 state.prev_was_cr = false;
                 state.seen = state.seen.saturating_add(1);
                 state.col0 = state.col0.saturating_add(1);
-                i += utf8_step(bytes, i, bytes.len());
+                // Engine-aware cell stepping: for Class A every byte is one
+                // text unit, so columns are byte-exact; for UTF-8 the engine
+                // matches `utf8_step` behavior.
+                i += engine.step(bytes, i, bytes.len());
             }
         }
     }
@@ -956,32 +963,6 @@ fn mmap_line_byte_range(
         None => return None,
     };
     Some((start0, end0.max(start0)))
-}
-
-fn byte_offset_for_text_col_in_bytes(
-    bytes: &[u8],
-    line_range: (usize, usize),
-    col0: usize,
-) -> usize {
-    let (start, end) = line_range;
-    if col0 == 0 || start >= end {
-        return start.min(end);
-    }
-
-    let mut col = 0usize;
-    let mut offset = start;
-    let mut i = start;
-    while i < end && col < col0 {
-        let b = bytes[i];
-        if b == b'\n' || b == b'\r' {
-            break;
-        }
-        let step = utf8_step(bytes, i, end);
-        col += 1;
-        i += step;
-        offset += step;
-    }
-    offset.min(end)
 }
 
 fn byte_offset_for_text_col_with_engine(
@@ -1495,6 +1476,13 @@ impl PieceTable {
         self.total_len
     }
 
+    /// The document's byte-movement engine, for sibling-module callers
+    /// (search / reads) that must step cells or decode windows in the
+    /// document's own encoding.
+    pub(crate) fn engine(&self) -> &'static dyn encoding_engine::EncodingEngine {
+        self.engine
+    }
+
     /// Returns the byte length covered by the known line boundaries.
     ///
     /// A partial piece table indexes only a bounded window of lines, so this
@@ -1703,11 +1691,15 @@ impl PieceTable {
                     }
                     let step = self.engine.step(src, i, seg_end);
                     if step == 0 || i.saturating_add(step) > seg_end {
-                        // A piece boundary may split an encoded cell (for
-                        // example the first half of a UTF-16 unit). Do not
-                        // spin on a zero-step engine result; the next piece
-                        // owns the remaining bytes and its decode window
-                        // will handle the complete cell.
+                        // Known limitation (the piece-table line-model item
+                        // in ROADMAP): a piece boundary can split an encoded
+                        // cell (e.g. the halves of a UTF-16 unit), and this
+                        // guard stops the walk there instead of spinning on
+                        // a zero step or decoding a partial cell. For Class
+                        // A the guard never fires (a cell is one byte), so
+                        // single-byte documents are exact; for UTF-16/CJK
+                        // this can end a line segment early - the full fix
+                        // is the engine-aware line model, not this guard.
                         return false;
                     }
                     out.extend_from_slice(&src[i..i + step]);
@@ -1982,7 +1974,7 @@ impl PieceTable {
                 let seg_start = piece.start + local_start;
                 let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
-                scan_cursor_position_bytes(&src[seg_start..seg_end], &mut state);
+                scan_cursor_position_bytes(&src[seg_start..seg_end], &mut state, self.engine);
             });
 
         state.position()
