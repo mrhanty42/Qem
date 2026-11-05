@@ -1291,8 +1291,10 @@ impl Document {
     /// document's encoding-aware text-unit semantics rather
     /// than treating the bytes as if they were UTF-8.
     ///
-    /// Falls back to `mmap_position_for_byte_offset` semantics for
-    /// rope/piece-table backings, where this helper is currently unused.
+    /// Used only for mmap-backed Class B documents; piece-table-backed
+    /// matches resolve through the piece table's engine-aware position
+    /// scan instead, because the mmap snapshot and the open-time line
+    /// offsets go stale on the first edit.
     pub(super) fn position_for_byte_offset_in_class_b(&self, byte_offset: usize) -> TextPosition {
         let bytes = self.mmap_bytes();
         let file_len = self.file_len.min(bytes.len());

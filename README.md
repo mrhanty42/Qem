@@ -10,7 +10,7 @@ It provides mmap-backed reads, incremental line indexing, bounded viewport acces
 
 Qem is currently pre-1.0. The public API is usable, but it may still receive focused changes before the 1.0 stability freeze.
 
-The primary path is UTF-8/ASCII. Explicit native support also exists for UTF-16 LE/BE, common single-byte encodings, Shift_JIS, GB18030, and EUC-KR. Invalid or lossy input is reported through the typed open/save APIs.
+The primary path is UTF-8/ASCII. Explicit native support also exists for UTF-16 LE/BE, common single-byte encodings, Shift_JIS, GB18030, and EUC-KR. Invalid or lossy input is reported through the typed open/save APIs. Saving a non-UTF-8 document larger than 128 MiB is rejected with `DocumentEncodingErrorKind::SaveReopenTooLarge` (the full-materialization budget shared with the rope edit path).
 
 ## What it does
 

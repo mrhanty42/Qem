@@ -4,6 +4,53 @@
 
 ### Fixed
 
+- The engine-aware text-unit walker
+  (`advance_offset_by_text_units_with_engine`) carries the walk at the
+  first unconsumed byte across its 64 KiB chunk edges. The previous
+  chunk carry stepped back one byte at every fully consumed edge, so
+  the boundary byte was counted twice: deleting or replacing a range of
+  64 KiB+ cells on a Class A piece-table document left one stray cell
+  per interior boundary behind, and UTF-16 tails re-decoded from an odd
+  offset, shifting every subsequent cell by one byte. The walker now
+  also refuses to decode a cell from a window that truncates it (CJK
+  engines fall back to a 1-byte step on truncated leads, which used to
+  split the cell across the edge), while a CRLF split across the edge
+  still collapses into one text unit - including when the units run out
+  exactly on the CR half. Four walker tests pin Class A, UTF-16LE, a
+  Shift_JIS split cell, and the CRLF straddle.
+- `find_prev_regex*` on UTF-16 / CJK documents returns the last
+  non-overlapping match again. The reverse decode scan documented
+  keep-last semantics but each window only looked at the first regex
+  hit, so a range within one 8 MiB decode window answered the leftmost
+  match and "find previous" stayed stuck at the document's first
+  occurrence whenever two or more matched. keep_last now walks
+  `find_iter` over the decoded window (overlap-filtered) and records
+  the window's last valid candidate, matching the small-span byte
+  fallback. A two-occurrence UTF-16LE fixture pins it; the single-match
+  pins from the previous wave pass unchanged.
+- Class B regex match positions resolve in the byte space the match was
+  found in. `build_class_b_search_match` mapped match offsets through
+  the original mmap snapshot and the open-time line offsets, but an
+  edited Class B document promotes to the piece table on its first edit
+  while the snapshot stays in place, so every regex position drifted
+  after that first insert or delete (and the "currently unused for
+  piece-table backings" comment beside the mapper falsified what the
+  same series had just wired up). Piece-table-backed matches now go
+  through the piece table's engine-aware position scan - the same model
+  every other piece-table position surface uses - while mmap-backed
+  documents keep the snapshot mapper. The piece-table UTF-16 column
+  model keeps its documented 1.0 line-model caveat.
+- Editlog session open rejects an invalid `page_count` instead of
+  trusting it. The unchecksummed header field fed the committed-size
+  truncation and `next_page_id` directly, while every other raw header
+  counter is bounded by what the sidecar can physically hold: a
+  corrupt-small value truncated pages the history still references
+  (lazy page misses then read short while `total_len` stays full, and
+  the drop-and-rebuild recovery never fired), and a corrupt-huge one
+  wrapped the page-offset arithmetic on the next flush. Open now
+  surfaces either direction as a typed `InvalidData` so the session
+  sidecar is dropped and rebuilt. Both corruption directions are pinned
+  by tests, and the orphan-page truncation test passes unchanged.
 - Class B regex window hardening: the chunked decode scan now actually
   rounds the window start up to the UTF-16 cell grid as its contract
   documents (guards a truncated odd-length file tail), and a

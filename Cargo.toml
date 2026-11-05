@@ -21,6 +21,7 @@ include = [
     "README.md",
     "ROADMAP.md",
     "CHANGELOG.md",
+    "BENCHMARKS.md",
     "LICENSE",
     "LICENSE-APACHE",
     "src/**/*",

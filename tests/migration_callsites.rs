@@ -1,12 +1,18 @@
 //! Integration test guarding the encoding-aware migration.
 //!
-//! All hot byte-level callsites in the document layer have been moved
-//! off the bare free helpers (`utf8_step`, `next_line_start_exact`
-//! `count_text_columns_exact`, `count_text_columns`
-//! `advance_offset_by_text_units_in_bytes`) and onto
-//! `self.encoding_engine.<method>(...)`. This test fails if a future
-//! change reintroduces a direct call to one of those free functions
-//! inside the migrated source files.
+//! The files listed in `MIGRATED_FILES` below have had their hot
+//! byte-level callsites moved off the bare free helpers (`utf8_step`,
+//! `next_line_start_exact` `count_text_columns_exact`,
+//! `count_text_columns` `advance_offset_by_text_units_in_bytes`) and
+//! onto `self.encoding_engine.<method>(...)`. This test fails if a
+//! future change reintroduces a direct call to one of those free
+//! functions inside the migrated files.
+//!
+//! Scope note: `src/document.rs` and `src/piece_tree.rs` are NOT in the
+//! list. They still host legacy free-helper paths (for example the
+//! naive UTF-8-gated `advance_offset_by_text_units`), so adding them
+//! here would fail immediately; migrate those callsites first, then
+//! extend `MIGRATED_FILES`.
 //!
 //! The check is pure text grep: each forbidden symbol must not appear
 //! as a `function_call(` token in the migrated files. We allow comments

@@ -214,6 +214,21 @@ none.
   `advance_position_by_bytes` / `scan_cursor_position_bytes` callers
   must switch from raw-byte line-break detection to cell-aware
   detection for multi-byte-cell documents.
+- **Bounded piece-tree session history (audit 2026-11-06):** the
+  in-memory edit history and its sidecar rewrite are unbounded - every
+  flush re-serializes all history entries and appends fresh history
+  pages, so long editing sessions on huge files pay O(edits²) sidecar
+  writes and monotonically growing flush latency until save/reopen
+  (the rope path caps at 500 entries). A cap or window needs an owner
+  decision because it changes the user-visible undo depth.
+- **Checksums for `.qem.lineidx` pages (audit 2026-11-06):** index
+  pages validate kind/count/child invariants but carry no CRC, so a
+  flipped byte inside a checkpoint value parses fine and yields
+  silently wrong line starts; the editlog pages already CRC-verify.
+  Fix belongs with the next sidecar format bump.
+- **Empty public module `qem::index` (audit 2026-11-06):** the module
+  re-exports nothing (all items are `pub(crate)`), but a `pub mod` is
+  a semver commitment - make it private before the 1.0 freeze.
 - **Small refactors for clarity**, not a rewrite. Split overgrown modules
   into focused units (history, persistence, fragmentation, core data
   structure for `piece_tree`; named lifecycle helpers around inspection,
