@@ -2222,9 +2222,10 @@ impl PieceTable {
     /// Walks `text_units` text-unit cells forward from `start`, counting
     /// each `engine.step` advance as one cell and treating `\r\n` as a
     /// single CRLF cell when the engine reports `0x0D` and `0x0A` as
-    /// 1-byte cells. The piece-tree contents are read into a contiguous
-    /// buffer (from `start` to `total_len`) so the engine's flat-slice
-    /// `step` contract holds.
+    /// 1-byte cells. The piece-tree range is read in bounded 64 KiB
+    /// chunks (plus a small decode-context tail) instead of one
+    /// contiguous buffer, so a replace near the start of a
+    /// multi-gigabyte document never materializes the whole tail.
     ///
     /// Used by the non-UTF-8 edit paths so `try_replace_range` /
     /// `try_delete_range_at_encoded` compute deletion endpoints on
@@ -2241,12 +2242,10 @@ impl PieceTable {
         if text_units == 0 || start >= self.total_len {
             return start;
         }
-        // Walk the piece range in bounded chunks instead of materializing
-        // the whole tail: a replace near the start of a multi-gigabyte
-        // document used to allocate the entire remaining document here.
-        // Each chunk carries one extra byte of context so a CRLF split
-        // across the chunk boundary still collapses into one text unit.
         const CHUNK_BYTES: usize = 64 * 1024;
+        // Wideest cell any engine reports: 4 bytes (UTF-16 supplementary
+        // pair, GB18030 four-byte sequence).
+        const MAX_CELL_BYTES: usize = 4;
         let mut local = 0usize;
         let mut remaining = text_units;
         let mut pending_cr = false;
@@ -2263,8 +2262,19 @@ impl PieceTable {
                 break;
             }
             let bytes_len = bytes.len();
+            let at_doc_end = chunk_end == self.total_len;
             let mut chunk_local = 0usize;
             while chunk_local < bytes_len && (remaining > 0 || pending_cr) {
+                // Never decode a cell from a window that truncates it:
+                // engines fall back to a 1-byte step on truncated
+                // multi-byte leads, which would desync the walk. Cells
+                // are at most MAX_CELL_BYTES wide, so consume only while
+                // the full cell is visible; a cell starting nearer the
+                // edge is decoded by the next chunk, which re-reads from
+                // the unconsumed byte with fresh context.
+                if !at_doc_end && bytes_len - chunk_local < MAX_CELL_BYTES {
+                    break;
+                }
                 let next_step = engine.step(&bytes, chunk_local, bytes_len);
                 if pending_cr {
                     pending_cr = false;
@@ -2288,17 +2298,23 @@ impl PieceTable {
                 remaining -= 1;
             }
             local += chunk_local;
-            if remaining == 0 {
+            if remaining == 0 && !pending_cr {
                 break;
             }
-            if chunk_local + 1 < bytes_len || chunk_end == self.total_len {
-                // The walker stopped mid-chunk (zero step) or reached the
-                // end of the document: no further progress is possible.
+            if chunk_end == self.total_len {
+                // Reached the end of the document: no further progress
+                // is possible.
                 break;
             }
-            // The chunk was consumed to its edge; continue with the next
-            // chunk, re-walking the one context byte already visited.
-            local = local.saturating_sub(1);
+            if chunk_local == 0 {
+                // No cell was consumed and no pending CRLF is resolvable
+                // here; further chunks cannot make progress.
+                break;
+            }
+            // The pending_cr flag (and the first unconsumed byte at
+            // `start + local`) carry into the next chunk: a CRLF split
+            // across the boundary still collapses into one text unit,
+            // and no cell is ever counted on both sides of an edge.
         }
         start.saturating_add(local).min(self.total_len)
     }

@@ -645,6 +645,144 @@ fn piece_table_insert_encoded_bytes_at_appends_raw_bytes_to_add_buffer() {
 }
 
 #[test]
+fn piece_table_advance_text_units_crosses_chunk_boundaries_exactly_class_a() {
+    // The engine-aware text-unit walker reads the piece-tree range in
+    // 64 KiB chunks with one context byte. Advancing across an interior
+    // chunk boundary must never consume the boundary byte twice: each
+    // cell is counted exactly once, so N units from `start` land exactly
+    // N cells forward.
+    let dir = std::env::temp_dir().join(format!(
+        "standpad-doc-advance-class-a-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("advance-class-a.bin");
+    std::fs::write(&path, vec![b'a'; 200_000]).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+    let piece_table = PieceTable::new(storage, vec![200_000], true);
+    let engine = super::encoding_engine::engine_for_encoding(
+        DocumentEncoding::from_label("windows-1251").unwrap(),
+    );
+
+    // 100_000 single-byte cells cross the 65_537-byte first chunk edge.
+    assert_eq!(
+        piece_table.advance_offset_by_text_units_with_engine(0, 100_000, engine),
+        100_000
+    );
+    // ... and ten cells across the boundary land ten cells forward.
+    assert_eq!(
+        piece_table.advance_offset_by_text_units_with_engine(65_530, 10, engine),
+        65_540
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn piece_table_advance_text_units_crosses_chunk_boundaries_exactly_utf16le() {
+    // UTF-16 code units are 2 bytes, so a 65_537-byte chunk always ends
+    // with a lone trailing byte. The walker must carry at the first
+    // unconsumed byte instead of stepping back into the previous cell:
+    // a step-back re-decodes the tail from an odd offset and every
+    // subsequent cell shifts by one byte.
+    let dir =
+        std::env::temp_dir().join(format!("standpad-doc-advance-utf16-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("advance-utf16.bin");
+    // 40_000 hiragana `あ` cells = 80_000 bytes; the first chunk edge at
+    // byte 65_537 splits a code unit.
+    let mut bytes = Vec::with_capacity(80_000);
+    for _ in 0..40_000 {
+        bytes.extend_from_slice(&0x3042u16.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+    let piece_table = PieceTable::new(storage, vec![80_000], true);
+    let engine = super::encoding_engine::engine_for_encoding(DocumentEncoding::utf16le());
+
+    assert_eq!(
+        piece_table.advance_offset_by_text_units_with_engine(0, 40_000, engine),
+        80_000
+    );
+    assert_eq!(
+        piece_table.advance_offset_by_text_units_with_engine(0, 32_769, engine),
+        65_538
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn piece_table_advance_text_units_does_not_split_cjk_cell_at_chunk_edge() {
+    // Shift_JIS `あ` is two bytes (0x82 0xA0). Placing its lead byte on
+    // the last bytes of a chunk means the engine falls back to a 1-byte
+    // step for the truncated sequence; the walker must not let that
+    // fallback split the cell across the chunk boundary.
+    let dir = std::env::temp_dir().join(format!(
+        "standpad-doc-advance-shift-jis-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("advance-shift-jis.bin");
+    let mut bytes = vec![b'a'; 65_536];
+    bytes.extend_from_slice(&[0x82, 0xA0]); // lead byte sits at byte 65_536
+    bytes.push(b'b');
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+    let piece_table = PieceTable::new(storage, vec![bytes.len()], true);
+    let engine = super::encoding_engine::engine_for_encoding(
+        DocumentEncoding::from_label("Shift_JIS").unwrap(),
+    );
+
+    // 65_537 cells = 65_536 `a` cells + the two-byte `あ` cell; the
+    // result must land after the whole cell, not on its lead byte.
+    assert_eq!(
+        piece_table.advance_offset_by_text_units_with_engine(0, 65_537, engine),
+        65_538
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn piece_table_advance_text_units_keeps_collapse_across_chunk_edges() {
+    // The one-byte chunk context exists so a CRLF split across the
+    // boundary still collapses into one cell — both when the LF is
+    // inside the chunk and when the walk runs out of units exactly on
+    // the CR half and the LF lives in the next chunk.
+    let dir =
+        std::env::temp_dir().join(format!("standpad-doc-advance-crlf-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("advance-crlf.bin");
+    let mut bytes = vec![b'a'; 65_536];
+    bytes.extend_from_slice(b"\r\nb");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+    let piece_table = PieceTable::new(storage, vec![bytes.len()], true);
+    let engine = super::encoding_engine::engine_for_encoding(
+        DocumentEncoding::from_label("windows-1251").unwrap(),
+    );
+
+    // Running out of units exactly on the CR half must still land
+    // behind the collapsed LF.
+    assert_eq!(
+        piece_table.advance_offset_by_text_units_with_engine(0, 65_537, engine),
+        65_538
+    );
+    // Same collapse with units to spare.
+    assert_eq!(
+        piece_table.advance_offset_by_text_units_with_engine(0, 65_540, engine),
+        65_539
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn piece_table_line_lengths_for_edit_supports_large_exact_prefix() {
     let dir =
         std::env::temp_dir().join(format!("standpad-doc-large-prefix-{}", std::process::id()));
