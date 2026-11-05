@@ -783,6 +783,43 @@ fn piece_table_advance_text_units_keeps_collapse_across_chunk_edges() {
 }
 
 #[test]
+fn piece_table_read_range_clamps_hostile_piece_bounds() {
+    // Piece bounds come from the sidecar's piece pages. A page whose
+    // CRC still holds but whose piece advertises a length past the real
+    // source must not panic the reader with a slice out of range:
+    // read_range clamps segments to the actual source length (byte_at
+    // already used the defensive `get` form).
+    let dir =
+        std::env::temp_dir().join(format!("standpad-doc-hostile-piece-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("hostile.bin");
+    std::fs::write(&path, b"abcdef\n").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+    let mut piece_table = PieceTable::new(storage, vec![7], true);
+
+    // Simulate a parsed hostile page: the tree's only piece claims 100
+    // bytes from a 7-byte source, with matching root totals.
+    let hostile = Piece {
+        src: PieceSource::Original,
+        start: 0,
+        len: 100,
+        line_breaks: 1,
+    };
+    piece_table.pieces = PieceTree::from_pieces(vec![hostile]);
+    piece_table.total_len = piece_table.pieces.total_len();
+
+    let read = piece_table.read_range(0, piece_table.total_len);
+    assert_eq!(
+        read,
+        b"abcdef\n".to_vec(),
+        "a hostile piece must be clamped to the real source bytes, not panic"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn piece_table_line_lengths_for_edit_supports_large_exact_prefix() {
     let dir =
         std::env::temp_dir().join(format!("standpad-doc-large-prefix-{}", std::process::id()));

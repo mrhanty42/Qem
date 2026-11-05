@@ -1403,8 +1403,11 @@ impl DiskPageStore {
         let bytes = serialize_page(page.as_ref())?;
         debug_assert_eq!(bytes.len(), EDITLOG_PAGE_SIZE);
         file.write_all(&bytes)?;
-        let expected_offset =
-            EDITLOG_HEADER_BYTES as u64 + page_id.saturating_sub(1) * EDITLOG_PAGE_SIZE as u64;
+        let expected_offset = (EDITLOG_HEADER_BYTES as u64).saturating_add(
+            page_id
+                .saturating_sub(1)
+                .saturating_mul(EDITLOG_PAGE_SIZE as u64),
+        );
         let actual_end = file.stream_position()?;
         let actual_offset = actual_end.saturating_sub(EDITLOG_PAGE_SIZE as u64);
         if actual_offset != expected_offset {
@@ -1530,8 +1533,11 @@ impl DiskPageStore {
         file.seek(SeekFrom::End(0))?;
         debug_assert_eq!(bytes.len(), EDITLOG_PAGE_SIZE);
         file.write_all(&bytes)?;
-        let expected_offset =
-            EDITLOG_HEADER_BYTES as u64 + page_id.saturating_sub(1) * EDITLOG_PAGE_SIZE as u64;
+        let expected_offset = (EDITLOG_HEADER_BYTES as u64).saturating_add(
+            page_id
+                .saturating_sub(1)
+                .saturating_mul(EDITLOG_PAGE_SIZE as u64),
+        );
         let actual_end = file.stream_position()?;
         let actual_offset = actual_end.saturating_sub(EDITLOG_PAGE_SIZE as u64);
         if actual_offset != expected_offset {
@@ -1688,7 +1694,11 @@ fn serialize_page(page: &PiecePage) -> io::Result<Vec<u8>> {
 
 fn read_page_from_file(file: &mut File, page_id: u64) -> io::Result<PiecePage> {
     let mut buf = vec![0u8; EDITLOG_PAGE_SIZE];
-    let offset = EDITLOG_HEADER_BYTES as u64 + page_id.saturating_sub(1) * EDITLOG_PAGE_SIZE as u64;
+    let offset = (EDITLOG_HEADER_BYTES as u64).saturating_add(
+        page_id
+            .saturating_sub(1)
+            .saturating_mul(EDITLOG_PAGE_SIZE as u64),
+    );
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(&mut buf)?;
     parse_page(&buf)
@@ -1951,7 +1961,11 @@ fn bounded_page_count(file_len: Option<u64>, page_count: usize) -> usize {
 
 fn read_raw_page_from_file(file: &mut File, page_id: u64) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; EDITLOG_PAGE_SIZE];
-    let offset = EDITLOG_HEADER_BYTES as u64 + page_id.saturating_sub(1) * EDITLOG_PAGE_SIZE as u64;
+    let offset = (EDITLOG_HEADER_BYTES as u64).saturating_add(
+        page_id
+            .saturating_sub(1)
+            .saturating_mul(EDITLOG_PAGE_SIZE as u64),
+    );
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(&mut buf)?;
     validate_page_crc(&buf)?;
@@ -3035,6 +3049,84 @@ mod tests {
             reopened.total_len(),
             7,
             "the refused edit must leave the tree content intact"
+        );
+
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_open_survives_a_corrupt_history_page_id_as_typed_error() {
+        // `history_first_page_id` is another raw unchecksummed header
+        // field. A corrupt-huge value must not overflow the page-offset
+        // arithmetic (debug builds panic on the multiply), it must
+        // surface as a typed IO error like every other corrupt counter.
+        let dir = std::env::temp_dir().join(format!(
+            "qem-piece-tree-corrupt-history-page-id-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef\n").unwrap();
+        let mut tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 7,
+                line_breaks: 1,
+            }],
+        )
+        .unwrap();
+        let mut split = |piece: Piece, left_len: usize| {
+            let left = Piece {
+                src: piece.src,
+                start: piece.start,
+                len: left_len,
+                line_breaks: 0,
+            };
+            let right = Piece {
+                src: piece.src,
+                start: piece.start + left_len,
+                len: piece.len - left_len,
+                line_breaks: piece.line_breaks,
+            };
+            (Some(left), Some(right))
+        };
+        tree.insert(
+            3,
+            Piece {
+                src: PieceSource::Add,
+                start: 10,
+                len: 2,
+                line_breaks: 1,
+            },
+            &mut split,
+        )
+        .unwrap();
+        tree.flush_session(b"ignored-by-test", SessionMeta::default())
+            .unwrap();
+        drop(tree);
+
+        let sidecar = editlog_path(&source);
+        {
+            let mut file = fs::OpenOptions::new().write(true).open(&sidecar).unwrap();
+            file.seek(SeekFrom::Start(48)).unwrap();
+            file.write_all(&u64::MAX.to_le_bytes()).unwrap();
+            file.flush().unwrap();
+        }
+
+        let err = PieceTree::open_disk(&source).unwrap_err();
+        assert!(
+            matches!(err.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof)
+                // Windows maps the out-of-range page-id seek to raw OS
+                // errors instead of UnexpectedEof: 131 =
+                // ERROR_NEGATIVE_SEEK, 38 = ERROR_HANDLE_EOF.
+                || matches!(err.raw_os_error(), Some(38) | Some(131)),
+            "actual kind: {:?}, raw: {:?}",
+            err.kind(),
+            err.raw_os_error()
         );
 
         let _ = fs::remove_file(&sidecar);

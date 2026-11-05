@@ -2088,12 +2088,18 @@ impl PieceTable {
             return Vec::new();
         }
         let end = end.min(self.total_len);
-        let mut out = Vec::with_capacity(end - start);
+        // Piece bounds come from the sidecar's piece pages; a hostile
+        // page whose CRC still holds can advertise start/len past the
+        // real source length, and byte_at's defensive `get` must not
+        // be the only reader that survives it.
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
         self.pieces
             .visit_range(start, end, |piece, local_start, local_end| {
-                let seg_start = piece.start + local_start;
-                let seg_end = piece.start + local_end;
+                let seg_start = piece.start.saturating_add(local_start);
+                let seg_end = seg_start.saturating_add(local_end.saturating_sub(local_start));
                 let src = self.source_bytes(piece.src);
+                let seg_start = seg_start.min(src.len());
+                let seg_end = seg_end.max(seg_start).min(src.len());
                 out.extend_from_slice(&src[seg_start..seg_end]);
             });
         out
