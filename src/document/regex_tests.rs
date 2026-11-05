@@ -190,6 +190,52 @@ fn find_all_regex_iterates_non_overlapping_matches() {
 }
 
 #[test]
+fn find_all_regex_maps_multi_window_shift_jis_matches_without_drift() {
+    // The CJK window slide is an arbitrary byte cut (8 MiB chunk minus
+    // 1 MiB overlap), so a window can open mid-sequence. The first
+    // window of this scan ends at 8 MiB and holds no match, so the scan
+    // slides to [7 MiB, 15 MiB): with the 3-byte `あa` period the slide
+    // point is 7 MiB = 1 (mod 3), i.e. the window provably opens on a
+    // trail byte. The leading fragment decodes to a U+FFFD whose
+    // re-encode length (an 8-byte numeric character reference in
+    // Shift_JIS) has nothing to do with the fragment's source width,
+    // and the match mapped after it used to drift by 7 bytes.
+    let k1 = 2_830_667usize; // MARK byte offset = 3*k1 = 8_492_001 (inside window 2)
+    let k3 = 350_000usize; // tail pushes the file past the second window start
+    let mut content = String::with_capacity(3 * (k1 + k3) + 4);
+    content.push_str(&"あa".repeat(k1));
+    content.push_str("MARK");
+    content.push_str(&"あa".repeat(k3));
+    assert!(content.len() > 3 * (k1 + k3));
+
+    let dir = fresh_test_dir("shift-jis-regex-multi-window");
+    let path = dir.join("source.txt");
+    let (encoded, used, had_errors) = SHIFT_JIS.encode(&content);
+    assert_eq!(used, SHIFT_JIS);
+    assert!(!had_errors, "shift_jis fixture must round-trip cleanly");
+    fs::write(&path, encoded.as_ref()).unwrap();
+
+    let doc =
+        Document::open_with_encoding(&path, DocumentEncoding::from_label("shift_jis").unwrap())
+            .unwrap();
+    wait_until_indexed(&doc);
+
+    // Independent oracle: the decoded document text knows the char
+    // column of the match without touching the regex mapping
+    // (`String::find` yields a UTF-8 byte offset, hence the count()).
+    let mark_byte = content.find("MARK").unwrap();
+    let mark_char_col = content[..mark_byte].chars().count();
+    assert_eq!(mark_char_col, 2 * k1);
+
+    let matches: Vec<_> = doc.find_all_regex("MARK").unwrap().collect();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].start(), TextPosition::new(0, mark_char_col));
+    assert_eq!(matches[0].len_chars(), 4);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn find_all_regex_terminates_on_empty_match_pattern() {
     let doc = doc_with("aaa\n");
     let matches: Vec<_> = doc.find_all_regex(r"a*").unwrap().take(64).collect();

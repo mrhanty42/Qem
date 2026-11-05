@@ -1710,9 +1710,10 @@ fn scan_class_b_regex_candidates(
     // this guards a truncated odd-length file tail. For CJK
     // multibyte the start can be any byte: callers ensure the initial
     // `start_offset` lands on a character boundary by going through
-    // `search_byte_offset_for_position`, and subsequent chunks slide
-    // forward by `chunk_size - overlap` which preserves whatever
-    // alignment the encoding requires.
+    // `search_byte_offset_for_position`, but the fixed-size slide does
+    // NOT preserve character alignment for variable-length encodings,
+    // so each window re-aligns itself on the leading bytes below before
+    // decoding.
     let mut chunk_start = if requires_even_alignment {
         start_offset.saturating_add(start_offset & 1)
     } else {
@@ -1746,6 +1747,47 @@ fn scan_class_b_regex_candidates(
             slice.to_vec()
         } else {
             doc.piece_table_uncapped_range(chunk_start, chunk_end)?
+        };
+
+        // For UTF-16 the even grid keeps every window on a code-unit
+        // cell. For CJK multibyte the slide (chunk_end minus the fixed
+        // overlap) lands on an arbitrary byte, so a window can open
+        // mid-sequence: the leading fragment decodes to a U+FFFD whose
+        // re-encode length has nothing to do with the fragment's source
+        // width (Shift_JIS / EUC-KR emit an 8-byte numeric character
+        // reference for it), and every `class_b_source_bytes_for_decoded_prefix`
+        // mapping after it would drift. Drop leading bytes until a probe
+        // of the window head no longer decodes with a replacement as its
+        // first character: the dropped fragment belongs to the previous
+        // window's tail, which the overlap already covered. Genuinely
+        // corrupt bytes inside the window still decode to U+FFFD and
+        // keep the re-encode mapping approximate (see the ROADMAP
+        // reverse-regex item).
+        let cjk_window_skip = if requires_even_alignment {
+            0usize
+        } else {
+            let probe_end = window.len().min(4);
+            let mut skip = 0usize;
+            while skip < probe_end {
+                let (probe_decoded, _, probe_had_errors) =
+                    encoding.decode(&window[skip..probe_end]);
+                let opens_on_boundary = if probe_had_errors {
+                    !probe_decoded.starts_with('\u{FFFD}')
+                } else {
+                    true
+                };
+                if opens_on_boundary {
+                    break;
+                }
+                skip += 1;
+            }
+            skip
+        };
+        chunk_start = chunk_start.saturating_add(cjk_window_skip);
+        let window = if cjk_window_skip > 0 {
+            window[cjk_window_skip..].to_vec()
+        } else {
+            window
         };
 
         // Decode the window into a Cow<str>. `decode_without_bom_handling`
