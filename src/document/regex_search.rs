@@ -1765,43 +1765,60 @@ fn scan_class_b_regex_candidates(
             decoded_prefix_for_source_byte_count(doc_encoding, &decoded, overlap_source_bytes)
         };
 
-        if let Some(m) = query.text_regex().find(&decoded) {
+        // Forward mode takes the first valid candidate of the window;
+        // `keep_last` mode must scan past it and keep the window's last
+        // non-overlapping candidate, so the recorded match is the
+        // rightmost one in the whole range, mirroring the small-span
+        // byte fallback's `find_iter(..).last()`.
+        let window_matches: Vec<_> = if keep_last {
+            query
+                .text_regex()
+                .find_iter(&decoded)
+                .filter(|m| first_chunk || m.end() > overlap_already_matched_decoded)
+                .collect()
+        } else {
+            query
+                .text_regex()
+                .find(&decoded)
+                .into_iter()
+                .filter(|m| first_chunk || m.end() > overlap_already_matched_decoded)
+                .collect()
+        };
+        for m in window_matches {
             // Skip matches fully inside the previous-chunk overlap on
             // continuation chunks; they were either already returned or
             // will be returned by an earlier window.
-            if first_chunk || m.end() > overlap_already_matched_decoded {
-                // Map the decoded match back to source bytes. A mapping
-                // failure (not currently reachable: `find` offsets are
-                // always char boundaries inside `decoded`) must not abort
-                // the whole scan - in `keep_last` mode that would discard
-                // a match already accumulated on an earlier window - so
-                // fall through to the window slide and keep scanning.
-                let prefix_source_len =
-                    class_b_source_bytes_for_decoded_prefix(doc_encoding, &decoded, m.start());
-                let match_source_len = prefix_source_len.and_then(|_| {
-                    class_b_source_bytes_for_decoded_prefix(
-                        doc_encoding,
-                        &decoded[m.start()..],
-                        m.end() - m.start(),
-                    )
-                });
-                if let (Some(prefix_source_len), Some(match_source_len)) =
-                    (prefix_source_len, match_source_len)
-                {
-                    // Forward mode: a returned candidate is the answer.
-                    // Reverse mode (`keep_last = true`) records it and
-                    // keeps scanning until the range is exhausted.
-                    if let Some(candidate) = map_and_keep_class_b_candidate(
-                        requires_even_alignment,
-                        keep_last,
-                        &mut last_match,
-                        chunk_start,
-                        prefix_source_len,
-                        match_source_len,
-                        &window,
-                    ) {
-                        return Some(candidate);
-                    }
+            // Map the decoded match back to source bytes. A mapping
+            // failure (not currently reachable: match offsets are
+            // always char boundaries inside `decoded`) must not abort
+            // the whole scan - in `keep_last` mode that would discard
+            // a match already accumulated on an earlier window - so
+            // fall through to the window slide and keep scanning.
+            let prefix_source_len =
+                class_b_source_bytes_for_decoded_prefix(doc_encoding, &decoded, m.start());
+            let match_source_len = prefix_source_len.and_then(|_| {
+                class_b_source_bytes_for_decoded_prefix(
+                    doc_encoding,
+                    &decoded[m.start()..],
+                    m.end() - m.start(),
+                )
+            });
+            if let (Some(prefix_source_len), Some(match_source_len)) =
+                (prefix_source_len, match_source_len)
+            {
+                // Forward mode: a returned candidate is the answer.
+                // Reverse mode (`keep_last = true`) records it and
+                // keeps scanning until the range is exhausted.
+                if let Some(candidate) = map_and_keep_class_b_candidate(
+                    requires_even_alignment,
+                    keep_last,
+                    &mut last_match,
+                    chunk_start,
+                    prefix_source_len,
+                    match_source_len,
+                    &window,
+                ) {
+                    return Some(candidate);
                 }
             }
         }

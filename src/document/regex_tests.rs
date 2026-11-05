@@ -1471,6 +1471,36 @@ fn find_prev_regex_finds_cjk_target_in_shift_jis_document() {
 }
 
 #[test]
+fn find_prev_regex_returns_the_last_match_in_utf16le_document() {
+    // `keep_last` must scan the whole range and return the last
+    // non-overlapping match - the semantics the small-span byte
+    // fallback documents - not the first match of the last window that
+    // contains one. Two matches inside one decode window pin this.
+    let dir = fresh_test_dir("utf16le-regex-prev-last");
+    let path = dir.join("source.txt");
+    let text = "first TARGET\nsecond TARGET line\nthird\n";
+    let mut encoded: Vec<u8> = Vec::with_capacity(text.len() * 2);
+    for unit in text.encode_utf16() {
+        encoded.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(&path, &encoded).unwrap();
+
+    let doc = Document::open_with_encoding(&path, DocumentEncoding::utf16le()).unwrap();
+    wait_until_indexed(&doc);
+
+    let m = doc
+        .find_prev_regex("TARGET", TextPosition::new(usize::MAX, usize::MAX))
+        .unwrap()
+        .expect("expected previous TARGET match in UTF-16LE document");
+    // The second occurrence (line 1), not the first.
+    assert_eq!(m.start(), TextPosition::new(1, 7));
+    assert_eq!(m.end(), TextPosition::new(1, 13));
+    assert_eq!(m.len_chars(), 6);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn find_next_regex_match_units_are_engine_aware_on_class_a() {
     let dir = fresh_test_dir("cp1251-regex-units");
     let path = dir.join("source.txt");
