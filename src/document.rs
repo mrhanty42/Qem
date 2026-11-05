@@ -2362,7 +2362,7 @@ impl PieceTable {
             split_piece_with_sources(original, add, piece, left_len, engine)
         };
         self.pieces
-            .insert(pos.min(self.total_len), new_piece, &mut split_piece);
+            .insert(pos.min(self.total_len), new_piece, &mut split_piece)?;
         self.total_len = self.pieces.total_len();
         // Maintain the known-region boundary here, before the session flush
         // can run: the journal must never serialize pieces from a newer
@@ -2392,7 +2392,7 @@ impl PieceTable {
         let mut trim_piece = |piece: Piece, local_start: usize, local_end: usize| {
             trim_piece_with_sources(original, add, piece, local_start, local_end, engine)
         };
-        self.pieces.delete_range(start, len, &mut trim_piece);
+        self.pieces.delete_range(start, len, &mut trim_piece)?;
         self.total_len = self.pieces.total_len();
         if self.full_index {
             self.known_byte_len = self.total_len;

@@ -488,44 +488,73 @@ impl PieceTree {
         self.find_line_start_ref(root, target_break, 0, &mut locate_break)
     }
 
-    pub(crate) fn insert<F>(&mut self, offset: usize, piece: Piece, split_piece: &mut F)
+    pub(crate) fn insert<F>(
+        &mut self,
+        offset: usize,
+        piece: Piece,
+        split_piece: &mut F,
+    ) -> io::Result<()>
     where
         F: FnMut(Piece, usize) -> (Option<Piece>, Option<Piece>),
     {
         if piece.len == 0 {
-            return;
+            return Ok(());
         }
         let offset = offset.min(self.total_len());
         let Some(root) = self.root.take() else {
             self.root = self.build_tree_from_pieces(vec![piece]);
             self.record_history_root();
-            return;
+            return Ok(());
         };
-        let children = self.insert_at(root, offset, piece, split_piece);
-        self.root = self.build_tree_from_child_refs(children);
-        self.record_history_root();
+        match self.insert_at(root, offset, piece, split_piece) {
+            Ok(children) => {
+                self.root = self.build_tree_from_child_refs(children);
+                self.record_history_root();
+                Ok(())
+            }
+            // The edit must not land: an unreadable page means the
+            // children list would silently drop the subtree. Restore
+            // the previous root and surface the failure.
+            Err(err) => {
+                self.root = Some(root);
+                Err(err)
+            }
+        }
     }
 
-    pub(crate) fn delete_range<F>(&mut self, start: usize, len: usize, trim_piece: &mut F)
+    pub(crate) fn delete_range<F>(
+        &mut self,
+        start: usize,
+        len: usize,
+        trim_piece: &mut F,
+    ) -> io::Result<()>
     where
         F: FnMut(Piece, usize, usize) -> (Option<Piece>, Option<Piece>),
     {
         if len == 0 {
-            return;
+            return Ok(());
         }
         let Some(root) = self.root.take() else {
-            return;
+            return Ok(());
         };
         let total = root.total_bytes;
         let start = start.min(total);
         let end = start.saturating_add(len).min(total);
         if start >= end {
             self.root = Some(root);
-            return;
+            return Ok(());
         }
-        let children = self.delete_at(root, start, end, trim_piece);
-        self.root = self.build_tree_from_child_refs(children);
-        self.record_history_root();
+        match self.delete_at(root, start, end, trim_piece) {
+            Ok(children) => {
+                self.root = self.build_tree_from_child_refs(children);
+                self.record_history_root();
+                Ok(())
+            }
+            Err(err) => {
+                self.root = Some(root);
+                Err(err)
+            }
+        }
     }
 
     pub(crate) fn flush_session(&mut self, add_bytes: &[u8], meta: SessionMeta) -> io::Result<()> {
@@ -972,27 +1001,33 @@ impl PieceTree {
         offset: usize,
         piece: Piece,
         split_piece: &mut F,
-    ) -> Vec<ChildRef>
+    ) -> io::Result<Vec<ChildRef>>
     where
         F: FnMut(Piece, usize) -> (Option<Piece>, Option<Piece>),
     {
+        // An unreadable page must fail the edit: splicing an empty
+        // child list here would silently drop the whole subtree from
+        // the document while the caller believes the edit landed.
         let Some(page) = self.page(child.page_id).map(|page| (*page).clone()) else {
-            return Vec::new();
+            return Err(io::Error::other(format!(
+                "piece page {} is unreadable; refusing to edit through the loss",
+                child.page_id
+            )));
         };
         match page {
             PiecePage::Leaf { pieces } => {
                 let mut next = insert_piece_into_leaf(pieces, offset, piece, split_piece);
                 coalesce_adjacent(&mut next);
-                self.leaf_refs_from_pieces(next)
+                Ok(self.leaf_refs_from_pieces(next))
             }
             PiecePage::Internal { children } => {
                 let (index, child_start) = child_index_for_offset(&children, offset);
                 let local_offset = offset.saturating_sub(child_start);
                 let mut next_children = children;
                 let target = next_children[index];
-                let inserted = self.insert_at(target, local_offset, piece, split_piece);
+                let inserted = self.insert_at(target, local_offset, piece, split_piece)?;
                 next_children.splice(index..=index, inserted);
-                self.internal_refs_from_children(next_children)
+                Ok(self.internal_refs_from_children(next_children))
             }
         }
     }
@@ -1003,18 +1038,21 @@ impl PieceTree {
         start: usize,
         end: usize,
         trim_piece: &mut F,
-    ) -> Vec<ChildRef>
+    ) -> io::Result<Vec<ChildRef>>
     where
         F: FnMut(Piece, usize, usize) -> (Option<Piece>, Option<Piece>),
     {
         let Some(page) = self.page(child.page_id).map(|page| (*page).clone()) else {
-            return Vec::new();
+            return Err(io::Error::other(format!(
+                "piece page {} is unreadable; refusing to edit through the loss",
+                child.page_id
+            )));
         };
         match page {
             PiecePage::Leaf { pieces } => {
                 let mut next = delete_range_from_leaf(pieces, start, end, trim_piece);
                 coalesce_adjacent(&mut next);
-                self.leaf_refs_from_pieces(next)
+                Ok(self.leaf_refs_from_pieces(next))
             }
             PiecePage::Internal { children } => {
                 let mut next_children = Vec::with_capacity(children.len());
@@ -1031,11 +1069,11 @@ impl PieceTree {
                             local_start,
                             local_end,
                             trim_piece,
-                        ));
+                        )?);
                     }
                     child_base = child_end;
                 }
-                self.internal_refs_from_children(next_children)
+                Ok(self.internal_refs_from_children(next_children))
             }
         }
     }
@@ -2126,7 +2164,7 @@ fn coalesce_adjacent(pieces: &mut Vec<Piece>) {
 mod tests {
     use super::{
         editlog_path, source_metadata, DiskPageStore, FragmentationStats, Piece, PieceSource,
-        PieceTree, SessionMeta, SourceMetadata,
+        PieceTree, SessionMeta, SourceMetadata, EDITLOG_HEADER_BYTES,
     };
     use std::fs;
     use std::io::{Seek, SeekFrom, Write};
@@ -2172,7 +2210,8 @@ mod tests {
                 line_breaks: 1,
             },
             &mut split,
-        );
+        )
+        .unwrap();
         tree.insert(
             3,
             Piece {
@@ -2182,7 +2221,8 @@ mod tests {
                 line_breaks: 0,
             },
             &mut split,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             collect(&tree),
@@ -2236,7 +2276,7 @@ mod tests {
             (left, right)
         };
 
-        tree.delete_range(2, 6, &mut trim);
+        tree.delete_range(2, 6, &mut trim).unwrap();
 
         assert_eq!(
             collect(&tree),
@@ -2583,7 +2623,8 @@ mod tests {
                 line_breaks: 1,
             },
             &mut split,
-        );
+        )
+        .unwrap();
         tree.flush_session(b"ignored-by-test", SessionMeta::default())
             .unwrap();
         drop(tree);
@@ -2654,7 +2695,8 @@ mod tests {
                 line_breaks: 1,
             },
             &mut split,
-        );
+        )
+        .unwrap();
         tree.flush_session(b"ignored-by-test", SessionMeta::default())
             .unwrap();
         drop(tree);
@@ -2666,16 +2708,18 @@ mod tests {
         }
 
         let mut reopened = PieceTree::open_disk(&source).unwrap();
-        reopened.insert(
-            1,
-            Piece {
-                src: PieceSource::Add,
-                start: 12,
-                len: 1,
-                line_breaks: 0,
-            },
-            &mut split,
-        );
+        reopened
+            .insert(
+                1,
+                Piece {
+                    src: PieceSource::Add,
+                    start: 12,
+                    len: 1,
+                    line_breaks: 0,
+                },
+                &mut split,
+            )
+            .unwrap();
         reopened
             .flush_session(b"ignored-by-test", SessionMeta::default())
             .unwrap();
@@ -2737,7 +2781,8 @@ mod tests {
                 line_breaks: 1,
             },
             &mut split,
-        );
+        )
+        .unwrap();
         tree.flush_session(b"ignored-by-test", SessionMeta::default())
             .unwrap();
         drop(tree);
@@ -2814,7 +2859,8 @@ mod tests {
                 line_breaks: 1,
             },
             &mut split,
-        );
+        )
+        .unwrap();
         tree.flush_session(b"ignored-by-test", SessionMeta::default())
             .unwrap();
         drop(tree);
@@ -2888,7 +2934,8 @@ mod tests {
                 line_breaks: 1,
             },
             &mut split,
-        );
+        )
+        .unwrap();
         tree.flush_session(b"ignored-by-test", SessionMeta::default())
             .unwrap();
         drop(tree);
@@ -2906,6 +2953,88 @@ mod tests {
             err.kind(),
             std::io::ErrorKind::InvalidData,
             "a page_count beyond the sidecar size must reject the session"
+        );
+
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_edit_fails_typed_when_a_piece_page_is_unreadable() {
+        // A lazily-read piece page whose bytes no longer pass the page
+        // CRC must not let a structural edit silently splice the
+        // subtree out: an unreadable page used to answer an empty child
+        // list, the parent recomputed its totals over the survivors,
+        // and the next edit shrank the document while `total_len` still
+        // advertised the full size. The edit must fail as a typed error
+        // so the caller keeps the tree intact.
+        let dir = std::env::temp_dir().join(format!(
+            "qem-piece-tree-unreadable-piece-page-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef\n").unwrap();
+        let mut tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 7,
+                line_breaks: 1,
+            }],
+        )
+        .unwrap();
+        let mut split = |piece: Piece, left_len: usize| {
+            let left = Piece {
+                src: piece.src,
+                start: piece.start,
+                len: left_len,
+                line_breaks: 0,
+            };
+            let right = Piece {
+                src: piece.src,
+                start: piece.start + left_len,
+                len: piece.len - left_len,
+                line_breaks: piece.line_breaks,
+            };
+            (Some(left), Some(right))
+        };
+        tree.flush_session(b"ignored-by-test", SessionMeta::default())
+            .unwrap();
+        drop(tree);
+
+        let sidecar = editlog_path(&source);
+        {
+            // Piece page 1 holds the original pieces; scramble its
+            // payload so the page CRC fails on the next lazy read.
+            let mut file = fs::OpenOptions::new().write(true).open(&sidecar).unwrap();
+            file.seek(SeekFrom::Start((EDITLOG_HEADER_BYTES + 8) as u64))
+                .unwrap();
+            file.write_all(&[0xFFu8; 16]).unwrap();
+            file.flush().unwrap();
+        }
+
+        let mut reopened = PieceTree::open_disk(&source).unwrap();
+        let insert_result = reopened.insert(
+            3,
+            Piece {
+                src: PieceSource::Add,
+                start: 10,
+                len: 2,
+                line_breaks: 1,
+            },
+            &mut split,
+        );
+        assert!(
+            insert_result.is_err(),
+            "editing through an unreadable piece page must fail, not lose the subtree"
+        );
+        assert_eq!(
+            reopened.total_len(),
+            7,
+            "the refused edit must leave the tree content intact"
         );
 
         let _ = fs::remove_file(&sidecar);
