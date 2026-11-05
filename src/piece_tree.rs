@@ -1232,6 +1232,51 @@ impl DiskPageStore {
             decoding_had_errors: (header.flags & EDITLOG_FLAG_DECODING_HAD_ERRORS) != 0,
         };
 
+        // `page_count` is also a raw unchecksummed header field, but
+        // unlike the counters above it drives the committed-size
+        // truncation and `next_page_id`. A corrupt-small value would
+        // truncate pages the history still references (lazy page misses
+        // then read short while `total_len` stays full), and a
+        // corrupt-huge one would wrap the page-offset arithmetic on the
+        // next flush. Either way the session is invalid and must reject
+        // here so the sidecar is dropped and rebuilt, mirroring the
+        // distrust `read_history_entries` applies to its own counters.
+        let file_len = file.metadata()?.len();
+        let page_count = usize::try_from(header.page_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog page_count exceeds the addressable size",
+            )
+        })?;
+        if page_count > bounded_page_count(Some(file_len), usize::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog page_count exceeds what the sidecar can physically hold",
+            ));
+        }
+        let max_referenced_page_id = history
+            .iter()
+            .filter_map(|entry| entry.root.as_ref())
+            .map(|child| child.page_id)
+            .chain((header.history_page_count > 0).then(|| {
+                header
+                    .history_first_page_id
+                    .saturating_add(header.history_page_count - 1)
+            }))
+            .chain((header.add_page_count > 0).then(|| {
+                header
+                    .add_first_page_id
+                    .saturating_add(header.add_page_count - 1)
+            }))
+            .max()
+            .unwrap_or(0);
+        if max_referenced_page_id > page_count as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog page_count is below the pages the history references",
+            ));
+        }
+
         // The header is the commit record: pages appended after the last
         // committed `page_count` are orphans from a crash between the page
         // append and the header rewrite. Page writes go through
@@ -1241,7 +1286,7 @@ impl DiskPageStore {
         // of the session. Truncating to the committed size restores the
         // exact pre-crash append position.
         let committed_len = EDITLOG_HEADER_BYTES as u64
-            + header.page_count.saturating_mul(EDITLOG_PAGE_SIZE as u64);
+            + (page_count as u64).saturating_mul(EDITLOG_PAGE_SIZE as u64);
         if file.metadata()?.len() > committed_len {
             file.set_len(committed_len)?;
         }
@@ -1253,7 +1298,7 @@ impl DiskPageStore {
                 file: Some(file),
                 cache: Mutex::new(PageCache::default()),
                 resident_pages: HashMap::new(),
-                next_page_id: header.page_count,
+                next_page_id: page_count as u64,
                 persistence_failed: false,
             },
             history,
@@ -2714,6 +2759,154 @@ mod tests {
             err.kind(),
             std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
         ));
+
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_open_rejects_page_count_below_referenced_pages() {
+        // `page_count` is a raw unchecksummed header field that drives
+        // the committed-size truncation. A corrupt-small value must not
+        // silently truncate pages the history still references (lazy
+        // page misses then read short while total_len stays full); it
+        // must surface as a typed error so the session sidecar is
+        // dropped and rebuilt instead.
+        let dir = std::env::temp_dir().join(format!(
+            "qem-piece-tree-page-count-small-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef\n").unwrap();
+        let mut tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 7,
+                line_breaks: 1,
+            }],
+        )
+        .unwrap();
+        let mut split = |piece: Piece, left_len: usize| {
+            let left = Piece {
+                src: piece.src,
+                start: piece.start,
+                len: left_len,
+                line_breaks: 0,
+            };
+            let right = Piece {
+                src: piece.src,
+                start: piece.start + left_len,
+                len: piece.len - left_len,
+                line_breaks: piece.line_breaks,
+            };
+            (Some(left), Some(right))
+        };
+        tree.insert(
+            3,
+            Piece {
+                src: PieceSource::Add,
+                start: 10,
+                len: 2,
+                line_breaks: 1,
+            },
+            &mut split,
+        );
+        tree.flush_session(b"ignored-by-test", SessionMeta::default())
+            .unwrap();
+        drop(tree);
+
+        let sidecar = editlog_path(&source);
+        {
+            let mut file = fs::OpenOptions::new().write(true).open(&sidecar).unwrap();
+            file.seek(SeekFrom::Start(16)).unwrap();
+            // Real sessions span several pages (piece page, history page,
+            // add page); 1 is below every referenced page id.
+            file.write_all(&1u64.to_le_bytes()).unwrap();
+            file.flush().unwrap();
+        }
+
+        let err = PieceTree::open_disk(&source).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a page_count below the referenced pages must reject the session"
+        );
+
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_open_rejects_page_count_beyond_the_sidecar_size() {
+        // A corrupt-huge `page_count` must not become `next_page_id` (the
+        // next flush computes page offsets with a non-saturating
+        // multiply) nor extend the sidecar at open. It is an invalid
+        // session, not a truncation hint.
+        let dir = std::env::temp_dir().join(format!(
+            "qem-piece-tree-page-count-huge-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef\n").unwrap();
+        let mut tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 7,
+                line_breaks: 1,
+            }],
+        )
+        .unwrap();
+        let mut split = |piece: Piece, left_len: usize| {
+            let left = Piece {
+                src: piece.src,
+                start: piece.start,
+                len: left_len,
+                line_breaks: 0,
+            };
+            let right = Piece {
+                src: piece.src,
+                start: piece.start + left_len,
+                len: piece.len - left_len,
+                line_breaks: piece.line_breaks,
+            };
+            (Some(left), Some(right))
+        };
+        tree.insert(
+            3,
+            Piece {
+                src: PieceSource::Add,
+                start: 10,
+                len: 2,
+                line_breaks: 1,
+            },
+            &mut split,
+        );
+        tree.flush_session(b"ignored-by-test", SessionMeta::default())
+            .unwrap();
+        drop(tree);
+
+        let sidecar = editlog_path(&source);
+        {
+            let mut file = fs::OpenOptions::new().write(true).open(&sidecar).unwrap();
+            file.seek(SeekFrom::Start(16)).unwrap();
+            file.write_all(&u64::MAX.to_le_bytes()).unwrap();
+            file.flush().unwrap();
+        }
+
+        let err = PieceTree::open_disk(&source).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a page_count beyond the sidecar size must reject the session"
+        );
 
         let _ = fs::remove_file(&sidecar);
         let _ = fs::remove_file(&source);
