@@ -31,6 +31,9 @@ const EDITLOG_PAGE_SIZE: usize = 4096;
 const EDITLOG_HEADER_BYTES: usize = 128;
 const EDITLOG_PAGE_HEADER_BYTES: usize = 24;
 const EDITLOG_CACHE_PAGES: usize = 1024;
+/// Bound on pages kept resident while editlog persistence is down:
+/// each is an Arc'd page that only this map holds (see `alloc_page`).
+const RESIDENT_PAGES_FAILED_PERSISTENCE_CAP: usize = 4096;
 const LEAF_ENTRY_BYTES: usize = 32;
 const INTERNAL_ENTRY_BYTES: usize = 24;
 const HISTORY_ENTRY_BYTES: usize = 32;
@@ -1382,7 +1385,16 @@ impl DiskPageStore {
 
         if write_result.is_err() {
             self.persistence_failed = true;
-            self.resident_pages.insert(page_id, Arc::clone(&page_ref));
+            // While persistence is down every new page lives only in
+            // resident_pages; without a cap a long session after a disk
+            // failure accumulates an Arc'd page per structural edit
+            // forever. Keep a bounded window of them: beyond the cap a
+            // page becomes unreadable, and an edit through an unreadable
+            // page fails as a typed error instead of losing the subtree
+            // (see insert_at / delete_at).
+            if self.resident_pages.len() < RESIDENT_PAGES_FAILED_PERSISTENCE_CAP {
+                self.resident_pages.insert(page_id, Arc::clone(&page_ref));
+            }
         }
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(page_id, page_ref);
