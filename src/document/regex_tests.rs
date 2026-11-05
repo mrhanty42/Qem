@@ -1501,6 +1501,95 @@ fn find_prev_regex_returns_the_last_match_in_utf16le_document() {
 }
 
 #[test]
+fn class_a_regex_positions_follow_edits_on_piece_table_documents() {
+    // Class A regex search resolves positions through the byte-engine
+    // path and never reaches the Class B mapper below, so this test is
+    // a regression guard for that layer (already engine-aware), not the
+    // pin for the Class B piece-table routing - the utf16le test pins
+    // that one.
+    //
+    // After the first edit a non-UTF-8 document promotes to the piece
+    // table, while the original mmap snapshot and the open-time line
+    // offsets stay in place. Positions must follow the post-edit
+    // content; the Class A line model is byte-exact, so the exact
+    // position is asserted.
+    let dir = fresh_test_dir("class-a-regex-edited-positions");
+    let path = dir.join("source.txt");
+    fs::write(&path, b"first\nTARGET line\nthird\n").unwrap();
+
+    let mut doc =
+        Document::open_with_encoding(&path, DocumentEncoding::from_label("windows-1251").unwrap())
+            .unwrap();
+    wait_until_indexed(&doc);
+
+    // Pre-edit sanity: TARGET sits on line 1.
+    let m = doc
+        .find_next_regex("TARGET", TextPosition::new(0, 0))
+        .unwrap()
+        .expect("expected TARGET before the edit");
+    assert_eq!(m.start(), TextPosition::new(1, 0));
+
+    // Insert a leading line: TARGET moves to line 2 and the document
+    // is now backed by the piece table.
+    doc.try_insert_text_at(0, 0, "\n").unwrap();
+    assert!(
+        doc.has_piece_table(),
+        "edit must promote to the piece table"
+    );
+
+    let m = doc
+        .find_next_regex("TARGET", TextPosition::new(0, 0))
+        .unwrap()
+        .expect("expected TARGET after the edit");
+    assert_eq!(m.start(), TextPosition::new(2, 0));
+    assert_eq!(m.end(), TextPosition::new(2, 6));
+    assert_eq!(m.len_chars(), 6);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn utf16le_regex_positions_follow_edits_on_piece_table_documents() {
+    // Same promotion path for a Class B document: the match must move
+    // to the post-edit line. The column index is not pinned - the
+    // piece-table UTF-16 column model carries the 1.0 line-model
+    // caveat shared with cursor scans (ROADMAP).
+    let dir = fresh_test_dir("utf16le-regex-edited-positions");
+    let path = dir.join("source.txt");
+    let text = "first\nTARGET line\nthird\n";
+    let mut encoded: Vec<u8> = Vec::with_capacity(text.len() * 2);
+    for unit in text.encode_utf16() {
+        encoded.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(&path, &encoded).unwrap();
+
+    let mut doc = Document::open_with_encoding(&path, DocumentEncoding::utf16le()).unwrap();
+    wait_until_indexed(&doc);
+
+    let m = doc
+        .find_next_regex("TARGET", TextPosition::new(0, 0))
+        .unwrap()
+        .expect("expected TARGET before the edit");
+    assert_eq!(m.start().line0(), 1);
+
+    doc.try_insert_text_at(0, 0, "\n").unwrap();
+    assert!(
+        doc.has_piece_table(),
+        "edit must promote to the piece table"
+    );
+
+    let m = doc
+        .find_next_regex("TARGET", TextPosition::new(0, 0))
+        .unwrap()
+        .expect("expected TARGET after the edit");
+    assert_eq!(m.start().line0(), 2);
+    assert_eq!(m.end().line0(), 2);
+    assert_eq!(m.len_chars(), 6);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn find_next_regex_match_units_are_engine_aware_on_class_a() {
     let dir = fresh_test_dir("cp1251-regex-units");
     let path = dir.join("source.txt");

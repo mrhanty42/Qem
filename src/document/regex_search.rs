@@ -1970,8 +1970,28 @@ fn build_class_b_search_match(
     match_bytes: &[u8],
     end: Option<TextPosition>,
 ) -> Option<SearchMatch> {
-    let start_pos = doc.position_for_byte_offset_in_class_b(match_start);
-    let end_pos = doc.position_for_byte_offset_in_class_b(match_end);
+    // Resolve positions in the same byte space the match was found in:
+    // edited Class B documents promote to the piece table while the
+    // original mmap snapshot and the open-time line offsets stay in
+    // place, so the snapshot-based mapper would answer with pre-edit
+    // lines and columns.
+    let (start_pos, end_pos) = if let Some(piece_table) = doc.piece_table.as_ref() {
+        let engine = doc.encoding_engine();
+        let start_pos = piece_table.position_for_byte_offset_from(
+            0,
+            TextPosition::new(0, 0),
+            match_start,
+            engine,
+        );
+        let end_pos =
+            piece_table.position_for_byte_offset_from(match_start, start_pos, match_end, engine);
+        (start_pos, end_pos)
+    } else {
+        (
+            doc.position_for_byte_offset_in_class_b(match_start),
+            doc.position_for_byte_offset_in_class_b(match_end),
+        )
+    };
     if let Some(end_bound) = end {
         if end_pos > end_bound {
             return None;
