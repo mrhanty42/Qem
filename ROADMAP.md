@@ -188,14 +188,23 @@ none.
 - **Carry-over design items from the 1.0-track audit (post-0.9.0):**
   make literal search encoding-aware for Class A (encode the needle
   through the document's engine before `memmem`) or return a typed
-  `Unsupported` instead of a silent miss; store the document encoding in
-  the `.qem.editlog` header (format v3) and route
-  `open_with_encoding` through session recovery; unify the
+  `Unsupported` instead of a silent miss - and the same applies
+  verbatim to UTF-16 / CJK documents, where a multi-char needle cannot
+  appear in the interleaved storage bytes at all (wave-7 audit: the
+  literal dispatcher forks by backing only, never by encoding); store
+  the document encoding in the `.qem.editlog` header (format v3) and
+  route `open_with_encoding` through session recovery; unify the
   reverse-regex overlap semantics between the large-span DFA path and
   the small-span forward path (pinned reproduction in
-  `regex_tests.rs`); make the non-Windows snapshot backing cheaper than
-  a full file copy; snapshot `save_async` state through `Arc` instead of
-  cloning the edit buffer on the UI thread.
+  `regex_tests.rs`) - and note that the Class B decode-scan mapping
+  stays approximate for *genuinely corrupt* bytes: a U+FFFD decoded
+  from ill-formed data mid-window re-encodes to an 8-byte numeric
+  character reference in Shift_JIS / EUC-KR, drifting the mapping for
+  matches after it (window starts are re-aligned since the wave-7
+  fix; the in-window corruption case remains); make the non-Windows
+  snapshot backing cheaper than a full file copy; snapshot
+  `save_async` state through `Arc` instead of cloning the edit buffer
+  on the UI thread.
 - **Engine-aware line model for multi-byte-cell piece tables (1.0):**
   the piece-table line model scans raw `0x0A` / `0x0D` bytes, which is
   byte-exact for UTF-8 and Class A but wrong for UTF-16 (a `0x0A` byte

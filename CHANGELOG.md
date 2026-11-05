@@ -4,6 +4,53 @@
 
 ### Fixed
 
+- Class B regex windows that slide into the middle of a CJK character
+  re-align before decoding. The window slide is an arbitrary byte cut
+  (8 MiB chunk minus the fixed 1 MiB overlap), which is exact for
+  UTF-16's even grid but lands mid-sequence for variable-length CJK
+  encodings - with a 3-byte character period every slide point is
+  1 (mod 3). A window opening on a trail byte decodes a leading U+FFFD,
+  and the decoded-to-source mapping re-encodes it to an 8-byte numeric
+  character reference in Shift_JIS / EUC-KR, drifting every match
+  mapped after it by 7 bytes (wrong offsets, positions, and match
+  bytes on any CJK document spanning more than one window). Each CJK
+  window now drops leading bytes until a probe no longer decodes with
+  a replacement as its first character; the dropped fragment belongs
+  to the previous window's tail, which the overlap already covers.
+  A 9.5 MiB Shift_JIS fixture whose only match sits in the provably
+  mid-sequence second window pins the mapping.
+- Structural piece-tree edits refuse to run through an unreadable page.
+  `insert_at` / `delete_at` answered an empty child list when a
+  lazily-read piece page failed to load (any IO hiccup or CRC
+  mismatch), the parent recomputed its totals over the survivors, and
+  the next edit silently shrank the document while `total_len` still
+  advertised the full size - content loss that undo could not restore,
+  since the shrunken root was recorded as history. `PieceTree::insert`
+  / `delete_range` now return `io::Result`, restore the previous root
+  when a page read fails, and the piece-table edit paths thread the
+  error to the caller. A long session after a disk failure degrades
+  into explicit edit failures instead of silent truncation.
+- Hostile sidecar geometry degrades to typed errors instead of panics.
+  The piece-offset arithmetic overflowed on a corrupt-huge page id
+  (debug panic, release wrap) - every offset expression now saturates
+  end to end. `PieceTable::read_range` sliced source bytes at bounds
+  taken verbatim from page payloads, so a page advertising a piece
+  past the real source length panicked the reader; segments are now
+  clamped to the actual source length. Tests pin a corrupt
+  `history_first_page_id` header field and a 100-byte piece over a
+  7-byte source.
+- Pages kept resident while editlog persistence is down are bounded.
+  Once `persistence_failed` was set, `alloc_page` never wrote again
+  but kept inserting every new page into `resident_pages`, and
+  `flush_session` refuses while that map is non-empty - a long session
+  after a disk failure accumulated one page per structural edit for
+  the rest of the session. The map now keeps a bounded 4096-page
+  window.
+- Reverse regex keep-last scans stream their window matches instead of
+  collecting them: a dense pattern over an 8 MiB decoded window used
+  to transiently allocate on the order of the match count on every
+  window slide.
+
 - The engine-aware text-unit walker
   (`advance_offset_by_text_units_with_engine`) carries the walk at the
   first unconsumed byte across its 64 KiB chunk edges. The previous
