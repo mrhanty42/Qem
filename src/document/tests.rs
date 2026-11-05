@@ -1478,6 +1478,53 @@ fn document_compact_piece_table_preserves_recovery_and_clears_recommendation() {
 }
 
 #[test]
+fn document_compaction_refuses_above_the_full_materialization_budget() {
+    // ea6711d capped compaction by the full-materialization budget:
+    // `run_idle_compaction` is advertised as an idle-time helper and
+    // must never abort the process by materializing a multi-gigabyte
+    // document. This pins both halves - the recommender never proposes
+    // above the budget and the executor refuses - without writing
+    // 128 MiB of content (the file tail is an OS-reserved hole).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("over-budget.txt");
+    {
+        let mut file = std::fs::File::create(&path).unwrap();
+        use std::io::Write as _;
+        file.write_all(b"abc\n").unwrap();
+        file.set_len((MAX_ROPE_EDIT_FILE_BYTES + 1) as u64).unwrap();
+    }
+
+    let storage = FileStorage::open(&path).unwrap();
+    let mut piece_table = PieceTable::new(storage, vec![MAX_ROPE_EDIT_FILE_BYTES + 1], true);
+    piece_table.insert_bytes(1, b"X").unwrap();
+    piece_table.insert_bytes(3, b"Y").unwrap();
+
+    // A policy that would happily recommend (and force) compaction on a
+    // small fragmented document.
+    let policy = CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 2,
+        small_piece_threshold_bytes: 1,
+        max_average_piece_bytes: 4,
+        min_fragmentation_ratio: 0.0,
+        forced_piece_count: 3,
+        forced_fragmentation_ratio: 0.0,
+    };
+
+    assert!(
+        piece_table.compaction_recommendation(policy).is_none(),
+        "the recommender must never propose a rewrite above the budget"
+    );
+    assert!(
+        !piece_table.compact_current_state().unwrap(),
+        "the executor must refuse above the budget"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+#[test]
 fn idle_compaction_runs_for_deferred_recommendations() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("idle-deferred.txt");
