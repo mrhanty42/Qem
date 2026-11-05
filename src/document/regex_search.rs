@@ -1811,20 +1811,27 @@ fn scan_class_b_regex_candidates(
         // `keep_last` mode must scan past it and keep the window's last
         // non-overlapping candidate, so the recorded match is the
         // rightmost one in the whole range, mirroring the small-span
-        // byte fallback's `find_iter(..).last()`.
-        let window_matches: Vec<_> = if keep_last {
-            query
-                .text_regex()
-                .find_iter(&decoded)
-                .filter(|m| first_chunk || m.end() > overlap_already_matched_decoded)
-                .collect()
+        // byte fallback's `find_iter(..).last()`. Both arms stream the
+        // iterator: keep_last only needs the running last candidate,
+        // and collecting an 8 MiB window's matches would transiently
+        // allocate on the order of the match count for dense patterns.
+        let overlap_filter =
+            |m: regex::Match<'_>| first_chunk || m.end() > overlap_already_matched_decoded;
+        let window_matches: Box<dyn Iterator<Item = regex::Match<'_>> + '_> = if keep_last {
+            Box::new(
+                query
+                    .text_regex()
+                    .find_iter(&decoded)
+                    .filter(move |m| overlap_filter(*m)),
+            )
         } else {
-            query
-                .text_regex()
-                .find(&decoded)
-                .into_iter()
-                .filter(|m| first_chunk || m.end() > overlap_already_matched_decoded)
-                .collect()
+            Box::new(
+                query
+                    .text_regex()
+                    .find(&decoded)
+                    .into_iter()
+                    .filter(move |m| overlap_filter(*m)),
+            )
         };
         for m in window_matches {
             // Skip matches fully inside the previous-chunk overlap on
