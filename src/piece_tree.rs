@@ -509,20 +509,26 @@ impl PieceTree {
             self.record_history_root();
             return Ok(());
         };
-        match self.insert_at(root, offset, piece, split_piece) {
-            Ok(children) => {
-                self.root = self.build_tree_from_child_refs(children);
-                self.record_history_root();
-                Ok(())
-            }
-            // The edit must not land: an unreadable page means the
-            // children list would silently drop the subtree. Restore
-            // the previous root and surface the failure.
+        let first_new_page = self.store.next_page_id_hint();
+        let children = match self.insert_at(root, offset, piece, split_piece) {
+            Ok(children) => children,
             Err(err) => {
                 self.root = Some(root);
-                Err(err)
+                return Err(err);
             }
+        };
+        // While persistence is down every new page lives only in the
+        // bounded resident window (see `alloc_page`). The edit must not
+        // land through a page that the window refused: reads would
+        // silently skip it and the document would shrink behind
+        // `total_len`.
+        if let Err(err) = self.store.verify_pages_resident_since(first_new_page) {
+            self.root = Some(root);
+            return Err(err);
         }
+        self.root = self.build_tree_from_child_refs(children);
+        self.record_history_root();
+        Ok(())
     }
 
     pub(crate) fn delete_range<F>(
@@ -547,8 +553,13 @@ impl PieceTree {
             self.root = Some(root);
             return Ok(());
         }
+        let first_new_page = self.store.next_page_id_hint();
         match self.delete_at(root, start, end, trim_piece) {
             Ok(children) => {
+                if let Err(err) = self.store.verify_pages_resident_since(first_new_page) {
+                    self.root = Some(root);
+                    return Err(err);
+                }
                 self.root = self.build_tree_from_child_refs(children);
                 self.record_history_root();
                 Ok(())
@@ -1163,6 +1174,41 @@ impl PageStore {
         match self {
             Self::InMemory(store) => store.alloc_page(page, total_bytes, total_line_breaks),
             Self::Disk(store) => store.alloc_page(page, total_bytes, total_line_breaks),
+        }
+    }
+
+    fn next_page_id_hint(&self) -> u64 {
+        match self {
+            Self::InMemory(_) => 0,
+            Self::Disk(store) => store.next_page_id,
+        }
+    }
+
+    /// Verifies that every page allocated since `first_new_page` is
+    /// readable for the rest of the session. While persistence is down
+    /// new pages live only in the bounded resident window, so a page the
+    /// window refused must fail the edit instead of being referenced by
+    /// a root that reads would silently skip.
+    fn verify_pages_resident_since(&self, first_new_page: u64) -> io::Result<()> {
+        match self {
+            Self::InMemory(_) => Ok(()),
+            Self::Disk(store) => {
+                if !store.persistence_failed {
+                    return Ok(());
+                }
+                // Pages allocated by this edit are strictly past
+                // `first_new_page`; the id AT the hint belongs to the
+                // previous edit and may legitimately live on disk.
+                for page_id in (first_new_page + 1)..=store.next_page_id {
+                    if !store.resident_pages.contains_key(&page_id) {
+                        return Err(io::Error::other(format!(
+                            "resident window exhausted while persistence is down: \
+                             piece page {page_id} could not be kept resident"
+                        )));
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -2191,6 +2237,7 @@ mod tests {
     use super::{
         editlog_path, source_metadata, DiskPageStore, FragmentationStats, Piece, PieceSource,
         PieceTree, SessionMeta, SourceMetadata, EDITLOG_HEADER_BYTES,
+        RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
     };
     use std::fs;
     use std::io::{Seek, SeekFrom, Write};
@@ -3141,6 +3188,102 @@ mod tests {
             err.raw_os_error()
         );
 
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_resident_window_refuses_edits_before_losing_pages() {
+        // While persistence is down every new piece page lives only in
+        // the bounded resident window (4096). An edit whose page the
+        // window refused must fail typed instead of landing: otherwise
+        // the recorded root would reference unreadable pages and reads
+        // would silently shorten behind `total_len` once the page cache
+        // (1024) evicted them too.
+        let dir = std::env::temp_dir().join(format!(
+            "qem-piece-tree-resident-window-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef\n").unwrap();
+        let mut tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 7,
+                line_breaks: 1,
+            }],
+        )
+        .unwrap();
+        let mut split = |piece: Piece, left_len: usize| {
+            let left = Piece {
+                src: piece.src,
+                start: piece.start,
+                len: left_len,
+                line_breaks: 0,
+            };
+            let right = Piece {
+                src: piece.src,
+                start: piece.start + left_len,
+                len: piece.len - left_len,
+                line_breaks: piece.line_breaks,
+            };
+            (Some(left), Some(right))
+        };
+        tree.flush_session(b"ignored-by-test", SessionMeta::default())
+            .unwrap();
+        tree.poison_persistence_for_test();
+
+        // Single-byte inserts at the tail; every copy-on-write rebuild
+        // allocates a fresh page, so the refusal must arrive around the
+        // window size instead of never.
+        let mut accepted = 0usize;
+        let mut refused = false;
+        for i in 0..(RESIDENT_PAGES_FAILED_PERSISTENCE_CAP * 2) {
+            let insert_result = tree.insert(
+                7 + accepted,
+                Piece {
+                    src: PieceSource::Add,
+                    start: i,
+                    len: 1,
+                    line_breaks: 0,
+                },
+                &mut split,
+            );
+            match insert_result {
+                Ok(()) => accepted += 1,
+                Err(_) => {
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused, "the resident window must eventually refuse edits");
+        assert!(
+            accepted >= RESIDENT_PAGES_FAILED_PERSISTENCE_CAP - 64,
+            "the window must still give edits room before refusing (accepted {accepted})"
+        );
+        assert_eq!(
+            tree.total_len(),
+            7 + accepted,
+            "the refused edit must not change the tree size"
+        );
+
+        // Reads must stay complete: walking the live root collects every
+        // piece, so a silent unreadable-page skip would shrink the sum
+        // below total_len.
+        let pieces = tree.to_vec();
+        let collected_bytes: usize = pieces.iter().map(|piece| piece.len).sum();
+        assert_eq!(
+            collected_bytes,
+            7 + accepted,
+            "every referenced page must stay readable past the refusal"
+        );
+
+        let sidecar = editlog_path(&source);
         let _ = fs::remove_file(&sidecar);
         let _ = fs::remove_file(&source);
         let _ = fs::remove_dir_all(&dir);
