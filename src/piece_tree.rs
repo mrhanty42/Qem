@@ -1116,8 +1116,17 @@ impl PieceTree {
             .chunks(MAX_LEAF_PIECES)
             .map(|chunk| {
                 let chunk = chunk.to_vec();
-                let total_bytes = chunk.iter().map(|piece| piece.len).sum();
-                let total_line_breaks = chunk.iter().map(|piece| piece.line_breaks).sum();
+                // Hostile CRC-valid pages can carry totals that overflow
+                // a plain sum; saturate so the next edit fails a bounds
+                // check instead of panicking (debug) or wrapping (release).
+                let total_bytes = chunk
+                    .iter()
+                    .map(|piece| piece.len)
+                    .fold(0usize, usize::saturating_add);
+                let total_line_breaks = chunk
+                    .iter()
+                    .map(|piece| piece.line_breaks)
+                    .fold(0usize, usize::saturating_add);
                 self.alloc_page(
                     PiecePage::Leaf { pieces: chunk },
                     total_bytes,
@@ -1136,8 +1145,16 @@ impl PieceTree {
             .chunks(MAX_INTERNAL_CHILDREN)
             .map(|chunk| {
                 let chunk = chunk.to_vec();
-                let total_bytes = chunk.iter().map(|child| child.total_bytes).sum();
-                let total_line_breaks = chunk.iter().map(|child| child.total_line_breaks).sum();
+                // Saturate for hostile page totals, same as the leaf
+                // aggregator above.
+                let total_bytes = chunk
+                    .iter()
+                    .map(|child| child.total_bytes)
+                    .fold(0usize, usize::saturating_add);
+                let total_line_breaks = chunk
+                    .iter()
+                    .map(|child| child.total_line_breaks)
+                    .fold(0usize, usize::saturating_add);
                 self.alloc_page(
                     PiecePage::Internal { children: chunk },
                     total_bytes,
@@ -1805,6 +1822,19 @@ fn parse_page(buf: &[u8]) -> io::Result<PiecePage> {
                     "internal editlog page is overfull",
                 ));
             }
+            // The writer never emits an empty internal page (a root for
+            // an empty document is `None`, and
+            // `build_tree_from_child_refs` allocates only for non-empty
+            // children). A CRC-valid but empty internal page would panic
+            // `child_index_for_offset` consumers on insert and silently
+            // empty the document on delete, so it is invalid by
+            // construction.
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "internal editlog page is empty",
+                ));
+            }
 
             let mut children = Vec::with_capacity(count);
             for _ in 0..count {
@@ -2235,9 +2265,9 @@ fn coalesce_adjacent(pieces: &mut Vec<Piece>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        editlog_path, source_metadata, DiskPageStore, FragmentationStats, Piece, PieceSource,
-        PieceTree, SessionMeta, SourceMetadata, EDITLOG_HEADER_BYTES,
-        RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
+        editlog_path, parse_page, serialize_page, source_metadata, DiskPageStore,
+        FragmentationStats, Piece, PiecePage, PieceSource, PieceTree, SessionMeta, SourceMetadata,
+        EDITLOG_HEADER_BYTES, RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
     };
     use std::fs;
     use std::io::{Seek, SeekFrom, Write};
@@ -3191,6 +3221,19 @@ mod tests {
         let _ = fs::remove_file(&sidecar);
         let _ = fs::remove_file(&source);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_page_rejects_empty_internal_pages_as_invalid() {
+        // The writer never emits an empty internal page; a CRC-valid
+        // forged one would panic the insert path and silently empty the
+        // document on delete, so parse must reject it up front.
+        let page = PiecePage::Internal {
+            children: Vec::new(),
+        };
+        let buf = serialize_page(&page).unwrap();
+        let err = parse_page(&buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
