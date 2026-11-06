@@ -179,6 +179,40 @@ fn find_prev_regex_returns_none_at_document_start() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn find_all_regex_keeps_matches_just_past_a_skipped_window_boundary() {
+    // The window re-alignment drops `skip` leading bytes, and the
+    // overlap threshold must drop them too: the raw window still
+    // contains 1 MiB of overlap, but the window the previous scan
+    // actually covered is 1 MiB - skip. A match ending within the
+    // dropped `skip` bytes past the previous window's end used to be
+    // rejected as "already covered" and lost permanently (skip = 1
+    // with the 3-byte `あa` period: slide = 7 MiB = 1 mod 3).
+    let head_periods = 2_796_202usize; // byte 8_388_608 lands on the period's `a`
+    let tail_periods = 350_000usize;
+    let build = "あa".repeat(head_periods + tail_periods);
+    let mut bytes = SHIFT_JIS.encode(&build).0.into_owned();
+    assert_eq!(bytes[8_388_608], b'a', "fixture phase drifted");
+    bytes[8_388_608] = b'Z'; // the only match; ends 1 byte past window 1's end
+
+    let dir = fresh_test_dir("shift-jis-skip-boundary");
+    let path = dir.join("source.txt");
+    fs::write(&path, bytes).unwrap();
+
+    let doc =
+        Document::open_with_encoding(&path, DocumentEncoding::from_label("shift_jis").unwrap())
+            .unwrap();
+    wait_until_indexed(&doc);
+
+    let matches: Vec<_> = doc.find_all_regex("Z").unwrap().collect();
+    assert_eq!(matches.len(), 1, "the boundary match must survive the skip");
+    let oracle = "あa".repeat(head_periods).chars().count() + 1; // + the `あ` before Z
+    assert_eq!(matches[0].start(), TextPosition::new(0, oracle));
+    assert_eq!(matches[0].len_chars(), 1);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn find_all_regex_iterates_non_overlapping_matches() {
     let doc = doc_with("a1 b22 c333 d4444\n");
     let matches: Vec<_> = doc.find_all_regex(r"\d+").unwrap().collect();

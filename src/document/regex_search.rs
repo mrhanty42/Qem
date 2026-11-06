@@ -1800,10 +1800,16 @@ fn scan_class_b_regex_candidates(
             0
         } else {
             // The leading `REGEX_CHUNK_OVERLAP_BYTES` source bytes were
-            // already part of the previous chunk's window. Translate that
-            // source-byte overlap into a decoded-byte threshold so we can
-            // reject matches that lie entirely inside the overlap region.
-            let overlap_source_bytes = REGEX_CHUNK_OVERLAP_BYTES.min(window.len());
+            // already part of the previous chunk's window — minus the
+            // `cjk_window_skip` bytes this window dropped: the covered
+            // span is the previous window's tail, which shrinks by the
+            // same skip. Translate that source-byte overlap into a
+            // decoded-byte threshold so matches fully inside the overlap
+            // are rejected without also rejecting matches that end
+            // within the dropped fragment.
+            let overlap_source_bytes = REGEX_CHUNK_OVERLAP_BYTES
+                .saturating_sub(cjk_window_skip)
+                .min(window.len());
             decoded_prefix_for_source_byte_count(doc_encoding, &decoded, overlap_source_bytes)
         };
 
