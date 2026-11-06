@@ -452,11 +452,14 @@ impl Document {
                 };
                 (start_col0, end > start, delete_result)
             };
+            if let Some(delete_result) = delete_result {
+                // Surface the refusal before marking dirty: a refused
+                // edit changed nothing, so the document must not report
+                // itself modified (there is no undo entry to back it).
+                delete_result?;
+            }
             if edited {
                 self.mark_dirty();
-            }
-            if let Some(delete_result) = delete_result {
-                delete_result?;
             }
             return Ok((line0, start_col0));
         }
@@ -1128,7 +1131,7 @@ impl Document {
 
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
-            let (start_col0, edited, delete_result) = {
+            let (start_col0, _edited, delete_result) = {
                 let actual_col0 = piece_table.line_len_chars(line0);
                 let start_col0 = col0.min(actual_col0);
                 let start = piece_table.byte_offset_for_col(line0, start_col0);
@@ -1146,11 +1149,12 @@ impl Document {
                 };
                 (start_col0, end > start, delete_result)
             };
-            if edited {
-                self.mark_dirty();
-            }
             if let Some(delete_result) = delete_result {
+                // Surface the refusal before marking dirty: a refused
+                // edit changed nothing, so the document must not report
+                // itself modified (there is no undo entry to back it).
                 delete_result?;
+                self.mark_dirty();
                 return Ok((true, line0, start_col0));
             }
             return Ok((false, line0, start_col0));

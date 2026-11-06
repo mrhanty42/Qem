@@ -2390,7 +2390,13 @@ impl PieceTable {
             split_piece_with_sources(original, add, piece, left_len, engine)
         };
         self.pieces
-            .insert(pos.min(self.total_len), new_piece, &mut split_piece)?;
+            .insert(pos.min(self.total_len), new_piece, &mut split_piece)
+            .inspect_err(|_| {
+                // The tree edit did not land: the add-buffer range the
+                // piece would have referenced must not leak into every
+                // future session flush as unreferenced dead weight.
+                self.add.truncate(add_start);
+            })?;
         self.total_len = self.pieces.total_len();
         // Maintain the known-region boundary here, before the session flush
         // can run: the journal must never serialize pieces from a newer
