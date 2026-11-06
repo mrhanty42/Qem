@@ -815,6 +815,12 @@ fn piece_table_read_range_clamps_hostile_piece_bounds() {
         "a hostile piece must be clamped to the real source bytes, not panic"
     );
 
+    // The same hostile tree reached through the other piece-bound
+    // consumers (cursor mapping, char-index scan, the naive UTF-8
+    // walker) must also clamp instead of panicking.
+    let _ = piece_table.position_for_char_index(50);
+    let _ = piece_table.advance_offset_by_text_units(0, 50);
+
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1591,9 +1591,9 @@ impl PieceTable {
         let mut state = PositionScanState::default();
         self.pieces
             .visit_range(0, target, |piece, local_start, local_end| {
-                let seg_start = piece.start + local_start;
-                let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
+                let (seg_start, seg_end) =
+                    self.clamped_piece_segment(piece, local_start, local_end, src.len());
                 scan_position_bytes(engine, &src[seg_start..seg_end], &mut state);
             });
         state.position()
@@ -1615,9 +1615,9 @@ impl PieceTable {
         let mut state = PositionScanState::new(anchor_position.line0(), anchor_position.col0());
         self.pieces
             .visit_range(anchor_offset, target, |piece, local_start, local_end| {
-                let seg_start = piece.start + local_start;
-                let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
+                let (seg_start, seg_end) =
+                    self.clamped_piece_segment(piece, local_start, local_end, src.len());
                 scan_position_bytes(engine, &src[seg_start..seg_end], &mut state);
             });
         state.position()
@@ -1642,9 +1642,9 @@ impl PieceTable {
 
         self.pieces
             .visit_range_while(start, self.total_len, |piece, local_start, local_end| {
-                let seg_start = piece.start + local_start;
-                let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
+                let (seg_start, seg_end) =
+                    self.clamped_piece_segment(piece, local_start, local_end, src.len());
                 let segment = &src[seg_start..seg_end];
                 if segment.is_empty() {
                     return true;
@@ -1699,9 +1699,9 @@ impl PieceTable {
             0,
             end.min(self.total_len),
             |piece, local_start, local_end| {
-                let seg_start = piece.start + local_start;
-                let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
+                let (seg_start, seg_end) =
+                    self.clamped_piece_segment(piece, local_start, local_end, src.len());
                 let segment = &src[seg_start..seg_end];
                 if segment.is_empty() {
                     return true;

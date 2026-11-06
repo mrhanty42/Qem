@@ -1753,9 +1753,9 @@ impl PieceTable {
                     return false;
                 }
 
-                let seg_start = piece.start + local_start;
-                let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
+                let (seg_start, seg_end) =
+                    self.clamped_piece_segment(piece, local_start, local_end, src.len());
                 let mut i = seg_start;
 
                 while i < seg_end {
@@ -2045,9 +2045,9 @@ impl PieceTable {
                 if state.is_done() {
                     return;
                 }
-                let seg_start = piece.start + local_start;
-                let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
+                let (seg_start, seg_end) =
+                    self.clamped_piece_segment(piece, local_start, local_end, src.len());
                 scan_cursor_position_bytes(&src[seg_start..seg_end], &mut state, self.engine);
             });
 
@@ -2083,6 +2083,30 @@ impl PieceTable {
         )
     }
 
+    /// Returns the clamped source-byte range of the piece segment
+    /// covered by `[local_start, local_end)`.
+    ///
+    /// Piece bounds come from the sidecar's piece pages; a page whose
+    /// CRC still holds can advertise bounds past the real source
+    /// length, so every consumer slices through this clamp instead of
+    /// raw adds and raw slices (the public API must not panic on
+    /// hostile sidecar bytes).
+    pub(crate) fn clamped_piece_segment(
+        &self,
+        piece: Piece,
+        local_start: usize,
+        local_end: usize,
+        src_len: usize,
+    ) -> (usize, usize) {
+        let seg_start = piece.start.saturating_add(local_start).min(src_len);
+        let seg_end = piece
+            .start
+            .saturating_add(local_end)
+            .max(seg_start)
+            .min(src_len);
+        (seg_start, seg_end)
+    }
+
     fn read_range(&self, start: usize, end: usize) -> Vec<u8> {
         if start >= end || start >= self.total_len {
             return Vec::new();
@@ -2095,11 +2119,9 @@ impl PieceTable {
         let mut out = Vec::with_capacity(end.saturating_sub(start));
         self.pieces
             .visit_range(start, end, |piece, local_start, local_end| {
-                let seg_start = piece.start.saturating_add(local_start);
-                let seg_end = seg_start.saturating_add(local_end.saturating_sub(local_start));
                 let src = self.source_bytes(piece.src);
-                let seg_start = seg_start.min(src.len());
-                let seg_end = seg_end.max(seg_start).min(src.len());
+                let (seg_start, seg_end) =
+                    self.clamped_piece_segment(piece, local_start, local_end, src.len());
                 out.extend_from_slice(&src[seg_start..seg_end]);
             });
         out
@@ -2181,9 +2203,9 @@ impl PieceTable {
                 if remaining == 0 && !pending_cr {
                     return;
                 }
-                let seg_start = piece.start + local_start;
-                let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
+                let (seg_start, seg_end) =
+                    self.clamped_piece_segment(piece, local_start, local_end, src.len());
                 let mut i = seg_start;
                 while i < seg_end && (remaining > 0 || pending_cr) {
                     if pending_cr {

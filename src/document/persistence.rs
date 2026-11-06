@@ -33,8 +33,17 @@ impl PieceTableSnapshot {
         let mut done = 0u64;
         for piece in &self.pieces {
             let src = self.source_bytes(piece.src);
-            let mut start = piece.start;
-            let end = piece.start + piece.len;
+            // Piece bounds come from the sidecar's piece pages; a page
+            // whose CRC still holds can advertise bounds past the real
+            // source length. Clamp like PieceTable::read_range does —
+            // the save path must not panic on hostile geometry.
+            let start = piece.start.min(src.len());
+            let end = piece
+                .start
+                .saturating_add(piece.len)
+                .max(start)
+                .min(src.len());
+            let mut start = start;
             while start < end {
                 let chunk_end = start.saturating_add(SAVE_STREAM_CHUNK_BYTES).min(end);
                 out.write_all(&src[start..chunk_end])?;
