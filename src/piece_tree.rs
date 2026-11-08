@@ -3251,11 +3251,18 @@ mod tests {
 
         let err = PieceTree::open_disk(&source).unwrap_err();
         assert!(
-            matches!(err.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof)
-                // Windows maps the out-of-range page-id seek to raw OS
-                // errors instead of UnexpectedEof: 131 =
-                // ERROR_NEGATIVE_SEEK, 38 = ERROR_HANDLE_EOF.
-                || matches!(err.raw_os_error(), Some(38) | Some(131)),
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::UnexpectedEof
+                    // Linux lseek rejects the out-of-range offset with
+                    // EINVAL, which std maps to InvalidInput.
+                    | std::io::ErrorKind::InvalidInput
+            )
+            // Windows maps the out-of-range page-id seek to raw OS
+            // errors instead of UnexpectedEof: 131 =
+            // ERROR_NEGATIVE_SEEK, 38 = ERROR_HANDLE_EOF.
+            || matches!(err.raw_os_error(), Some(38) | Some(131)),
             "actual kind: {:?}, raw: {:?}",
             err.kind(),
             err.raw_os_error()
