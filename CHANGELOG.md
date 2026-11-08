@@ -1,6 +1,72 @@
 # Changelog
 
-## Unreleased (1.0.0)
+## 0.9.0 (2026-11-08)
+
+### Added
+
+- The Qem-native edit buffer replacing `ropey::Rope` (the 0.9.0 rope
+  replacement). It is a B-tree of flat UTF-8 chunks whose internal nodes
+  carry per-child byte, char, and line-break summaries, so char/byte
+  conversion, line lookup, insert, remove, and chunk iteration for
+  streaming search are all O(log N) in the document size. It stores
+  LF-normalized text - the same contract the document layer already
+  enforced on the rope path - and takes over the small-file and
+  untitled-document paths with unchanged public behavior. `ropey` is
+  removed from `Cargo.toml`.
+- A proptest parity suite drives the new buffer against a plain `String`
+  oracle, re-checking every indexed accessor after each randomized
+  insert/remove step; the saved regression case covers a last-child
+  splice bug the suite caught before any unit test reached it.
+
+- A documented threading model in the crate root: `FileStorage` is
+  `Send + Sync`, while `Document`, `DocumentSession`, and `EditorTab` are
+  `Send` single-thread-owner types - movable between threads but not
+  shareable across threads, because their preserve-save error cache and
+  background-job receivers carry no internal locking. Background open,
+  save, and indexing work stays on Qem-owned worker threads and reports
+  through the polling APIs. The auto-trait bounds are pinned by a
+  compile-time test so a change to them cannot land silently.
+
+- Undo/redo history for the rope edit buffer. Small UTF-8 documents (below
+  the piece-table size gate) and untitled documents edit through the rope
+  buffer and previously reported "nothing to undo" even right after edits;
+  they now keep a bounded in-memory history (500 operations) covering
+  insert, delete, backspace, delete-forward, and replace, with composite
+  replaces undoing in a single step. The history survives same-encoding
+  saves and is reset on reopen and on piece-table-to-rope promotion.
+- `Document::try_undo_with_cursor` / `try_redo_with_cursor` returning a
+  typed `UndoResult` that carries the restored caret position. The
+  piece-tree snapshot path reports `cursor: None` (its snapshots carry no
+  caret); rope history returns the position the edit started from.
+- `DocumentSession::try_undo` / `try_redo` and `EditorTab::try_undo` /
+  `try_redo`: guarded undo entry points that refuse while a background
+  open/save is in flight instead of mutating the document through the
+  `document_mut()` escape hatch underneath a running job.
+- Mouse text selection in the egui demo editor: drag with the left button,
+  Shift+click and Shift+arrow keys extend the selection, Escape collapses
+  it, and Ctrl+C / Ctrl+X / Delete / Backspace / typing operate on the
+  selection (falling back to the current search match when there is no
+  selection). The selection renders as a highlight under the text and its
+  geometry stays in integer line space, so it works at any depth of a
+  huge file.
+- Editing at any line of a huge storage-backed document. When an edit
+  targets a line beyond every in-memory anchor, the piece table extends its
+  annotated region from the on-disk line index: checkpoint-aligned pieces
+  carry exact per-piece line-break counts, so the piece tree can navigate
+  to the edit point without materializing per-line lengths for the span
+  (a line-132,213,510 insert into the 50 GiB bench file completes in well
+  under a second). The annotated region grows monotonically, edits in
+  several distant regions coexist, reads outside it keep using the disk
+  index, and annotated pieces persist through the session journal and
+  streaming saves. Documents that can still be promoted to a rope keep the
+  promotion fallback.
+- The piece-table edit window is budget-based instead of a fixed
+  4,000,000-line cap: the materialized line-length table is bounded by a
+  128 MiB byte budget (16,777,216 rows on 64-bit targets), and
+  storage-backed documents whose whole line table fits the budget get a
+  fully indexed edit buffer, making every line editable (a
+  7,043,298-line 1 GiB log file used to refuse edits past line
+  4,000,000).
 
 ### Fixed
 
@@ -218,180 +284,6 @@
   now computed once per edit generation; a regression test tracks it
   across successive edits on a big5 document.
 
-### Changed
-
-- README documents `tmp-auto` as the explicit marker for the default
-  scratch policy: the flag itself has no code hook, the automatic
-  writable-location fallback already applies when none of the other
-  `tmp-*` features (and no `QEM_TMP_POLICY` override) are set.
-- Piece-table documents now carry their encoding engine: column
-  arithmetic (`line_len_chars`, `byte_offset_for_col`), line-segment
-  decoding, and `read_text` from line/col positions all go through the
-  document's engine instead of UTF-8 stepping and UTF-8 lossy decoding.
-  Before this, a windows-1251 (or any Class A) document edited into a
-  piece table rendered every viewport line as U+FFFD garbage after the
-  first edit. Regression tests cover the cp1251 viewport/edit path end
-  to end, including the UTF-8 "collision pair" case where two adjacent
-  cp1251 bytes form a valid UTF-8 sequence and the old column scan
-  silently swallowed one. Search and `position_for_char_index` on
-  Class A piece tables are engine-aware too (`advance_position_by_bytes`
-  and the cursor scan now take the document's engine); line-indexed
-  reads for multi-byte-cell documents (UTF-16/CJK) remain a documented
-  1.0 item - see the line-model entry in ROADMAP.
-- `advance_offset_by_text_units_with_engine` no longer materializes the
-  document tail: the engine-aware walker reads bounded 64 KiB chunks
-  with one byte of CRLF context, so a replace near the start of a
-  multi-gigabyte non-UTF-8 document no longer allocates the entire
-  remaining document per edit.
-- Composite edits (replace = delete + insert inside one edit batch) no
-  longer corrupt the known-region boundary history: the batch-aware
-  `set_known_boundary` writes to the pending history slot and the
-  deferred root commit picks it up, so undoing a composite replace on a
-  partial-window document restores the pre-batch boundary instead of
-  the post-batch one. The regression test fails against the old
-  behavior (verified: 199945 vs 200000) and passes with the fix.
-- The `.qem.editlog` open path truncates orphan pages past the committed
-  header size. A crash between the page append and the header rewrite
-  used to leave unreachable bytes at the tail of the sidecar; page
-  writes append at end-of-file and verify the offset against the page
-  id, so the first edit after reopening poisoned every later flush into
-  `persistence_failed` and the session silently stopped persisting for
-  the rest of its life. The header is the commit record, so open now
-  restores the exact pre-crash append position; a regression test
-  simulates the interrupted flush end to end.
-- Piece-table undo/redo restores the known-region boundary for partial
-  windows, not only for full-index documents. Every history entry now
-  carries the `(known_byte_len, full_index)` pair that belonged to the
-  state it represents; undoing a delete inside a partial window used to
-  clamp the boundary down and truncate reads of the last known lines
-  until the next edit. The regression test fails against the old
-  min-clamp behavior and passes with the history restore.
-- Line-offset scanning pairs a CRLF whose CR sits exactly on the
-  1 GiB scan-budget edge with its LF: the lookahead is bounded by the
-  buffer length instead of the budget, so the pair is no longer
-  miscounted as a lone CR plus a line.
-- `align_byte_offset` no longer returns mid-character offsets for
-  rope-backed UTF-8 documents. The alignment window snapped its base
-  outward onto a char boundary while the caller rebased its answer on
-  the *requested* offset, shifting every result by the snap delta; the
-  backward direction could land on a continuation byte. The window now
-  reports its actual base and both call sites rebase on it. A unit test
-  pins the boundary property on a multi-byte rope fixture.
-- Piece-table compaction is capped by the full-materialization budget
-  (128 MiB, like the rope path). Compaction copies the whole document
-  into the edit buffer, so `run_idle_compaction` - which the crate docs
-  advertise as an idle-time helper - used to attempt a full-document
-  allocation on partial-window huge documents and could abort the
-  process. The recommendation path never proposes a rewrite the
-  executor would refuse, and `compact_piece_table` documents the
-  refusal.
-- The save skip paths (nothing to write: the document is already saved
-  and byte-identical at the target) now clear the retained background
-  issue like every other successful save completion, matching the
-  crate-docs contract instead of silently keeping a stale problem.
-- The `large_file` demo binary no longer allocates a console window in
-  release builds, matching the main demo (the 0.9.0 changelog claim now
-  holds for both binaries).
-
-### Changed
-
-- Removed the stale module-level `#![allow(dead_code)]` from the
-  alignment and encoding-engine modules: every item under them is
-  reachable again, so the blanket waivers are gone.
-- The no-editor build (`--no-default-features`) is warning-clean. The
-  session-driven pieces of the save/rebase machinery (the discarded-save
-  rebase chain, its saved-source span helpers, the disk-history rebuild
-  hook, and the already-saved fast path) are now explicitly
-  `editor`-feature-gated, the dead `snapshot_add_len` field is removed,
-  and CI runs clippy with `-D warnings` on the no-editor configuration
-  so this class of drift cannot land silently.
-- Documentation swept against the code: auto-detect recognizes the
-  UTF-8 BOM (not only UTF-16), the Class A CRLF line-offset comment now
-  describes the actual skip/push split, `EditorTab::generation` documents
-  that successful saves also move it, `EditorTab::open_file` #Errors
-  covers the load-in-progress rejection, the literal-search crate-doc
-  sentence acknowledges the coexisting regex API, the Class B alignment
-  doc block is attached to `align_class_b` instead of the UTF-8 window
-  walker, BENCHMARKS.md names the real
-  `session_layer_maintenance_status` group and the
-  `small_document_open` / session-layer families and notes that
-  `--seed-edit` inserts its text verbatim, and CI gained a
-  `cargo check --workspace --all-targets` gate next to the README's
-  quality-check list.
-- The reverse-regex rightmost-match semantics are documented as a known
-  inconsistency with the small-span forward path for self-overlapping
-  patterns, with a pinned reproduction behind `#[ignore]` until the
-  semantics are unified.
-
-## Unreleased (0.9.0)
-
-### Added
-
-- The Qem-native edit buffer replacing `ropey::Rope` (the 0.9.0 rope
-  replacement). It is a B-tree of flat UTF-8 chunks whose internal nodes
-  carry per-child byte, char, and line-break summaries, so char/byte
-  conversion, line lookup, insert, remove, and chunk iteration for
-  streaming search are all O(log N) in the document size. It stores
-  LF-normalized text - the same contract the document layer already
-  enforced on the rope path - and takes over the small-file and
-  untitled-document paths with unchanged public behavior. `ropey` is
-  removed from `Cargo.toml`.
-- A proptest parity suite drives the new buffer against a plain `String`
-  oracle, re-checking every indexed accessor after each randomized
-  insert/remove step; the saved regression case covers a last-child
-  splice bug the suite caught before any unit test reached it.
-
-- A documented threading model in the crate root: `FileStorage` is
-  `Send + Sync`, while `Document`, `DocumentSession`, and `EditorTab` are
-  `Send` single-thread-owner types - movable between threads but not
-  shareable across threads, because their preserve-save error cache and
-  background-job receivers carry no internal locking. Background open,
-  save, and indexing work stays on Qem-owned worker threads and reports
-  through the polling APIs. The auto-trait bounds are pinned by a
-  compile-time test so a change to them cannot land silently.
-
-- Undo/redo history for the rope edit buffer. Small UTF-8 documents (below
-  the piece-table size gate) and untitled documents edit through the rope
-  buffer and previously reported "nothing to undo" even right after edits;
-  they now keep a bounded in-memory history (500 operations) covering
-  insert, delete, backspace, delete-forward, and replace, with composite
-  replaces undoing in a single step. The history survives same-encoding
-  saves and is reset on reopen and on piece-table-to-rope promotion.
-- `Document::try_undo_with_cursor` / `try_redo_with_cursor` returning a
-  typed `UndoResult` that carries the restored caret position. The
-  piece-tree snapshot path reports `cursor: None` (its snapshots carry no
-  caret); rope history returns the position the edit started from.
-- `DocumentSession::try_undo` / `try_redo` and `EditorTab::try_undo` /
-  `try_redo`: guarded undo entry points that refuse while a background
-  open/save is in flight instead of mutating the document through the
-  `document_mut()` escape hatch underneath a running job.
-- Mouse text selection in the egui demo editor: drag with the left button,
-  Shift+click and Shift+arrow keys extend the selection, Escape collapses
-  it, and Ctrl+C / Ctrl+X / Delete / Backspace / typing operate on the
-  selection (falling back to the current search match when there is no
-  selection). The selection renders as a highlight under the text and its
-  geometry stays in integer line space, so it works at any depth of a
-  huge file.
-- Editing at any line of a huge storage-backed document. When an edit
-  targets a line beyond every in-memory anchor, the piece table extends its
-  annotated region from the on-disk line index: checkpoint-aligned pieces
-  carry exact per-piece line-break counts, so the piece tree can navigate
-  to the edit point without materializing per-line lengths for the span
-  (a line-132,213,510 insert into the 50 GiB bench file completes in well
-  under a second). The annotated region grows monotonically, edits in
-  several distant regions coexist, reads outside it keep using the disk
-  index, and annotated pieces persist through the session journal and
-  streaming saves. Documents that can still be promoted to a rope keep the
-  promotion fallback.
-- The piece-table edit window is budget-based instead of a fixed
-  4,000,000-line cap: the materialized line-length table is bounded by a
-  128 MiB byte budget (16,777,216 rows on 64-bit targets), and
-  storage-backed documents whose whole line table fits the budget get a
-  fully indexed edit buffer, making every line editable (a
-  7,043,298-line 1 GiB log file used to refuse edits past line
-  4,000,000).
-
-### Fixed
 
 - Rope undo/redo history no longer produces a phantom redo at the
   history cap: after the 501st consecutive edit the just-applied entry
@@ -496,6 +388,80 @@
   scroll range survives the edit.
 
 ### Changed
+
+- README documents `tmp-auto` as the explicit marker for the default
+  scratch policy: the flag itself has no code hook, the automatic
+  writable-location fallback already applies when none of the other
+  `tmp-*` features (and no `QEM_TMP_POLICY` override) are set.
+- Piece-table documents now carry their encoding engine: column
+  arithmetic (`line_len_chars`, `byte_offset_for_col`), line-segment
+  decoding, and `read_text` from line/col positions all go through the
+  document's engine instead of UTF-8 stepping and UTF-8 lossy decoding.
+  Before this, a windows-1251 (or any Class A) document edited into a
+  piece table rendered every viewport line as U+FFFD garbage after the
+  first edit. Regression tests cover the cp1251 viewport/edit path end
+  to end, including the UTF-8 "collision pair" case where two adjacent
+  cp1251 bytes form a valid UTF-8 sequence and the old column scan
+  silently swallowed one. Search and `position_for_char_index` on
+  Class A piece tables are engine-aware too (`advance_position_by_bytes`
+  and the cursor scan now take the document's engine); line-indexed
+  reads for multi-byte-cell documents (UTF-16/CJK) remain a documented
+  1.0 item - see the line-model entry in ROADMAP.
+- `advance_offset_by_text_units_with_engine` no longer materializes the
+  document tail: the engine-aware walker reads bounded 64 KiB chunks
+  with one byte of CRLF context, so a replace near the start of a
+  multi-gigabyte non-UTF-8 document no longer allocates the entire
+  remaining document per edit.
+- Composite edits (replace = delete + insert inside one edit batch) no
+  longer corrupt the known-region boundary history: the batch-aware
+  `set_known_boundary` writes to the pending history slot and the
+  deferred root commit picks it up, so undoing a composite replace on a
+  partial-window document restores the pre-batch boundary instead of
+  the post-batch one. The regression test fails against the old
+  behavior (verified: 199945 vs 200000) and passes with the fix.
+- The `.qem.editlog` open path truncates orphan pages past the committed
+  header size. A crash between the page append and the header rewrite
+  used to leave unreachable bytes at the tail of the sidecar; page
+  writes append at end-of-file and verify the offset against the page
+  id, so the first edit after reopening poisoned every later flush into
+  `persistence_failed` and the session silently stopped persisting for
+  the rest of its life. The header is the commit record, so open now
+  restores the exact pre-crash append position; a regression test
+  simulates the interrupted flush end to end.
+- Piece-table undo/redo restores the known-region boundary for partial
+  windows, not only for full-index documents. Every history entry now
+  carries the `(known_byte_len, full_index)` pair that belonged to the
+  state it represents; undoing a delete inside a partial window used to
+  clamp the boundary down and truncate reads of the last known lines
+  until the next edit. The regression test fails against the old
+  min-clamp behavior and passes with the history restore.
+- Line-offset scanning pairs a CRLF whose CR sits exactly on the
+  1 GiB scan-budget edge with its LF: the lookahead is bounded by the
+  buffer length instead of the budget, so the pair is no longer
+  miscounted as a lone CR plus a line.
+- `align_byte_offset` no longer returns mid-character offsets for
+  rope-backed UTF-8 documents. The alignment window snapped its base
+  outward onto a char boundary while the caller rebased its answer on
+  the *requested* offset, shifting every result by the snap delta; the
+  backward direction could land on a continuation byte. The window now
+  reports its actual base and both call sites rebase on it. A unit test
+  pins the boundary property on a multi-byte rope fixture.
+- Piece-table compaction is capped by the full-materialization budget
+  (128 MiB, like the rope path). Compaction copies the whole document
+  into the edit buffer, so `run_idle_compaction` - which the crate docs
+  advertise as an idle-time helper - used to attempt a full-document
+  allocation on partial-window huge documents and could abort the
+  process. The recommendation path never proposes a rewrite the
+  executor would refuse, and `compact_piece_table` documents the
+  refusal.
+- The save skip paths (nothing to write: the document is already saved
+  and byte-identical at the target) now clear the retained background
+  issue like every other successful save completion, matching the
+  crate-docs contract instead of silently keeping a stale problem.
+- The `large_file` demo binary no longer allocates a console window in
+  release builds, matching the main demo (the 0.9.0 changelog claim now
+  holds for both binaries).
+
 
 - The `small_document_open` benchmark's raw-load baseline is now the
   Qem-native edit buffer bulk loader (through the hidden test-support

@@ -25,7 +25,7 @@ the rope dependency with our own structure, then freeze the public API at
 
 ## Current Release Line
 
-Current target: `0.9.0` (in progress, unreleased)
+Current target: `1.0.0` (0.9.0 shipped 2026-11-08)
 
 ## 0.8.0
 

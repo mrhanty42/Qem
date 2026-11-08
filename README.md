@@ -30,14 +30,14 @@ Qem deliberately does **not** provide a text widget or GUI toolkit integration. 
 
 ```toml
 [dependencies]
-qem = "0.8.1"
+qem = "0.9.0"
 ```
 
 The default features include the editor/session layer and automatic temporary-directory selection. For the lower-level document engine only:
 
 ```toml
 [dependencies]
-qem = { version = "0.8.1", default-features = false }
+qem = { version = "0.9.0", default-features = false }
 ```
 
 ### Features
