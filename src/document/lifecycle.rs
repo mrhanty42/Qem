@@ -123,6 +123,20 @@ fn is_cjk(encoding: DocumentEncoding) -> bool {
     matches!(encoding.name(), "Shift_JIS" | "gb18030" | "EUC-KR")
 }
 
+/// Returns `true` when reopening this encoding through
+/// `from_storage_with_encoding` materializes the whole document into a
+/// UTF-8 rope — the only reopen shape the save/reopen size budget
+/// protects. Class A (single-byte engines) and Class B (UTF-16/CJK)
+/// reopen natively over mmap + the disk index and never touch the
+/// budget; plain UTF-8 reopens on the mmap fast path. Keep this in sync
+/// with the routing in `from_storage_with_encoding`: if a new native
+/// branch lands there, its encodings must be excluded here too.
+pub(super) fn reopens_via_rope_decode(encoding: DocumentEncoding) -> bool {
+    !encoding.is_utf8()
+        && !encoding_engine::SingleByteEngine::supports(encoding)
+        && !(is_utf16(encoding) || is_cjk(encoding))
+}
+
 /// Classifies the line ending style preceding `next_line_start` for a
 /// Class B document, returning `None` if the cell immediately before
 /// `next` cannot be inspected (e.g. the file ends with a CR that the

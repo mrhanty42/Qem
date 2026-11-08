@@ -500,7 +500,11 @@ fn session_and_tab_save_conversion_preflight_reports_success_and_failures() {
 }
 
 #[test]
-fn session_and_tab_large_non_utf8_save_preflight_report_reopen_limit() {
+fn session_and_tab_large_non_utf8_save_preflight_allows_native_reopen() {
+    // Update of `session_and_tab_large_non_utf8_save_preflight_report_reopen_limit`:
+    // the session/tab preflight used to report `SaveReopenTooLarge` for a
+    // windows-1251 document beyond 128 MiB; Class A reopens natively (no
+    // rope materialization), so the preflight now allows it at any size.
     let dir = std::env::temp_dir().join(format!(
         "qem-editor-large-save-preflight-{}",
         std::process::id()
@@ -518,24 +522,14 @@ fn session_and_tab_large_non_utf8_save_preflight_report_reopen_limit() {
     let mut session = DocumentSession::new();
     session.open_file(path.clone()).unwrap();
     let _ = session.try_insert(TextPosition::new(0, 0), "X").unwrap();
-    assert_eq!(
-        session.save_error_for_encoding(encoding),
-        Some(DocumentEncodingErrorKind::SaveReopenTooLarge {
-            max_bytes: 128 * 1024 * 1024,
-        })
-    );
-    assert!(!session.can_save_with_encoding(encoding));
+    assert_eq!(session.save_error_for_encoding(encoding), None);
+    assert!(session.can_save_with_encoding(encoding));
 
     let mut tab = EditorTab::new(701);
     tab.open_file(path.clone()).unwrap();
     let _ = tab.try_insert(TextPosition::new(0, 0), "X").unwrap();
-    assert_eq!(
-        tab.save_error_for_encoding(encoding),
-        Some(DocumentEncodingErrorKind::SaveReopenTooLarge {
-            max_bytes: 128 * 1024 * 1024,
-        })
-    );
-    assert!(!tab.can_save_with_encoding(encoding));
+    assert_eq!(tab.save_error_for_encoding(encoding), None);
+    assert!(tab.can_save_with_encoding(encoding));
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);

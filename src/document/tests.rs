@@ -422,6 +422,19 @@ fn render_with_line_ending(text: &str, line_ending: LineEnding) -> String {
     }
 }
 
+/// Directory for tests that write multi-megabyte fixtures: prefers the
+/// `QEM_TEST_TMP` override and falls back to `D:\qem_test_tmp` (the
+/// developer machine keeps large fixtures on the HDD D: drive; the
+/// system temp dir on C: may not have room for a 200 MiB sparse file).
+fn large_fixture_dir(name: &str) -> std::path::PathBuf {
+    let base = std::env::var("QEM_TEST_TMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(r"D:\qem_test_tmp"));
+    let dir = base.join(format!("{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("large fixture dir must be creatable");
+    dir
+}
+
 fn write_disk_backed_fixture(path: &Path) {
     let mut file = std::fs::File::create(path).unwrap();
     let chunk = b"abc\ndef\n".repeat(1024);
@@ -865,6 +878,135 @@ fn piece_table_coalesce_survives_hostile_piece_totals() {
         b"Xabcdef\n".to_vec(),
         "the hostile piece must be clamped away, not panic the merge"
     );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn large_non_utf8_document_saves_and_reopens_beyond_the_rope_budget() {
+    // The save/reopen size budget (128 MiB) protects only the reopen
+    // paths that materialize the whole document into a UTF-8 rope.
+    // Class A (single-byte engines) and Class B (UTF-16/CJK) documents
+    // reopen natively over mmap + the disk index — no rope anywhere —
+    // so a 200 MiB windows-1251 document must save and reopen instead
+    // of failing with SaveReopenTooLarge. The fixture is a sparse file:
+    // the 200 MiB tail is an OS-reserved hole, so the test writes a few
+    // bytes.
+    let dir = large_fixture_dir("standpad-doc-large-1251-save");
+    let path = dir.join("large-1251.bin");
+    {
+        let mut file = std::fs::File::create(&path).unwrap();
+        use std::io::Write as _;
+        let (encoded, used, had_errors) = WINDOWS_1251.encode("привет\nмир\n");
+        assert_eq!(used, WINDOWS_1251);
+        assert!(!had_errors);
+        file.write_all(encoded.as_ref()).unwrap();
+        file.set_len(200 * 1024 * 1024).unwrap();
+    }
+
+    let encoding = DocumentEncoding::from_encoding_rs(WINDOWS_1251);
+    let mut doc = Document::open_with_encoding(&path, encoding).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while doc.is_indexing() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!doc.is_indexing(), "indexing must finish on a sparse file");
+
+    // Preflight and the actual save must both succeed beyond the old
+    // rope budget.
+    assert_eq!(
+        doc.save_error_for_encoding(encoding),
+        None,
+        "a 200 MiB windows-1251 document must pass the save preflight"
+    );
+    let _ = doc.try_insert_text_at(0, 0, "X").unwrap();
+    let save_path = dir.join("large-1251-saved.bin");
+    doc.save_to(&save_path).unwrap();
+
+    let reopened = Document::open_with_encoding(&save_path, encoding).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while reopened.is_indexing() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        reopened.file_len(),
+        200 * 1024 * 1024 + 1,
+        "the reopened document must keep the full sparse size plus the insert"
+    );
+    assert!(
+        reopened.text_lossy().starts_with("Xпривет\nмир\n"),
+        "the reopened content must round-trip"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&save_path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reopens_via_rope_decode_predicate_matches_the_open_routing() {
+    // The save/reopen budget applies only to encodings whose reopen
+    // materializes a UTF-8 rope. The predicate must mirror the open
+    // routing exactly: Class A (single-byte engines), Class B
+    // (UTF-16/CJK), and plain UTF-8 reopen natively; every other
+    // encoding goes through the rope-decode path.
+    let big5 = DocumentEncoding::from_label("big5").unwrap();
+    assert!(
+        super::lifecycle::reopens_via_rope_decode(big5),
+        "an encoding without a native route reopens through the rope decode"
+    );
+    assert!(
+        !super::lifecycle::reopens_via_rope_decode(DocumentEncoding::utf8()),
+        "plain UTF-8 reopens on the mmap fast path"
+    );
+    assert!(
+        !super::lifecycle::reopens_via_rope_decode(DocumentEncoding::from_encoding_rs(
+            WINDOWS_1251
+        )),
+        "Class A reopens natively"
+    );
+    assert!(
+        !super::lifecycle::reopens_via_rope_decode(DocumentEncoding::utf16le()),
+        "UTF-16 reopens natively"
+    );
+    assert!(
+        !super::lifecycle::reopens_via_rope_decode(
+            DocumentEncoding::from_label("Shift_JIS").unwrap()
+        ),
+        "CJK reopens natively"
+    );
+    assert!(
+        super::lifecycle::reopens_via_rope_decode(DocumentEncoding::from_label("big5").unwrap()),
+        "an encoding without a native route reopens through the rope decode"
+    );
+    eprintln!(
+        "DBG big5 name={} supports={}",
+        DocumentEncoding::from_label("big5").unwrap().name(),
+        super::encoding_engine::SingleByteEngine::supports(
+            DocumentEncoding::from_label("big5").unwrap()
+        ),
+    );
+}
+
+#[test]
+fn small_big5_document_still_saves_without_budget_errors() {
+    // Smoke test on the rope-decode path itself: a small Big5 document
+    // stays below the budget and saves without budget errors.
+    let dir = large_fixture_dir("standpad-doc-big5-smoke");
+    let path = dir.join("big5.txt");
+    std::fs::write(&path, b"").unwrap();
+
+    let big5 = DocumentEncoding::from_label("big5").unwrap();
+    let mut doc = Document::open_with_encoding(&path, big5).unwrap();
+    doc.try_insert_text_at(0, 0, "big5 \u{5b57} \u{4e2d}")
+        .unwrap();
+    assert_eq!(
+        doc.save_error_for_encoding(big5),
+        None,
+        "a small rope-decode document saves without budget errors"
+    );
+    assert!(doc.text_lossy().contains("big5"));
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
@@ -4010,7 +4152,15 @@ fn piece_table_same_path_save_reopen_failure_restores_recovery_sidecar() {
 }
 
 #[test]
-fn large_piece_table_non_utf8_save_is_rejected_before_write() {
+fn large_piece_table_non_utf8_save_writes_and_reopens() {
+    // Update of `large_piece_table_non_utf8_save_is_rejected_before_write`:
+    // that test pinned the old behavior — a Class A (windows-1251)
+    // document beyond MAX_ROPE_EDIT_FILE_BYTES was rejected with
+    // `SaveReopenTooLarge { max_bytes }` before any write. The budget
+    // only protects reopen paths that materialize a UTF-8 rope, and
+    // Class A reopens natively over mmap + the disk index, so the
+    // rejection was a relic: the save now succeeds, the file is written,
+    // and the reopen restores the full content.
     let dir = tempdir().unwrap();
     let src = dir.path().join("huge-source.txt");
     let dst = dir.path().join("huge-cp1251.txt");
@@ -4026,29 +4176,25 @@ fn large_piece_table_non_utf8_save_is_rejected_before_write() {
     let _ = doc.try_insert_text_at(0, 0, "X").unwrap();
     assert!(doc.has_piece_table());
 
-    let err = doc.save_to_with_encoding(&dst, encoding).unwrap_err();
-    assert!(matches!(
-        err,
-        DocumentError::Encoding {
-            path: failed_path,
-            operation: "save",
-            encoding: failed_encoding,
-            reason: DocumentEncodingErrorKind::SaveReopenTooLarge { max_bytes },
-        } if failed_path == dst
-            && failed_encoding == encoding
-            && max_bytes == MAX_ROPE_EDIT_FILE_BYTES
-    ));
+    assert_eq!(doc.save_error_for_encoding(encoding), None);
+    doc.save_to_with_encoding(&dst, encoding).unwrap();
     assert!(
-        !dst.exists(),
-        "rejected save must not write a partial destination"
+        dst.exists(),
+        "a native-route document must be written, not rejected"
     );
-    assert_eq!(doc.path(), Some(src.as_path()));
-    assert!(doc.is_dirty());
-    assert!(doc.has_piece_table());
+
+    let reopened = Document::open_with_encoding(&dst, encoding).unwrap();
+    assert_eq!(reopened.file_len(), MAX_ROPE_EDIT_FILE_BYTES + 2);
+    assert_eq!(reopened.path(), Some(dst.as_path()));
 }
 
 #[test]
-fn large_piece_table_non_utf8_save_preflight_reports_reopen_limit() {
+fn large_piece_table_non_utf8_save_preflight_allows_native_reopen() {
+    // Update of `large_piece_table_non_utf8_save_preflight_reports_reopen_limit`:
+    // the preflight used to report `SaveReopenTooLarge { max_bytes }` for
+    // a windows-1251 document beyond MAX_ROPE_EDIT_FILE_BYTES; Class A
+    // reopens natively (no rope materialization), so the preflight now
+    // allows it.
     let dir = tempdir().unwrap();
     let src = dir.path().join("huge-source.txt");
     let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
@@ -4063,13 +4209,8 @@ fn large_piece_table_non_utf8_save_preflight_reports_reopen_limit() {
     let _ = doc.try_insert_text_at(0, 0, "X").unwrap();
     assert!(doc.has_piece_table());
 
-    assert_eq!(
-        doc.save_error_for_encoding(encoding),
-        Some(DocumentEncodingErrorKind::SaveReopenTooLarge {
-            max_bytes: MAX_ROPE_EDIT_FILE_BYTES,
-        })
-    );
-    assert!(!doc.can_save_with_encoding(encoding));
+    assert_eq!(doc.save_error_for_encoding(encoding), None);
+    assert!(doc.can_save_with_encoding(encoding));
 }
 
 #[test]

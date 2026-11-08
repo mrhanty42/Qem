@@ -806,7 +806,13 @@ impl Document {
         };
 
         let reload_after_save = !self.has_edit_buffer() || self.has_piece_table();
-        if reload_after_save && !encoding.is_utf8() && total_bytes > MAX_ROPE_EDIT_FILE_BYTES as u64
+        // The budget protects only reopen paths that materialize the
+        // whole document into a UTF-8 rope. Class A / Class B reopen
+        // natively (mmap + disk index, no rope), so documents of any
+        // size in those encodings save and reopen fine.
+        if reload_after_save
+            && super::lifecycle::reopens_via_rope_decode(encoding)
+            && total_bytes > MAX_ROPE_EDIT_FILE_BYTES as u64
         {
             return Err(save_encoding_error(
                 path,

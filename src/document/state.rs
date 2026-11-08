@@ -515,7 +515,13 @@ impl Document {
         encoded_len: usize,
     ) -> Option<DocumentEncodingErrorKind> {
         let reload_after_save = !self.has_edit_buffer() || self.has_piece_table();
-        (reload_after_save && !encoding.is_utf8() && encoded_len > MAX_ROPE_EDIT_FILE_BYTES)
+        // The budget protects only reopen paths that materialize the
+        // whole document into a UTF-8 rope. Class A / Class B reopen
+        // natively (mmap + disk index, no rope), so documents of any
+        // size in those encodings save and reopen fine.
+        (reload_after_save
+            && super::lifecycle::reopens_via_rope_decode(encoding)
+            && encoded_len > MAX_ROPE_EDIT_FILE_BYTES)
             .then_some(DocumentEncodingErrorKind::SaveReopenTooLarge {
                 max_bytes: MAX_ROPE_EDIT_FILE_BYTES,
             })

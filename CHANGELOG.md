@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The 128 MiB save/reopen size budget no longer applies to documents
+  whose encoding reopens natively. The budget existed to protect the
+  rope-decode reopen path, but Class A (single-byte engines), Class B
+  (UTF-16/CJK), and plain UTF-8 documents reopen over mmap + the disk
+  index without materializing any rope, so a 200 MiB windows-1251
+  document used to be rejected with `SaveReopenTooLarge` even though
+  saving and reopening it worked fine mechanically. Native-route
+  documents of any size now save and reopen; the budget keeps applying
+  to encodings without a native route (e.g. Big5), where reopen really
+  does build a UTF-8 rope. The routing is expressed as a single
+  `reopens_via_rope_decode` predicate kept next to the open dispatch,
+  with tests pinning both directions.
+
 ## 0.9.0 (2026-11-08)
 
 ### Added
