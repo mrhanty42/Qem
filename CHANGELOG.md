@@ -4,6 +4,50 @@
 
 ### Fixed
 
+- Every piece-bound consumer clamps hostile page geometry. The wave-7
+  clamp covered `read_range` only; eight more paths sliced source bytes
+  at raw `piece.start + local` bounds taken verbatim from page payloads:
+  the save-path streamer, `position_for_char_index`, the naive UTF-8
+  text-unit walker, `line_visible_segment`, the engine-aware position
+  scans and both literal search walkers. A CRC-valid page whose piece
+  advertises bounds past the real source length panicked each of them
+  (index out of range) through public surfaces like the viewport, cursor
+  mapping, literal search, and Ctrl+S. All of them now route through one
+  clamped-segment helper, so a lying page degrades to short bytes
+  exactly like `read_range`.
+- Structural edits refuse to land through a page the resident window
+  refused. While persistence is down new pages live only in the bounded
+  resident window (4096); pages past it eventually fall out of the page
+  cache, and read paths silently skip unreadable pages - a root could
+  reference a page reads could never see, shrinking the document behind
+  `total_len`. `PieceTree::insert` / `delete_range` now verify that
+  every page an edit allocated stays resident: a refused page fails the
+  edit typed and the previous root is restored, so no root ever
+  references an unreadable page and reads stay complete for the whole
+  post-failure session.
+- The Class B regex overlap threshold shrinks by the window skip. The
+  wave-7 window re-alignment drops leading bytes but still translated
+  the full 1 MiB overlap, so the threshold claimed the previous window
+  covered up to skip bytes past its end: a match ending within those
+  1-3 bytes past the boundary was rejected as already covered and lost
+  permanently (one byte per 7 MiB with the 3-byte periodic filler). The
+  threshold now translates the covered span.
+- Forged-but-checksummed sidecar pages degrade to typed errors. An
+  internal page with count = 0 parsed fine and panicked the insert path
+  (empty children indexing) or silently emptied the document on delete;
+  the writer never emits one, so parse rejects it up front. The
+  leaf/internal page aggregators also summed child totals with plain
+  adds that overflow-panicked (debug) or wrapped (release) on hostile
+  totals; both fold with saturating adds now.
+- Document state stays coherent around refused edits. The encoded rope
+  fallback mutated the rope and returned without refreshing the dirty
+  flag or the cached content values (a stale file length answered the
+  next status poll); `PieceTable::insert_bytes` left refused-edit bytes
+  in the add buffer forever, serialized into every future flush as
+  unreferenced dead weight; and both delete paths marked the document
+  dirty before checking the delete result, reporting a refused edit as
+  modified with no undo entry behind it.
+
 - Class B regex windows that slide into the middle of a CJK character
   re-align before decoding. The window slide is an arbitrary byte cut
   (8 MiB chunk minus the fixed 1 MiB overlap), which is exact for

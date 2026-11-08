@@ -201,8 +201,15 @@ none.
   from ill-formed data mid-window re-encodes to an 8-byte numeric
   character reference in Shift_JIS / EUC-KR, drifting the mapping for
   matches after it (window starts are re-aligned since the wave-7
-  fix; the in-window corruption case remains); make the non-Windows
-  snapshot backing cheaper than a full file copy; snapshot
+  fix; the in-window corruption case remains) - and that the leading-
+  byte window probe itself is one-sided: a window opening on a trail
+  byte that splices into a valid pair with the next byte (Shift_JIS /
+  EUC-KR / GB18030 trail ranges overlap their lead ranges), or a
+  GB18030 four-byte sequence opening on a digit byte, decodes clean
+  and is accepted mid-sequence - byte-exact mapping, but occurrences
+  absorbed into spliced pairs are missed (wave-8 audit; a full fix
+  needs absolute phase tracking instead of probing); make the
+  non-Windows snapshot backing cheaper than a full file copy; snapshot
   `save_async` state through `Arc` instead of cloning the edit buffer
   on the UI thread.
 - **Engine-aware line model for multi-byte-cell piece tables (1.0):**
@@ -230,6 +237,18 @@ none.
   writes and monotonically growing flush latency until save/reopen
   (the rope path caps at 500 entries). A cap or window needs an owner
   decision because it changes the user-visible undo depth.
+- **Reads must fail typed on unreadable pages (audit 2026-11-06):**
+  the wave-8 fix makes structural edits refuse to reference a page the
+  resident window dropped, but the read walkers themselves
+  (`visit_range_ref` family, `collect_pieces`) still silently skip a
+  page that fails to load (any CRC mismatch or IO hiccup on a lazily
+  read page): reads shorten behind `total_len` instead of surfacing a
+  typed error. A genuine fix converts the read walkers to a Result
+  contour through `PieceTable::read_range` callers - a wide mechanical
+  diff, deferred so it does not churn the hot read path unreviewed.
+  Until then, the silent-skip hole exists only for genuinely corrupted
+  pages (edits through them already fail typed since the wave-7
+  `unreadable page` fix).
 - **Checksums for `.qem.lineidx` pages (audit 2026-11-06):** index
   pages validate kind/count/child invariants but carry no CRC, so a
   flipped byte inside a checkpoint value parses fine and yields
