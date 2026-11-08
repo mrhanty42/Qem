@@ -1882,6 +1882,19 @@ fn parse_page(buf: &[u8]) -> io::Result<PiecePage> {
                     "leaf editlog page is overfull",
                 ));
             }
+            // Same distrust as the internal branch above: the writer
+            // never emits an empty leaf (`leaf_refs_from_pieces` returns
+            // before allocating on empty input), and a forged empty leaf
+            // would parse into a silently-short read under a root that
+            // claims a nonzero span. Unlike the empty internal page this
+            // cannot panic today - the reject keeps the parse contract
+            // symmetric and the read hole closed.
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "leaf editlog page is empty",
+                ));
+            }
 
             let mut pieces = Vec::with_capacity(count);
             for _ in 0..count {
@@ -3261,6 +3274,16 @@ mod tests {
         let page = PiecePage::Internal {
             children: Vec::new(),
         };
+        let buf = serialize_page(&page).unwrap();
+        let err = parse_page(&buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parse_page_rejects_empty_leaf_pages_as_invalid() {
+        // Symmetric with the internal-page reject: the writer never
+        // emits an empty leaf either.
+        let page = PiecePage::Leaf { pieces: Vec::new() };
         let buf = serialize_page(&page).unwrap();
         let err = parse_page(&buf).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);

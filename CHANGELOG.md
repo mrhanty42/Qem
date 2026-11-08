@@ -39,14 +39,7 @@
   leaf/internal page aggregators also summed child totals with plain
   adds that overflow-panicked (debug) or wrapped (release) on hostile
   totals; both fold with saturating adds now.
-- Document state stays coherent around refused edits. The encoded rope
-  fallback mutated the rope and returned without refreshing the dirty
-  flag or the cached content values (a stale file length answered the
-  next status poll); `PieceTable::insert_bytes` left refused-edit bytes
-  in the add buffer forever, serialized into every future flush as
-  unreferenced dead weight; and both delete paths marked the document
-  dirty before checking the delete result, reporting a refused edit as
-  modified with no undo entry behind it.
+- Document state stays coherent around refused edits. `PieceTable::insert_bytes` left refused-edit bytes in the add buffer forever, serialized into every future flush as unreferenced dead weight (the truncation now runs on the error path); and both delete paths marked the document dirty before checking the delete result, reporting a refused edit as modified with no undo entry behind it. An earlier draft of this entry also claimed the encoded rope fallback needed a dirty-flag fix - that claim was refuted during the wave-9 audit: the fallback's `rope_mut` already refreshes the dirty flag and the cached content values, and no code change was needed there.
 
 - Class B regex windows that slide into the middle of a CJK character
   re-align before decoding. The window slide is an arbitrary byte cut

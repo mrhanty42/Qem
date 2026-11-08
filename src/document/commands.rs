@@ -1028,7 +1028,10 @@ impl Document {
                     return Ok((edited, new_line0, new_col0));
                 }
                 Err(source) => {
-                    self.mark_dirty();
+                    // A refused backspace changed nothing (the tree
+                    // restores its root), so the document must not
+                    // report itself modified - same rule as the delete
+                    // paths.
                     return Err(DocumentError::Write { path, source });
                 }
             }

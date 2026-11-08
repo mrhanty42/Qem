@@ -239,16 +239,17 @@ none.
   decision because it changes the user-visible undo depth.
 - **Reads must fail typed on unreadable pages (audit 2026-11-06):**
   the wave-8 fix makes structural edits refuse to reference a page the
-  resident window dropped, but the read walkers themselves
-  (`visit_range_ref` family, `collect_pieces`) still silently skip a
-  page that fails to load (any CRC mismatch or IO hiccup on a lazily
-  read page): reads shorten behind `total_len` instead of surfacing a
-  typed error. A genuine fix converts the read walkers to a Result
-  contour through `PieceTable::read_range` callers - a wide mechanical
-  diff, deferred so it does not churn the hot read path unreviewed.
-  Until then, the silent-skip hole exists only for genuinely corrupted
-  pages (edits through them already fail typed since the wave-7
-  `unreadable page` fix).
+  resident window dropped, but the `page()`-loading read walkers still
+  silently skip a page that fails to load (any CRC mismatch or IO hiccup
+  on a lazily read page): `visit_range_ref` family, `collect_pieces`,
+  `collect_fragmentation_stats`, and `find_line_start_ref` - reads
+  shorten behind `total_len` instead of surfacing a typed error. A
+  genuine fix converts the read walkers to a Result contour through
+  `PieceTable::read_range` callers - a wide mechanical diff, deferred so
+  it does not churn the hot read path unreviewed. Until then, the
+  silent-skip hole exists only for genuinely corrupted pages (edits
+  through them already fail typed since the wave-7 `unreadable page`
+  fix).
 - **Checksums for `.qem.lineidx` pages (audit 2026-11-06):** index
   pages validate kind/count/child invariants but carry no CRC, so a
   flipped byte inside a checkpoint value parses fine and yields
