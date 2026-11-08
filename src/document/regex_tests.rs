@@ -213,6 +213,30 @@ fn find_all_regex_keeps_matches_just_past_a_skipped_window_boundary() {
 }
 
 #[test]
+fn find_next_regex_reports_absolute_positions_across_rope_window_trims() {
+    // Rope-backed documents (small UTF-8 files, legacy-encoding bridges)
+    // walk the regex in bounded windows with a 1 MiB carry-over. The
+    // finalize must rebase match positions from the trimmed window's
+    // absolute start, not from the search origin: the first match past
+    // every 8 MiB grid otherwise reports a position short by the whole
+    // trimmed prefix.
+    let head = 8_500_000usize;
+    let content = format!("{}MARK{}", "a".repeat(head), "b".repeat(64));
+    let mut doc = Document::new();
+    doc.try_insert(TextPosition::new(0, 0), &content)
+        .expect("seeded insert succeeds");
+    assert!(doc.rope.is_some(), "fixture must be rope-backed");
+
+    let m = doc
+        .find_next_regex("MARK", TextPosition::new(0, 0))
+        .unwrap()
+        .expect("expected the MARK past the first window trim");
+    assert_eq!(m.start(), TextPosition::new(0, head));
+    assert_eq!(m.end(), TextPosition::new(0, head + 4));
+    assert_eq!(m.len_chars(), 4);
+}
+
+#[test]
 fn find_all_regex_iterates_non_overlapping_matches() {
     let doc = doc_with("a1 b22 c333 d4444\n");
     let matches: Vec<_> = doc.find_all_regex(r"\d+").unwrap().collect();

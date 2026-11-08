@@ -701,6 +701,9 @@ fn find_next_regex_in_rope_chunks(
     start_byte: usize,
     end_byte: usize,
 ) -> Option<SearchMatch> {
+    // `from` is not consulted by the walker itself: positions are rebased
+    // from the maintained `window_start_byte` inside the finalize helper.
+    let _ = from;
     if start_byte >= end_byte {
         return None;
     }
@@ -742,7 +745,14 @@ fn find_next_regex_in_rope_chunks(
 
         if window.len() >= target_chunk || chunk_end >= end_byte {
             if let Some(m) = query.text_regex().find(&window) {
-                return finalize_rope_window_match(doc, from, &window, m.start(), m.end());
+                return finalize_rope_window_match(
+                    doc,
+                    rope,
+                    window_start_byte,
+                    &window,
+                    m.start(),
+                    m.end(),
+                );
             }
             // Trim the window down to the carry-over overlap before the
             // next chunk so memory stays bounded.
@@ -764,25 +774,34 @@ fn find_next_regex_in_rope_chunks(
     // Final tail check (in case we never crossed the chunk threshold).
     if !window.is_empty() {
         if let Some(m) = query.text_regex().find(&window) {
-            return finalize_rope_window_match(doc, from, &window, m.start(), m.end());
+            return finalize_rope_window_match(
+                doc,
+                rope,
+                window_start_byte,
+                &window,
+                m.start(),
+                m.end(),
+            );
         }
     }
 
-    let _ = window_start_byte;
     None
 }
 
 fn finalize_rope_window_match(
     doc: &Document,
-    from: TextPosition,
+    rope: &EditBuffer,
+    window_start_byte: usize,
     window: &str,
     match_start: usize,
     match_end: usize,
 ) -> Option<SearchMatch> {
-    let prefix_units = window[..match_start].chars().count();
+    // The window's absolute start byte is maintained across the trims;
+    // positions must be rebased from there, not from the search origin
+    // (after the first trim the window no longer starts at `from`, so
+    // origin-based counting loses the whole trimmed prefix).
+    let match_start_char = rope.byte_to_char(window_start_byte.saturating_add(match_start));
     let match_units = window[match_start..match_end].chars().count();
-    let from_char = doc.char_index_for_position(from);
-    let match_start_char = from_char.saturating_add(prefix_units);
     let start_pos = doc.position_for_char_index(match_start_char);
     let end_pos = doc.position_for_char_index(match_start_char.saturating_add(match_units));
     Some(SearchMatch::new(
