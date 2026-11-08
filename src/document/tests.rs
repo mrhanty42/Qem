@@ -826,6 +826,51 @@ fn piece_table_read_range_clamps_hostile_piece_bounds() {
 }
 
 #[test]
+fn piece_table_coalesce_survives_hostile_piece_totals() {
+    // Hostile page payloads can carry piece.start near usize::MAX; the
+    // coalesce pass computes `last.start + last.len` on plain adds, so a
+    // forged leaf panicked the debug build (and wrapped in release,
+    // merging unrelated pieces) on any edit touching that leaf.
+    let dir = std::env::temp_dir().join(format!(
+        "standpad-doc-coalesce-hostile-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("coalesce-hostile.bin");
+    std::fs::write(&path, b"abcdef\n").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+    let mut piece_table = PieceTable::new(storage, vec![7], true);
+
+    piece_table.pieces = PieceTree::from_pieces(vec![
+        Piece {
+            src: PieceSource::Original,
+            start: usize::MAX,
+            len: 1,
+            line_breaks: 0,
+        },
+        Piece {
+            src: PieceSource::Original,
+            start: 0,
+            len: 7,
+            line_breaks: 1,
+        },
+    ]);
+    piece_table.total_len = piece_table.pieces.total_len();
+
+    // The insert lands at offset 0, making the hostile piece the
+    // coalesce pass's `last` against the real source piece.
+    piece_table.insert_bytes(0, b"X").unwrap();
+    assert_eq!(
+        piece_table.read_range(0, piece_table.total_len),
+        b"Xabcdef\n".to_vec(),
+        "the hostile piece must be clamped away, not panic the merge"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn piece_table_line_lengths_for_edit_supports_large_exact_prefix() {
     let dir =
         std::env::temp_dir().join(format!("standpad-doc-large-prefix-{}", std::process::id()));

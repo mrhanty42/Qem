@@ -387,6 +387,22 @@ impl PieceTree {
         }
     }
 
+    /// Test support: fills the resident window with dummy pages up to
+    /// `target` entries so a test can pin the next edit against the very
+    /// last free residency slot (the real pages already there stay).
+    #[cfg(test)]
+    pub(crate) fn fill_resident_window_for_test(&mut self, target: usize) {
+        if let PageStore::Disk(store) = &mut self.store {
+            let mut id = 1_000_000_000u64;
+            while store.resident_pages.len() < target {
+                store
+                    .resident_pages
+                    .insert(id, Arc::new(PiecePage::Leaf { pieces: Vec::new() }));
+                id += 1;
+            }
+        }
+    }
+
     pub(crate) fn total_len(&self) -> usize {
         self.root.map(|root| root.total_bytes).unwrap_or(0)
     }
@@ -505,28 +521,37 @@ impl PieceTree {
         }
         let offset = offset.min(self.total_len());
         let Some(root) = self.root.take() else {
-            self.root = self.build_tree_from_pieces(vec![piece]);
+            // Even the empty-root rebuild allocates pages, so the
+            // residency check covers it the same way.
+            let first_new_page = self.store.next_page_id_hint();
+            let new_root = self.build_tree_from_pieces(vec![piece]);
+            if let Err(err) = self.store.verify_pages_resident_since(first_new_page) {
+                self.root = None;
+                return Err(err);
+            }
+            self.root = new_root;
             self.record_history_root();
             return Ok(());
         };
         let first_new_page = self.store.next_page_id_hint();
-        let children = match self.insert_at(root, offset, piece, split_piece) {
-            Ok(children) => children,
+        // While persistence is down every new page lives only in the
+        // bounded resident window (see `alloc_page`). The edit must not
+        // land through a page that the window refused: reads would
+        // silently skip it and the document would shrink behind
+        // `total_len`. The verification runs AFTER the root rebuild,
+        // which itself allocates pages on an overflowing edit.
+        let new_root = match self.insert_at(root, offset, piece, split_piece) {
+            Ok(children) => self.build_tree_from_child_refs(children),
             Err(err) => {
                 self.root = Some(root);
                 return Err(err);
             }
         };
-        // While persistence is down every new page lives only in the
-        // bounded resident window (see `alloc_page`). The edit must not
-        // land through a page that the window refused: reads would
-        // silently skip it and the document would shrink behind
-        // `total_len`.
         if let Err(err) = self.store.verify_pages_resident_since(first_new_page) {
             self.root = Some(root);
             return Err(err);
         }
-        self.root = self.build_tree_from_child_refs(children);
+        self.root = new_root;
         self.record_history_root();
         Ok(())
     }
@@ -554,21 +579,23 @@ impl PieceTree {
             return Ok(());
         }
         let first_new_page = self.store.next_page_id_hint();
-        match self.delete_at(root, start, end, trim_piece) {
-            Ok(children) => {
-                if let Err(err) = self.store.verify_pages_resident_since(first_new_page) {
-                    self.root = Some(root);
-                    return Err(err);
-                }
-                self.root = self.build_tree_from_child_refs(children);
-                self.record_history_root();
-                Ok(())
-            }
+        let new_root = match self.delete_at(root, start, end, trim_piece) {
+            Ok(children) => self.build_tree_from_child_refs(children),
             Err(err) => {
                 self.root = Some(root);
-                Err(err)
+                return Err(err);
             }
+        };
+        // Same ordering as the insert path: the root rebuild allocates
+        // pages on an overflowing edit, so the verification must see
+        // them too.
+        if let Err(err) = self.store.verify_pages_resident_since(first_new_page) {
+            self.root = Some(root);
+            return Err(err);
         }
+        self.root = new_root;
+        self.record_history_root();
+        Ok(())
     }
 
     pub(crate) fn flush_session(&mut self, add_bytes: &[u8], meta: SessionMeta) -> io::Result<()> {
@@ -2249,7 +2276,10 @@ fn coalesce_adjacent(pieces: &mut Vec<Piece>) {
                 && piece.line_breaks == 0;
             let merge_add = last.src == PieceSource::Add;
             if last.src == piece.src
-                && last.start + last.len == piece.start
+                // Saturate: hostile page payloads can carry
+                // start/len whose plain add overflows (debug panic,
+                // release wrap merging unrelated pieces).
+                && last.start.saturating_add(last.len) == piece.start
                 && (merge_original || merge_add)
             {
                 last.len = last.len.saturating_add(piece.len);
@@ -2267,7 +2297,7 @@ mod tests {
     use super::{
         editlog_path, parse_page, serialize_page, source_metadata, DiskPageStore,
         FragmentationStats, Piece, PiecePage, PieceSource, PieceTree, SessionMeta, SourceMetadata,
-        EDITLOG_HEADER_BYTES, RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
+        EDITLOG_CACHE_PAGES, EDITLOG_HEADER_BYTES, RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
     };
     use std::fs;
     use std::io::{Seek, SeekFrom, Write};
@@ -3324,6 +3354,132 @@ mod tests {
             collected_bytes,
             7 + accepted,
             "every referenced page must stay readable past the refusal"
+        );
+
+        let sidecar = editlog_path(&source);
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_resident_window_verifies_the_rebuilt_root() {
+        // The root rebuild itself allocates pages on an overflowing edit
+        // (a full leaf splitting into two plus a new internal page). The
+        // residency verification must see those pages too: an edit whose
+        // rebuilt root references a page the window refused must fail,
+        // otherwise the root points at a page that only the page cache
+        // keeps readable - and reads silently shrink once it evicts.
+        //
+        // Deterministic setup: the window is filled to exactly one free
+        // slot, the tree already spans several leaves (so the rebuild
+        // allocates an internal page), and the next edit therefore
+        // occupies the last slot with its insert_at page while the
+        // rebuilt-root page lands beyond the window.
+        let dir = std::env::temp_dir().join(format!(
+            "qem-piece-tree-resident-root-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef\n").unwrap();
+        let mut tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 7,
+                line_breaks: 1,
+            }],
+        )
+        .unwrap();
+        let mut split = |piece: Piece, left_len: usize| {
+            let left = Piece {
+                src: piece.src,
+                start: piece.start,
+                len: left_len,
+                line_breaks: 0,
+            };
+            let right = Piece {
+                src: piece.src,
+                start: piece.start + left_len,
+                len: piece.len - left_len,
+                line_breaks: piece.line_breaks,
+            };
+            (Some(left), Some(right))
+        };
+        tree.flush_session(b"ignored-by-test", SessionMeta::default())
+            .unwrap();
+        tree.poison_persistence_for_test();
+
+        // Non-coalescing tail inserts (the add-buffer start skips a byte
+        // per insert, so `coalesce_adjacent` never merges them) grow the
+        // piece count past the first leaf split, making every further
+        // rebuild allocate an internal page.
+        let mut accepted = 0usize;
+        for _ in 0..200 {
+            tree.insert(
+                7 + accepted,
+                Piece {
+                    src: PieceSource::Add,
+                    start: accepted.saturating_mul(2),
+                    len: 1,
+                    line_breaks: 0,
+                },
+                &mut split,
+            )
+            .unwrap();
+            accepted += 1;
+        }
+
+        // Fill the window so the next edit gets exactly one free slot:
+        // its insert_at page takes it, and the rebuilt-root page (the
+        // internal above the split leaves) must fall outside the window
+        // and refuse the edit.
+        tree.fill_resident_window_for_test(RESIDENT_PAGES_FAILED_PERSISTENCE_CAP - 1);
+        let insert_result = tree.insert(
+            7 + accepted,
+            Piece {
+                src: PieceSource::Add,
+                start: accepted.saturating_mul(2),
+                len: 1,
+                line_breaks: 0,
+            },
+            &mut split,
+        );
+        assert!(
+            insert_result.is_err(),
+            "the rebuilt-root page beyond the window must refuse the edit"
+        );
+
+        // Refused edits still allocate (the tree walk runs before the
+        // verification), so churning the page cache evicts anything a
+        // stale implementation kept readable.
+        for _ in 0..(EDITLOG_CACHE_PAGES * 2) {
+            let _ = tree.insert(
+                7 + accepted,
+                Piece {
+                    src: PieceSource::Add,
+                    start: RESIDENT_PAGES_FAILED_PERSISTENCE_CAP.saturating_mul(4),
+                    len: 1,
+                    line_breaks: 0,
+                },
+                &mut split,
+            );
+        }
+
+        assert_eq!(
+            tree.total_len(),
+            7 + accepted,
+            "the refused edit must not change the tree size"
+        );
+        let pieces = tree.to_vec();
+        let collected_bytes: usize = pieces.iter().map(|piece| piece.len).sum();
+        assert_eq!(
+            collected_bytes,
+            7 + accepted,
+            "every page referenced by the live root must stay readable - \
+             a post-verify allocation escaping the window check shrinks reads"
         );
 
         let sidecar = editlog_path(&source);
