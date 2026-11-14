@@ -16,6 +16,14 @@
   does build a UTF-8 rope. The routing is expressed as a single
   `reopens_via_rope_decode` predicate kept next to the open dispatch,
   with tests pinning both directions.
+- CJK multibyte (Shift_JIS, GB18030, EUC-KR) literal candidates are
+  verified on character boundaries. Shift_JIS/GB18030/EUC-KR byte grids
+  are not self-synchronizing: a memmem hit can start on a trail byte of
+  a neighboring character, decoding into garbage or even into the
+  needle — a splice, not the text. Every multibyte candidate is walked
+  from the nearest known character boundary; non-boundary hits are
+  rejected. A deterministic Shift_JIS splice fixture pins the
+  rejection.
 - Literal search is encoding-aware. The needle was searched as raw
   UTF-8 bytes over the document's stored bytes, which never match
   interleaved UTF-16 storage and never match non-ASCII letters in
