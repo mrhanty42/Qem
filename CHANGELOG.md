@@ -16,6 +16,18 @@
   does build a UTF-8 rope. The routing is expressed as a single
   `reopens_via_rope_decode` predicate kept next to the open dispatch,
   with tests pinning both directions.
+- Literal search is encoding-aware. The needle was searched as raw
+  UTF-8 bytes over the document's stored bytes, which never match
+  interleaved UTF-16 storage and never match non-ASCII letters in
+  single-byte encodings — `find_next("привет")` on a windows-1251
+  document answered "not found" silently while the regex path found it.
+  The needle is now encoded into the document's encoding before the
+  byte search (UTF-16 needles are searched on the 2-byte cell grid,
+  byte-collision candidates at odd offsets are rejected), and needles
+  unrepresentable in the document's encoding (e.g. Latin-only text in a
+  document re-encoded without those glyphs) produce a dead query whose
+  searches answer `None`. Per-encoding tests pin UTF-16 LE/BE; the
+  former "must not find" assertions are updated with the stated reason.
 
 ## 0.9.0 (2026-11-08)
 

@@ -459,6 +459,77 @@ fn line_lengths_from_bytes_respects_limit() {
 }
 
 #[test]
+fn literal_search_is_encoding_aware_for_class_a_documents() {
+    // The literal needle used to be searched as raw UTF-8 bytes, which
+    // never match single-byte-encoded storage: a windows-1251 document
+    // holding the word "привет" reported "not found" for a plain
+    // find_next("привет"). The needle must be encoded into the
+    // document's encoding before the byte search.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("literal-cp1251.txt");
+    let (encoded, used, had_errors) = WINDOWS_1251.encode("first\nпривет мир\n");
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    std::fs::write(&path, encoded.as_ref()).unwrap();
+
+    let doc = Document::open_with_encoding(&path, DocumentEncoding::from_encoding_rs(WINDOWS_1251))
+        .unwrap();
+
+    let m = doc
+        .find_next("привет", TextPosition::new(0, 0))
+        .expect("literal search must find the encoded needle");
+    assert_eq!(m.start(), TextPosition::new(1, 0));
+    assert_eq!(m.len_chars(), 6);
+
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+#[test]
+fn literal_search_finds_ascii_in_utf16le_document() {
+    // UTF-16 storage interleaves NUL bytes between ASCII letters, so the
+    // UTF-8 needle bytes never appear in the raw storage. The literal
+    // search must encode the needle into UTF-16 and search the byte
+    // grid.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("literal-utf16le.txt");
+    let mut encoded: Vec<u8> = Vec::new();
+    for unit in "first\nsecond TARGET line\nthird\n".encode_utf16() {
+        encoded.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, &encoded).unwrap();
+
+    let doc = Document::open_with_encoding(&path, DocumentEncoding::utf16le()).unwrap();
+
+    let m = doc
+        .find_next("TARGET", TextPosition::new(0, 0))
+        .expect("literal search must find the UTF-16-encoded needle");
+    assert_eq!(m.start().line0(), 1);
+    assert_eq!(m.len_chars(), 6);
+    assert_eq!(m.len_chars(), 6);
+
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+#[test]
+fn literal_search_rejects_unaligned_utf16_candidates() {
+    // A forged byte grid can contain the needle's LE bytes at an odd
+    // offset (U+5400 puts 0x54 in the high half of a cell); that is not
+    // the text "TARGET" and must not be returned.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("unaligned-utf16le.txt");
+    let mut encoded: Vec<u8> = Vec::new();
+    for unit in "\u{5400}\u{4152}\u{4752}\u{4552}\u{5452}tail\n".encode_utf16() {
+        encoded.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, &encoded).unwrap();
+
+    let doc = Document::open_with_encoding(&path, DocumentEncoding::utf16le()).unwrap();
+    assert_eq!(doc.find_next("TARGET", TextPosition::new(0, 0)), None);
+
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+#[test]
 fn precise_piece_table_line_lengths_require_complete_index() {
     let doc = Document {
         path: None,

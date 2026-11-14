@@ -19,7 +19,7 @@ The primary path is UTF-8/ASCII. Explicit native support also exists for UTF-16 
 - Reads bounded viewports for virtualized editor rendering
 - Uses rope or piece-table backings when edits require them
 - Supports typed insert, replace, delete, selection, undo, and redo operations
-- Provides literal and regex search, including bounded and reverse search
+- Provides literal and regex search, including bounded and reverse search. Literal search is encoding-aware: the needle is encoded into the document's encoding (UTF-16, single-byte, CJK) before the byte search
 - Saves edited documents through streaming atomic replacement
 - Persists eligible edit sessions in `.qem.editlog` sidecars
 - Exposes background loading, indexing, saving, and error state to frontends

@@ -160,19 +160,18 @@ fn literal_and_regex_search_finds_known_match() {
     assert_eq!(regex_match.start(), TextPosition::new(0, 0));
     assert_eq!(regex_match.end(), TextPosition::new(0, 6));
 
-    // Literal search currently runs a byte-level finder against the
-    // raw mmap bytes. The needle bytes for `"TARGET"` are the six
-    // ASCII bytes `[0x54, 0x41, 0x52, 0x47, 0x45, 0x54]`; the UTF-16LE
-    // encoding of the same string interleaves a `0x00` filler byte
-    // after every ASCII byte, so the contiguous needle pattern never
-    // appears in the source. The literal byte finder therefore
-    // correctly returns `None` for an ASCII needle in a UTF-16
-    // document. Encoding-aware literal search is not in scope for
-    // ; this assertion documents the current contract.
-    assert!(
-        doc.find_next("TARGET", TextPosition::new(0, 0)).is_none(),
-        "literal byte-finder must not find a UTF-8 needle inside a UTF-16LE document",
-    );
+    // Update of the former "must not find" assertion: that pinned the
+    // old behavior — the literal needle was searched as raw UTF-8 bytes,
+    // which never appear in interleaved UTF-16 storage, so an ASCII
+    // needle was silently missed in UTF-16 documents. The literal search
+    // is now encoding-aware (the needle is encoded into the document's
+    // encoding before the byte search), so the marker is found at its
+    // real position like through the regex path.
+    let literal_match = doc
+        .find_next("TARGET", TextPosition::new(0, 0))
+        .expect("literal search must find the ASCII marker like the regex path");
+    assert_eq!(literal_match.start(), TextPosition::new(0, 0));
+    assert_eq!(literal_match.len_chars(), 6);
 }
 
 #[test]
