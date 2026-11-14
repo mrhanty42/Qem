@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ba845cf04e99287203fc6c72970b073a94bd7c89905fda1aa23e32b3bdeea2ce # shrinks to enc_idx = 0, text_idx = [26], needle_idx = [0]
+cc 6ff0c8a089ad856925311fa07b0d3ab6cb474c5be261c847a1571f7e529ad7c2 # shrinks to enc_idx = 1, text_idx = [0, 0, 0, 0, 0, 0, 0, 27, 0, 0, 0, 0, 55, 35, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13, 0], needle_idx = [7]
+cc d44ad956ec2aea9e089271ab7b47ed3b1ea849aace94fcf84902f97541fef809 # shrinks to enc_idx = 1, text_idx = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 55, 0, 0, 0, 0, 0, 25, 25, 32, 0], needle_idx = [37, 43]
+cc f89947f1240dfd544e0c9abb735a41656a5971b9b5a2d0bde55e960669652b13 # shrinks to enc_idx = 3, text_idx = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 3, 3, 3, 0, 3, 3, 0, 3, 0, 3, 3, 3, 3, 0, 25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4], needle_idx = [48]
