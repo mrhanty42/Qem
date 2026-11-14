@@ -1155,13 +1155,21 @@ impl Document {
             return None;
         }
 
+        let engine = self.encoding_engine();
         let end_offset = self.mmap_byte_offset_for_position(before);
         let mut search_end = end_offset.min(file_len);
         loop {
             let match_start = query.finder_rev.rfind(&bytes[..search_end])?;
-            if !query.candidate_grid_ok(match_start) {
-                // UTF-16 byte collision at an odd offset: exclude it and
-                // keep scanning backwards.
+            // Boundary proof: walk forward from the nearest line break at
+            // or before the candidate (a line start is always a character
+            // boundary; byte 0 is one too).
+            let window_start = match_start.saturating_sub(64 * 1024);
+            let anchor = memchr::memrchr2(b'\n', b'\r', &bytes[window_start..match_start])
+                .map(|p| window_start + p + 1)
+                .unwrap_or(0);
+            if !query.boundary_walk_ok(engine, bytes, anchor, match_start) {
+                // Spliced non-boundary candidate: exclude it and keep
+                // scanning backwards.
                 search_end = match_start;
                 continue;
             }
@@ -1297,9 +1305,28 @@ impl Document {
                 query.bytes().len(),
                 &query.finder_rev,
             )?;
-            if !query.candidate_grid_ok(candidate) {
-                // UTF-16 byte collision at an odd offset: exclude it and
-                // keep scanning backwards.
+            let walk_ok = if query.boundary_walk {
+                // Boundary proof: walk forward from the nearest line break
+                // at or before the candidate (a line start is always a
+                // character boundary). The window read is small; a candidate
+                // without a line break in the window is rejected
+                // conservatively.
+                let window_start = candidate.saturating_sub(64 * 1024);
+                let slice = piece_table.read_range(
+                    window_start,
+                    (candidate + query.bytes().len()).min(piece_table.total_len),
+                );
+                let needle_rel = candidate.saturating_sub(window_start);
+                let anchor = memchr::memrchr2(b'\n', b'\r', &slice[..needle_rel])
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                query.boundary_walk_ok(engine, &slice, anchor, needle_rel)
+            } else {
+                query.candidate_grid_ok(candidate)
+            };
+            if !walk_ok {
+                // Spliced non-boundary candidate: exclude it and keep
+                // scanning backwards.
                 search_end = candidate;
                 continue;
             }

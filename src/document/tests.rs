@@ -628,11 +628,17 @@ fn literal_search_rejects_shift_jis_boundary_splice_candidates() {
     let doc = Document::open_with_encoding(&path, DocumentEncoding::from_encoding_rs(enc)).unwrap();
 
     // The needle (Z's byte pair) occurs only at non-boundary offsets 1
-    // and 5 — a boundary-respecting literal search must reject both.
+    // and 5 — a boundary-respecting literal search must reject both, in
+    // both search directions.
     assert_eq!(
         doc.find_next(&needle_text, TextPosition::new(0, 0)),
         None,
         "a spliced non-boundary candidate must be rejected; s1={s1:?} needle={needle_text:?}"
+    );
+    assert_eq!(
+        doc.find_prev(&needle_text, TextPosition::new(usize::MAX, usize::MAX)),
+        None,
+        "reverse search must reject spliced candidates too"
     );
 
     let _ = std::fs::remove_dir_all(dir.path());
