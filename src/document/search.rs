@@ -527,9 +527,21 @@ impl Iterator for LiteralSearchIter<'_> {
                 };
                 let match_start_rel = buffered.next_rel_offset.saturating_add(rel);
                 let match_start_abs = buffered.base_offset.saturating_add(match_start_rel);
-                if !query.candidate_grid_ok(match_start_abs) {
-                    // UTF-16 byte collision at an odd offset: skip it and
-                    // keep scanning the buffered range.
+                // buffered.bytes starts at base_offset, which is always a
+                // character boundary (a match end or an engine-mapped
+                // position), so the walk runs from the slice's byte 0.
+                if !query.candidate_grid_ok(match_start_abs)
+                    || !query.boundary_walk_ok(
+                        self.doc.encoding_engine(),
+                        &buffered.bytes,
+                        0,
+                        match_start_rel,
+                    )
+                {
+                    // A candidate that is not on a real character boundary
+                    // (odd-offset UTF-16 collision, multibyte splice on a
+                    // trail byte) is a byte splice, not the text: skip it
+                    // and keep scanning the buffered range.
                     buffered.next_rel_offset = match_start_rel.saturating_add(1);
                     continue;
                 }
