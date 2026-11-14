@@ -4,6 +4,28 @@
 
 ### Fixed
 
+- Opening a session whose piece pages are unreadable is now rejected as
+  a typed error. A lazily-read piece page that fails its CRC answers
+  `None`, and the read paths silently skipped the subtree: an invalid
+  sidecar could open with `total_len` advertising content reads could
+  never return. `try_open_disk_session` now walks every page reachable
+  from the committed root up front and fails as `InvalidData`, letting
+  the recovery layer drop the sidecar and rebuild from the source file.
+  The same check refuses edits through pages that turn unreadable only
+  after a successful open (defense in depth).
+- Piece-table literal candidates are proven to sit on character
+  boundaries. The plain find_next path had no boundary proof, and the
+  offset-hint walk's window ended exactly at the candidate, so a
+  Shift_JIS splice inside piece bytes was returned as a phantom match
+  while the mmap path rejected the same bytes. The plain path delegates
+  to the offset-hint scan, and the walk window includes the candidate's
+  own bytes.
+- Refused backspaces no longer mark rope documents dirty. The rope
+  branch materialized the buffer through a helper that sets the dirty
+  flag before the no-op checks, so a backspace with nothing to delete
+  left a clean document falsely modified; `mark_dirty` now runs only
+  after an actual removal, matching the delete paths.
+
 - The 128 MiB save/reopen size budget no longer applies to documents
   whose encoding reopens natively. The budget existed to protect the
   rope-decode reopen path, but Class A (single-byte engines), Class B
