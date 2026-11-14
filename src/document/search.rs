@@ -1117,14 +1117,13 @@ impl Document {
         loop {
             let rel = query.finder.find(&bytes[search_from..file_len])?;
             let match_start = search_from.saturating_add(rel);
-            if !query.candidate_grid_ok(match_start)
-                || !query.boundary_walk_ok(
-                    engine,
-                    bytes,
-                    boundary.saturating_sub(search_from),
-                    match_start.saturating_sub(search_from),
-                )
-            {
+            // The boundary walk runs over the GLOBAL byte offsets: from the
+            // known boundary (`start_offset`, a match end or an engine-mapped
+            // position) to the candidate. A relative window (from
+            // `search_from`) would verify the byte at `rel` instead of the
+            // candidate at `search_from + rel` once `search_from > 0`,
+            // accepting splices and rejecting real matches.
+            if !query.boundary_walk_ok(engine, bytes, boundary, match_start) {
                 // A candidate that is not on a real character boundary
                 // (odd-offset UTF-16 collision, multibyte splice) is a
                 // byte splice, not the text: skip it and keep scanning.
@@ -1191,31 +1190,14 @@ impl Document {
         query: &LiteralSearchQuery,
         from: TextPosition,
     ) -> Option<SearchMatch> {
-        let start_col0 = from.col0();
-        let start_pos = TextPosition::new(from.line0(), start_col0);
-        let engine = piece_table.engine();
+        let start_pos = TextPosition::new(from.line0(), from.col0());
         let start_offset = scanned_piece_table_byte_offset_for_position(piece_table, start_pos)
-            .unwrap_or_else(|| piece_table.byte_offset_for_col(from.line0(), start_col0));
-        let mut search_offset = start_offset;
-        loop {
-            let (start_pos, match_start) = piece_table.find_literal_next_from_position(
-                search_offset,
-                start_pos,
-                query.bytes().len(),
-                &query.finder,
-            )?;
-            if !query.candidate_grid_ok(match_start) {
-                // UTF-16 byte collision at an odd offset: skip it and keep
-                // scanning.
-                search_offset = match_start.saturating_add(1);
-                continue;
-            }
-            let end_pos = advance_position_by_bytes(start_pos, query.bytes(), engine);
-            return Some(SearchMatch::new(
-                TextRange::new(start_pos, query.len_chars()),
-                end_pos,
-            ));
-        }
+            .unwrap_or_else(|| piece_table.byte_offset_for_col(from.line0(), from.col0()));
+        // Delegates to the offset-hint scan so the plain path applies the
+        // same candidate proof (UTF-16 cell grid, multibyte boundary walk)
+        // as the mmap forward path and the iterator path.
+        self.find_next_in_piece_table_from_offset(piece_table, query, start_pos, start_offset)
+            .map(|(m, _)| m)
     }
 
     fn find_next_in_piece_table_from_offset(
@@ -1237,11 +1219,19 @@ impl Document {
             )?;
             let walk_ok = if query.boundary_walk {
                 // Walk the stored bytes from the last known boundary to the
-                // candidate. The slice is small when candidates are close;
-                // far candidates pay one ranged read.
+                // candidate. The window also includes the candidate's own
+                // bytes, mirroring the reverse walk: a slice that ends at
+                // the candidate would truncate the character immediately
+                // before it, and the engine's malformed-tail fallback would
+                // step that lead byte as one byte — letting a spliced
+                // candidate "land" on the match offset. The slice is small
+                // when candidates are close; far candidates pay one ranged
+                // read.
                 let base = boundary.min(match_start);
-                let slice = piece_table
-                    .read_range(base, match_start.max(boundary).min(piece_table.total_len));
+                let slice = piece_table.read_range(
+                    base,
+                    (match_start + query.bytes().len()).min(piece_table.total_len),
+                );
                 query.boundary_walk_ok(
                     engine,
                     &slice,

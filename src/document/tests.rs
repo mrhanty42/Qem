@@ -555,14 +555,17 @@ fn literal_search_finds_multibyte_word_in_shift_jis_document() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
-#[test]
-fn literal_search_rejects_shift_jis_boundary_splice_candidates() {
-    // Shift_JIS byte grids are not self-synchronizing: the byte pair of a
-    // valid character can appear starting on a trail byte of the
-    // neighboring character. A memmem hit at a non-boundary offset is a
-    // byte splice, not the text, and must be rejected (this fixture is
-    // built deterministically by scanning Shift_JIS two-byte characters
-    // for such a splice).
+/// Deterministically scans Shift_JIS two-byte characters for a splice
+/// pair: `[S1][S2]` where S1's trail byte + S2's lead byte decode to a
+/// valid single character Z whose own Shift_JIS bytes are exactly those
+/// two — so the needle Z's byte pair occurs at offset 1 of the splice
+/// (inside S1), not at a character boundary. Every participating
+/// character must round-trip through the encoder, so writing the decoded
+/// `s1s2` text reproduces the raw splice bytes byte-for-byte (callers
+/// that build the splice through the encoded edit path rely on that).
+///
+/// Returns `(s1, s2, splice_bytes, needle_text)`.
+fn shift_jis_splice_fixture() -> (String, String, Vec<u8>, String) {
     let enc = SHIFT_JIS;
     let decode2 = |bytes: &[u8]| -> Option<String> {
         let (cow, _, had_errors) = enc.decode(bytes);
@@ -570,6 +573,10 @@ fn literal_search_rejects_shift_jis_boundary_splice_candidates() {
             return None;
         }
         Some(cow.into_owned())
+    };
+    let encodes_to = |text: &str, bytes: &[u8]| -> bool {
+        let (encoded, output, had_errors) = enc.encode(text);
+        !had_errors && output == enc && encoded.as_ref() == bytes
     };
 
     let mut two_byte: Vec<(u8, u8, String)> = Vec::new();
@@ -585,13 +592,9 @@ fn literal_search_rejects_shift_jis_boundary_splice_candidates() {
         }
     }
 
-    // Splice: [S1][S2] where S1's trail + S2's lead decode to a valid
-    // single character Z that also has a valid (lead, trail) pair of its
-    // own — so the needle Z's bytes occur at offset 1 (inside S1), not at
-    // a character boundary.
-    let mut fixture: Option<(String, Vec<u8>, String)> = None;
-    for (l1, t1, _s1) in &two_byte {
-        for (l2, t2, _s2) in &two_byte {
+    let mut fixture: Option<(String, String, Vec<u8>, String)> = None;
+    for (l1, t1, s1) in &two_byte {
+        for (l2, t2, s2) in &two_byte {
             if t1 == l2 {
                 continue;
             }
@@ -601,22 +604,32 @@ fn literal_search_rejects_shift_jis_boundary_splice_candidates() {
             if needle_text.chars().count() != 1 {
                 continue;
             }
-            let Some(s1) = decode2(&[*l1, *t1]) else {
-                continue;
-            };
-            let Some(_s2) = decode2(&[*l2, *t2]) else {
-                continue;
-            };
             let splice_bytes = vec![*l1, *t1, *l2, *t2];
-            fixture = Some((s1, splice_bytes, needle_text));
+            if !encodes_to(&needle_text, &[*t1, *l2])
+                || !encodes_to(s1, &[*l1, *t1])
+                || !encodes_to(s2, &[*l2, *t2])
+            {
+                continue;
+            }
+            fixture = Some((s1.clone(), s2.clone(), splice_bytes, needle_text));
             break;
         }
         if fixture.is_some() {
             break;
         }
     }
-    let (s1, splice_bytes, needle_text) =
-        fixture.expect("shift_jis fixture scan must find a splice pair");
+    fixture.expect("shift_jis fixture scan must find a splice pair")
+}
+
+#[test]
+fn literal_search_rejects_shift_jis_boundary_splice_candidates() {
+    // Shift_JIS byte grids are not self-synchronizing: the byte pair of a
+    // valid character can appear starting on a trail byte of the
+    // neighboring character. A memmem hit at a non-boundary offset is a
+    // byte splice, not the text, and must be rejected (the fixture is
+    // built deterministically by scanning Shift_JIS two-byte characters
+    // for such a splice).
+    let (s1, _s2, splice_bytes, needle_text) = shift_jis_splice_fixture();
 
     let dir = tempdir().unwrap();
     let path = dir.path().join("shift-jis-splice.bin");
@@ -625,7 +638,8 @@ fn literal_search_rejects_shift_jis_boundary_splice_candidates() {
     doc_bytes.extend_from_slice(splice_bytes.as_slice());
     std::fs::write(&path, &doc_bytes).unwrap();
 
-    let doc = Document::open_with_encoding(&path, DocumentEncoding::from_encoding_rs(enc)).unwrap();
+    let doc =
+        Document::open_with_encoding(&path, DocumentEncoding::from_encoding_rs(SHIFT_JIS)).unwrap();
 
     // The needle (Z's byte pair) occurs only at non-boundary offsets 1
     // and 5 — a boundary-respecting literal search must reject both, in
@@ -639,6 +653,83 @@ fn literal_search_rejects_shift_jis_boundary_splice_candidates() {
         doc.find_prev(&needle_text, TextPosition::new(usize::MAX, usize::MAX)),
         None,
         "reverse search must reject spliced candidates too"
+    );
+
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+#[test]
+fn literal_search_rejects_shift_jis_splice_on_piece_table() {
+    // Same splice fixture as the mmap test above, but the splice lands
+    // inside piece bytes: the Shift_JIS document is promoted to the
+    // piece-table edit buffer by a first insert, and the splice pair is
+    // appended through the encoded edit path, which writes the raw
+    // Shift_JIS splice bytes into the add buffer. The needle's byte pair
+    // then sits at non-boundary offsets inside piece bytes, and both
+    // search directions must prove the candidate's character boundary
+    // (the piece-table prev walk anchors at the nearest line break)
+    // before reporting a match.
+    let (s1, s2, splice_bytes, needle_text) = shift_jis_splice_fixture();
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("shift-jis-splice-piece.bin");
+    // ASCII-only fill: identical bytes in Shift_JIS and free of lead
+    // bytes, so the needle byte pair cannot occur anywhere outside the
+    // appended splice.
+    let fill = b"abc\ndef\n".repeat(1024);
+    let mut file_bytes = Vec::new();
+    while file_bytes.len() < PIECE_TREE_DISK_MIN_BYTES {
+        file_bytes.extend_from_slice(&fill);
+    }
+    std::fs::write(&path, &file_bytes).unwrap();
+
+    let mut doc =
+        Document::open_with_encoding(&path, DocumentEncoding::from_encoding_rs(SHIFT_JIS)).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "X").unwrap();
+    assert!(
+        doc.has_piece_table(),
+        "the first edit must promote the Shift_JIS document to the piece-table edit buffer"
+    );
+
+    // Append the doubled splice pair at the end of the text through the
+    // encoded insert path: the decoded "s1s2s1s2" encodes back to the
+    // raw splice bytes, so the needle pair sits at non-boundary offsets
+    // inside the add buffer.
+    let last_line0 = doc.text_lossy().matches('\n').count();
+    let splice_text = format!("{s1}{s2}{s1}{s2}");
+    let _ = doc.try_insert_text_at(last_line0, 0, &splice_text).unwrap();
+
+    // Non-vacuity: the raw piece bytes must contain the needle's byte
+    // pair (twice), while the decoded text never contains the needle as
+    // a character — the pair only occurs across a character boundary.
+    let piece_table = doc
+        .piece_table
+        .as_ref()
+        .expect("the piece table must hold the appended splice");
+    let raw = piece_table.read_range(0, piece_table.total_len());
+    let needle_bytes = &splice_bytes[1..3];
+    let occurrences = raw
+        .windows(needle_bytes.len())
+        .filter(|window| *window == needle_bytes)
+        .count();
+    assert!(
+        occurrences >= 2,
+        "splice bytes must reach the piece-table bytes; s1={s1:?} needle={needle_text:?}"
+    );
+    assert!(
+        !doc.text_lossy().contains(&needle_text),
+        "the decoded text must not contain the spliced needle; s1={s1:?} needle={needle_text:?}"
+    );
+
+    assert_eq!(
+        doc.find_prev(&needle_text, TextPosition::new(usize::MAX, usize::MAX)),
+        None,
+        "piece-table reverse search must reject spliced non-boundary candidates"
+    );
+    assert_eq!(
+        doc.find_next(&needle_text, TextPosition::new(0, 0)),
+        None,
+        "piece-table forward search must reject spliced non-boundary candidates"
     );
 
     let _ = std::fs::remove_dir_all(dir.path());
