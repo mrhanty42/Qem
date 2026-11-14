@@ -569,18 +569,17 @@ fn ranges_from_allocated_buffer(
 }
 
 fn should_build_index_synchronously(_source_path: &Path, file_len: usize) -> bool {
-    if file_len == 0 {
-        return true;
-    }
-
-    #[cfg(windows)]
-    {
-        if let Ok(ranges) = windows_allocated_ranges(_source_path, file_len) {
-            return total_scannable_bytes(&ranges) <= INDEX_SYNC_BUILD_MAX_SCAN_BYTES;
+    // An empty file is indexed instantly; otherwise only the allocated
+    // (non-sparse) ranges decide, and the fallback is the async build.
+    if file_len != 0 {
+        #[cfg(windows)]
+        {
+            if let Ok(ranges) = windows_allocated_ranges(_source_path, file_len) {
+                return total_scannable_bytes(&ranges) <= INDEX_SYNC_BUILD_MAX_SCAN_BYTES;
+            }
         }
     }
-
-    false
+    file_len == 0
 }
 
 #[cfg(any(windows, test))]
