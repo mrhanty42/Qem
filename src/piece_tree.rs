@@ -353,19 +353,24 @@ impl PieceTree {
             .unwrap_or(RootEntry { root: None })
             .root;
         let known_history = vec![(meta.known_byte_len, meta.full_index); history.len()];
-        Ok(Some((
-            Self {
-                store: PageStore::Disk(store),
-                root,
-                history,
-                known_history,
-                history_index,
-                history_batch_depth: 0,
-                history_batch_dirty: false,
-            },
-            add,
-            meta,
-        )))
+        let tree = Self {
+            store: PageStore::Disk(store),
+            root,
+            history,
+            known_history,
+            history_index,
+            history_batch_depth: 0,
+            history_batch_dirty: false,
+        };
+        // A lazily-read piece page that fails its CRC answers `None` and
+        // the read paths silently skip the subtree, so a session whose
+        // live root reaches an unreadable page would open and advertise
+        // `total_len` over content it can never return. Verify every
+        // page reachable from the committed root up front: an invalid
+        // sidecar must surface as a typed error so the recovery layer
+        // drops it and rebuilds from the source file.
+        tree.verify_root_pages_readable()?;
+        Ok(Some((tree, add, meta)))
     }
 
     #[cfg(test)]
@@ -802,6 +807,35 @@ impl PieceTree {
 
     fn page(&self, page_id: u64) -> Option<Arc<PiecePage>> {
         self.store.get_page(page_id)
+    }
+
+    /// Open-time readability check: every piece page reachable from the
+    /// live root must be readable, because an unreadable page (CRC
+    /// mismatch, IO failure) otherwise answers `None` and the read paths
+    /// silently skip the subtree — a short read masquerading as a
+    /// complete document under a full `total_len`. Rejecting the open as
+    /// `InvalidData` lets the recovery layer drop the sidecar and
+    /// rebuild from the source file instead.
+    fn verify_root_pages_readable(&self) -> io::Result<()> {
+        let Some(root) = self.root else {
+            return Ok(());
+        };
+        self.verify_child_pages_readable(root)
+    }
+
+    fn verify_child_pages_readable(&self, child: ChildRef) -> io::Result<()> {
+        let Some(page) = self.page(child.page_id) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("qem session piece page {} is unreadable", child.page_id),
+            ));
+        };
+        if let PiecePage::Internal { children } = page.as_ref() {
+            for child in children {
+                self.verify_child_pages_readable(*child)?;
+            }
+        }
+        Ok(())
     }
 
     fn collect_pieces(&self, child: ChildRef, out: &mut Vec<Piece>) {
@@ -3162,25 +3196,101 @@ mod tests {
             file.flush().unwrap();
         }
 
-        let mut reopened = PieceTree::open_disk(&source).unwrap();
-        let insert_result = reopened.insert(
-            3,
-            Piece {
-                src: PieceSource::Add,
-                start: 10,
-                len: 2,
-                line_breaks: 1,
-            },
-            &mut split,
-        );
-        assert!(
-            insert_result.is_err(),
-            "editing through an unreadable piece page must fail, not lose the subtree"
-        );
+        // Since open-time verification exists, a session whose live root
+        // reaches the unreadable page must already fail `open` as a
+        // typed error (the recovery layer then drops the sidecar and
+        // rebuilds from the source). The edit-time refusal below stays
+        // as defense in depth for a page that turns unreadable only
+        // after a successful open, so both outcomes are accepted here.
+        match PieceTree::open_disk(&source) {
+            Err(err) => assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "open-time verification must reject the unreadable piece page as a typed error, got {:?}",
+                err.kind()
+            ),
+            Ok(mut reopened) => {
+                let insert_result = reopened.insert(
+                    3,
+                    Piece {
+                        src: PieceSource::Add,
+                        start: 10,
+                        len: 2,
+                        line_breaks: 1,
+                    },
+                    &mut split,
+                );
+                assert!(
+                    insert_result.is_err(),
+                    "editing through an unreadable piece page must fail, not lose the subtree"
+                );
+                assert_eq!(
+                    reopened.total_len(),
+                    7,
+                    "the refused edit must leave the tree content intact"
+                );
+            }
+        }
+
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_open_rejects_a_session_with_an_unreadable_piece_page() {
+        // A lazily-read piece page that no longer passes its CRC answers
+        // `None` to every reader, so a session whose live root reaches
+        // such a page used to open fine and advertised `total_len` over
+        // content the reads silently skipped. Open must verify every page
+        // reachable from the committed root up front and reject the
+        // session as a typed error, letting the recovery layer drop the
+        // sidecar and rebuild from the source file.
+        let dir = std::env::temp_dir().join(format!(
+            "qem-piece-tree-open-unreadable-piece-page-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef\n").unwrap();
+        let mut tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![
+                Piece {
+                    src: PieceSource::Original,
+                    start: 0,
+                    len: 4,
+                    line_breaks: 0,
+                },
+                Piece {
+                    src: PieceSource::Original,
+                    start: 4,
+                    len: 3,
+                    line_breaks: 1,
+                },
+            ],
+        )
+        .unwrap();
+        tree.flush_session(b"ignored-by-test", SessionMeta::default())
+            .unwrap();
+        drop(tree);
+
+        let sidecar = editlog_path(&source);
+        {
+            // Piece page 1 holds the original pieces; scramble its
+            // payload so the page CRC fails on the next lazy read.
+            let mut file = fs::OpenOptions::new().write(true).open(&sidecar).unwrap();
+            file.seek(SeekFrom::Start((EDITLOG_HEADER_BYTES + 8) as u64))
+                .unwrap();
+            file.write_all(&[0xFFu8; 16]).unwrap();
+            file.flush().unwrap();
+        }
+
+        let err = PieceTree::open_disk(&source).unwrap_err();
         assert_eq!(
-            reopened.total_len(),
-            7,
-            "the refused edit must leave the tree content intact"
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "opening a session whose live root reaches an unreadable piece page must fail as a typed error"
         );
 
         let _ = fs::remove_file(&sidecar);
