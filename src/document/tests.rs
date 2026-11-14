@@ -1290,6 +1290,39 @@ fn small_big5_document_still_saves_without_budget_errors() {
 }
 
 #[test]
+fn noop_backspace_keeps_clean_rope_document_clean() {
+    // A refused backspace (nothing before the cursor) must not mark the
+    // document dirty: the rope branch materialized the buffer through
+    // `rope_mut`, which sets the dirty flag before the no-op checks, so
+    // a backspace with nothing to delete left a clean document falsely
+    // modified (there is no undo entry to back it).
+    let mut doc = Document::new();
+    let _ = doc.try_insert_text_at(0, 0, "abc\n").unwrap();
+    doc.mark_clean();
+
+    // Nothing before the cursor on a non-empty rope.
+    let result = doc.try_backspace_at(0, 0).unwrap();
+    assert_eq!(result, (false, 0, 0));
+    assert!(!doc.is_dirty());
+
+    // Virtual space past the line end only moves the cursor.
+    let result = doc.try_backspace_at(0, 5).unwrap();
+    assert_eq!(result, (false, 0, 4));
+    assert!(!doc.is_dirty());
+
+    // Materializing the rope during a refused backspace stays clean too.
+    let mut fresh = Document::new();
+    let result = fresh.try_backspace_at(0, 0).unwrap();
+    assert_eq!(result, (false, 0, 0));
+    assert!(!fresh.is_dirty());
+
+    // Sanity: a real deletion still marks the document dirty.
+    let result = doc.try_backspace_at(0, 1).unwrap();
+    assert_eq!(result, (true, 0, 0));
+    assert!(doc.is_dirty());
+}
+
+#[test]
 fn piece_table_line_lengths_for_edit_supports_large_exact_prefix() {
     let dir =
         std::env::temp_dir().join(format!("standpad-doc-large-prefix-{}", std::process::id()));

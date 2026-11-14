@@ -822,9 +822,14 @@ impl Document {
 
         // Documents that fell back to the rope edit-buffer bridge
         // (canonical UTF-8) reuse the rope path, like the encoded
-        // delete path.
+        // delete path. The rope is materialized without the dirty flag:
+        // the no-op checks below may return without deleting anything,
+        // and mark_dirty runs only after the real removal.
         if self.piece_table.is_none() {
-            let rope = self.rope_mut()?;
+            self.ensure_rope()?;
+            let Some(rope) = self.rope.as_mut() else {
+                return Err(self.missing_rope_error());
+            };
             if rope.len_chars() == 0 {
                 return Ok((false, line0, col0));
             }
@@ -1037,7 +1042,15 @@ impl Document {
             }
         }
 
-        let rope = self.rope_mut()?;
+        // Materialize the rope without marking the document dirty: the
+        // no-op checks below may return without deleting anything, and a
+        // refused backspace must not report itself modified (there is no
+        // undo entry to back it) - same rule as the piece-table branch
+        // above and the delete paths.
+        self.ensure_rope()?;
+        let Some(rope) = self.rope.as_mut() else {
+            return Err(self.missing_rope_error());
+        };
         if rope.len_chars() == 0 {
             return Ok((false, line0, col0));
         }
@@ -1064,6 +1077,7 @@ impl Document {
         rope.remove((cur - 1)..cur);
         self.rope_history
             .record(cur - 1, prev_ch.to_string(), String::new());
+        self.mark_dirty();
 
         if prev_ch == '\n' {
             let new_line0 = line0.saturating_sub(1);
