@@ -276,6 +276,7 @@ pub struct LiteralSearchQuery {
     needle_units: usize,
     dead: bool,
     even_grid: bool,
+    boundary_walk: bool,
     search_bytes: Vec<u8>,
     finder: Finder<'static>,
     finder_rev: FinderRev<'static>,
@@ -321,6 +322,12 @@ impl LiteralSearchQuery {
 
         let mut dead = false;
         let even_grid = is_utf16_name(encoding.name());
+        // CJK multibyte byte grids are not self-synchronizing: a byte pair
+        // can appear starting on a trail byte of a neighboring character.
+        // Candidates get a boundary walk check (see candidate_boundary_ok).
+        let boundary_walk = !encoding.is_utf8()
+            && !even_grid
+            && !encoding_engine::SingleByteEngine::supports(encoding);
         let search_bytes = if encoding.is_utf8() {
             utf8_bytes.clone()
         } else if is_utf16_name(encoding.name()) {
@@ -352,6 +359,7 @@ impl LiteralSearchQuery {
             needle_units,
             dead,
             even_grid,
+            boundary_walk,
             search_bytes,
             finder,
             finder_rev,
@@ -394,6 +402,33 @@ impl LiteralSearchQuery {
     /// so a hit at an odd offset is a byte collision, not the text.
     const fn candidate_grid_ok(&self, abs_offset: usize) -> bool {
         !self.even_grid || abs_offset % 2 == 0
+    }
+
+    /// Walks `bytes` from the known character boundary `from` (byte 0 of
+    /// the slice is always a boundary for the callers of this helper)
+    /// through the encoding's cell sizes and reports whether the walk
+    /// lands exactly on `to`. Multibyte byte grids are not
+    /// self-synchronizing, so a memmem candidate must be proven to sit on
+    /// a real character boundary this way.
+    fn boundary_walk_ok(
+        &self,
+        engine: &dyn super::encoding_engine::EncodingEngine,
+        bytes: &[u8],
+        from: usize,
+        to: usize,
+    ) -> bool {
+        if !self.boundary_walk {
+            return true;
+        }
+        let mut cursor = from;
+        while cursor < to {
+            let step = engine.step(bytes, cursor, bytes.len()).max(1);
+            cursor = (cursor + step).min(to + 1);
+            if cursor > to {
+                return false;
+            }
+        }
+        cursor == to
     }
 }
 
@@ -1078,12 +1113,21 @@ impl Document {
         }
 
         let mut search_from = start_offset.min(file_len);
+        let boundary = start_offset.min(file_len);
         loop {
             let rel = query.finder.find(&bytes[search_from..file_len])?;
             let match_start = search_from.saturating_add(rel);
-            if !query.candidate_grid_ok(match_start) {
-                // UTF-16 byte collision at an odd offset: skip it and keep
-                // scanning.
+            if !query.candidate_grid_ok(match_start)
+                || !query.boundary_walk_ok(
+                    engine,
+                    bytes,
+                    boundary.saturating_sub(search_from),
+                    match_start.saturating_sub(search_from),
+                )
+            {
+                // A candidate that is not on a real character boundary
+                // (odd-offset UTF-16 collision, multibyte splice) is a
+                // byte splice, not the text: skip it and keep scanning.
                 search_from = match_start.saturating_add(1);
                 continue;
             }
@@ -1174,6 +1218,7 @@ impl Document {
         start_offset: usize,
     ) -> Option<(SearchMatch, usize)> {
         let mut search_offset = start_offset.min(piece_table.total_len);
+        let boundary = search_offset;
         let engine = piece_table.engine();
         loop {
             let (start_pos, match_start) = piece_table.find_literal_next_from_position(
@@ -1182,9 +1227,26 @@ impl Document {
                 query.bytes().len(),
                 &query.finder,
             )?;
-            if !query.candidate_grid_ok(match_start) {
-                // UTF-16 byte collision at an odd offset: skip it and keep
-                // scanning.
+            let walk_ok = if query.boundary_walk {
+                // Walk the stored bytes from the last known boundary to the
+                // candidate. The slice is small when candidates are close;
+                // far candidates pay one ranged read.
+                let base = boundary.min(match_start);
+                let slice = piece_table
+                    .read_range(base, match_start.max(boundary).min(piece_table.total_len));
+                query.boundary_walk_ok(
+                    engine,
+                    &slice,
+                    boundary.min(match_start).saturating_sub(base),
+                    match_start.saturating_sub(base),
+                )
+            } else {
+                query.candidate_grid_ok(match_start)
+            };
+            if !walk_ok {
+                // A candidate that is not on a real character boundary
+                // (odd-offset UTF-16 collision, multibyte splice) is a
+                // byte splice, not the text: skip it and keep scanning.
                 search_offset = match_start.saturating_add(1);
                 continue;
             }
