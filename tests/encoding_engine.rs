@@ -30,6 +30,9 @@ mod prop_open_save_roundtrip;
 #[path = "encoding_engine/prop_endianness.rs"]
 mod prop_endianness;
 
+#[path = "encoding_engine/prop_literal.rs"]
+mod prop_literal;
+
 // Per-encoding integration suite for Class A. Each module owns the
 // fixed four-test contract for one Class A encoding.
 
