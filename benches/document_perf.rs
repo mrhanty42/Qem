@@ -2,9 +2,11 @@ use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
 use qem::document::__test_support::build_edit_buffer_line_count;
-use qem::{Document, LiteralSearchQuery, RegexSearchQuery, TextPosition, TextSelection, ViewportRequest};
 #[cfg(feature = "editor")]
 use qem::{CompactionPolicy, DocumentSession, EditorTab};
+use qem::{
+    Document, LiteralSearchQuery, RegexSearchQuery, TextPosition, TextSelection, ViewportRequest,
+};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
