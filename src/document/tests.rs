@@ -4861,6 +4861,76 @@ fn scheduled_editlog_flush_failure_does_not_rollback_piece_table_edit() {
 }
 
 #[test]
+fn replace_batch_partial_land_reports_dirty() {
+    // Regression for the half-landed replace batch: `replace_range_at`
+    // runs delete + insert inside one edit batch, and the insert can be
+    // refused (resident-window verification with poisoned persistence)
+    // after the delete half already landed. The error must not hide the
+    // mutation: the document did change, dirty has to say so, and the
+    // deletion stays undoable - the same convention the rope composite
+    // documents in `try_replace_range`.
+    let dir = std::env::temp_dir().join(format!(
+        "qem-doc-replace-partial-land-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("partial-land.txt");
+    write_disk_backed_fixture(&path);
+    let original = std::fs::read(&path).unwrap();
+
+    let mut doc = Document::open(path.clone()).unwrap();
+    // Materialize the disk-backed piece table without an edit so the
+    // replace starts from a clean document and the dirty assertion
+    // actually pins the fix.
+    doc.prepare_edit_at(0).unwrap();
+    assert!(doc.has_piece_table());
+    assert!(!doc.is_dirty());
+
+    {
+        let piece_table = doc.piece_table.as_mut().expect("piece table expected");
+        piece_table.pieces.poison_persistence_for_test();
+        // Leave exactly three residency slots (mirrors the private
+        // `piece_tree::RESIDENT_PAGES_FAILED_PERSISTENCE_CAP` of 4096):
+        // the delete's copy-on-write rebuild fits into the window and
+        // lands, and the insert's first page then falls outside the
+        // window and refuses the edit.
+        piece_table.pieces.fill_resident_window_for_test(4096 - 3);
+        // Keep the debounced session flush deferred: an attempted flush
+        // would detach persistence and fold the undo history, which is
+        // not part of this regression.
+        piece_table.last_session_flush = Some(Instant::now());
+    }
+
+    // Line 4000 ("abc") sits deep inside one piece, far from the
+    // 512-line piece boundaries, so the delete rebuilds a bounded,
+    // deterministic path.
+    let result = doc.try_replace_range(4000, 0, 2, "Q");
+    assert!(
+        matches!(result, Err(DocumentError::Write { .. })),
+        "the refused insert must surface as a write error, got {result:?}"
+    );
+
+    // The delete half landed: the document did change even though the
+    // edit reported an error, so dirty must report it...
+    assert!(doc.is_dirty(), "a half-landed replace must report dirty");
+    // ...the content shows only the deletion ("ab" gone, the refused
+    // insert "Q" absent)...
+    let mut expected = original.clone();
+    expected.drain(16_000..16_002);
+    assert_eq!(doc.text_lossy(), String::from_utf8_lossy(&expected));
+    assert!(!doc.text_lossy().contains('Q'));
+
+    // ...and the deletion stays undoable: the first undo restores the
+    // pre-replace content.
+    assert!(doc.try_undo().unwrap());
+    assert_eq!(doc.text_lossy(), String::from_utf8_lossy(&original));
+
+    clear_session_sidecar(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn recovered_piece_table_session_supports_undo_and_redo() {
     let dir = std::env::temp_dir().join(format!("qem-doc-session-history-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
