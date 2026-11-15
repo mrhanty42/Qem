@@ -1563,7 +1563,19 @@ impl PieceTable {
                 line_breaks: 0,
             });
         }
-        self.pieces.replace_current_root_with_pieces(all);
+        // The splice rebuilds the root from fresh pages, so it can be
+        // refused while persistence is down and the resident window is
+        // exhausted. Surface the refusal as a write error and leave the
+        // piece tree untouched: landing a root that references pages
+        // reads would silently skip would truncate the document behind
+        // `total_len`.
+        let sidecar = session_sidecar_path(None, self.original.path());
+        self.pieces
+            .replace_current_root_with_pieces(all)
+            .map_err(|source| DocumentError::Write {
+                path: sidecar,
+                source,
+            })?;
         self.known_byte_len = window_end_doc;
         self.known_line_count += span_breaks;
         self.exact_base_line_breaks = self

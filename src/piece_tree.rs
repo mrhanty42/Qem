@@ -40,6 +40,11 @@ pub(crate) const EDITLOG_ENCODING_LABEL_OFFSET: usize = 128;
 pub(crate) const EDITLOG_ENCODING_LABEL_BYTES: usize = 64;
 const EDITLOG_PAGE_HEADER_BYTES: usize = 24;
 const EDITLOG_CACHE_PAGES: usize = 1024;
+/// Test-only mirror of `EDITLOG_CACHE_PAGES` so document-level tests can
+/// churn the read cache past its bound (see the failed-persistence save
+/// regression).
+#[cfg(test)]
+pub(crate) const EDITLOG_READ_CACHE_PAGES_FOR_TEST: usize = EDITLOG_CACHE_PAGES;
 /// Bound on pages kept resident while editlog persistence is down:
 /// each is an Arc'd page that only this map holds (see `alloc_page`).
 pub(crate) const RESIDENT_PAGES_FAILED_PERSISTENCE_CAP: usize = 4096;
@@ -758,8 +763,26 @@ impl PieceTree {
         Ok(rebuilt)
     }
 
-    pub(crate) fn replace_current_root_with_pieces(&mut self, pieces: Vec<Piece>) {
+    /// Replaces the live root with a tree rebuilt from `pieces` (same
+    /// history entry, no new undo step). The rebuild allocates fresh
+    /// pages, so it must satisfy the same residency contract as
+    /// `insert` / `delete_range`: while persistence is down the new root
+    /// may only reference pages the resident window actually holds. A
+    /// root referencing a refused page reads back silently truncated
+    /// (`visit_range_ref` skips unreadable pages) and would stream that
+    /// truncation into every save. On refusal the previous root stays in
+    /// place and the error is reported to the caller.
+    pub(crate) fn replace_current_root_with_pieces(
+        &mut self,
+        pieces: Vec<Piece>,
+    ) -> io::Result<()> {
+        let previous_root = self.root;
+        let first_new_page = self.store.next_page_id_hint();
         let root = self.build_tree_from_pieces(filter_zero_len(pieces));
+        if let Err(err) = self.store.verify_pages_resident_since(first_new_page) {
+            self.root = previous_root;
+            return Err(err);
+        }
         self.root = root;
         if let Some(entry) = self.history.get_mut(self.history_index) {
             entry.root = root;
@@ -767,6 +790,7 @@ impl PieceTree {
             self.history = vec![RootEntry { root }];
             self.history_index = 0;
         }
+        Ok(())
     }
 
     pub(crate) fn detach_persistence(&mut self) {

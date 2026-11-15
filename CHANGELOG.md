@@ -4,6 +4,59 @@
 
 ### Fixed
 
+- Saving a document whose editlog persistence had failed no longer
+  streams truncated (or empty) content. The forced compaction before a
+  save rebuilt the piece tree root from freshly allocated pages without
+  the failed-persistence residency contract `insert` and `delete`
+  enforce: once the editlog read cache evicted the failure-era pages,
+  reads silently skipped them (`visit_range_ref` skips unreadable
+  pages), the streamed save wrote that truncation to disk, and the
+  document finished marked clean. Root rewrites now verify that every
+  newly allocated page is resident while persistence is down and
+  refuse by leaving the previous root in place: compaction reports
+  "skipped" and the save streams the full content, and a splice
+  rebuild surfaces `DocumentError::Write`. Regression tests pin the
+  complete streamed content and the error-without-dirty symmetry of
+  refused deletes.
+- Reopening a session whose header totals disagree with the committed
+  root is rejected instead of silently clamped. `known_byte_len` is a
+  raw unchecksummed header field while every history and piece page
+  carries a CRC, so a flipped header byte was the one corruption that
+  changed a total while all pages stayed readable; recovery clamped
+  the disagreement and opened a document whose line index claimed
+  exactness over content it did not cover. The session open now rejects
+  the sidecar as `InvalidData` (dropping it and rebuilding from the
+  source file) when the known boundary exceeds the committed root's
+  byte count, or when a full-index session's boundary differs from it;
+  partial-index boundaries below the root stay legal.
+- Regex windows over Shift_JIS / GB18030 / EUC-KR documents are cut on
+  whole character cells. The fixed-size windows slid arbitrary byte
+  boundaries, and a boundary inside a multibyte character corrupted
+  both window edges: the trailing fragment decoded as U+FFFD (hiding a
+  match that straddles the boundary), and the next window's leading
+  trail byte decoded as a phantom ASCII character a match could anchor
+  on — a `@.+?x` search reported a match four bytes left of the real
+  text. Both window edges are now walked to whole cells through the
+  encoding engine (UTF-16 keeps its even-grid arithmetic), the overlap
+  follows the actual previous coverage, and a degenerate slide advances
+  one whole cell so the scan cannot stall.
+- Reopened sessions restore the document's encoding. The `.qem.editlog`
+  sidecar gains a v3 header that stores the encoding as a label: an
+  implicit reopen trusts it (a session flushed in windows-1251 reopens
+  as windows-1251 instead of being re-detected), an explicit open must
+  agree with it (otherwise the caller's contract governs a fresh open),
+  v2 sidecars keep their historical UTF-8-only recovery, and UTF-16/CJK
+  sessions are not recoverable through the byte-indexed session path
+  yet — they fall back to a fresh open. v2 headers fail the version
+  check, so an old-format sidecar is dropped and rebuilt from the
+  source file once.
+- Line scans in UTF-16 documents stop after the whole line-ending cell.
+  The raw `0x0A`/`0x0D` byte scan answered the byte just past the
+  line-ending byte, which is the middle of the two-byte cell (LF is
+  `[0x0A, 0x00]` in UTF-16LE): every reader slicing a line from that
+  offset decoded mid-cell garbage. The scan now advances past the full
+  cell, and a truncated tail can never shrink the offset behind the
+  raw byte.
 - Opening a session whose piece pages are unreadable is now rejected as
   a typed error. A lazily-read piece page that fails its CRC answers
   `None`, and the read paths silently skipped the subtree: an invalid

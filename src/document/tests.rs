@@ -5001,6 +5001,354 @@ fn replace_batch_partial_land_reports_dirty() {
 }
 
 #[test]
+fn refused_delete_surfaces_error_and_keeps_document_clean() {
+    // Persistence is poisoned and the resident window is full, so a
+    // delete's copy-on-write page rebuild is refused
+    // (`verify_pages_resident_since` on the delete path). The refusal
+    // must behave like the insert side: an honest write error, no dirty
+    // flag (the tree restores its root, nothing changed), and intact
+    // content. Same convention the refused-insert and refused-backspace
+    // regressions pin for their own paths.
+    let dir = std::env::temp_dir().join(format!("qem-doc-refused-delete-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("refused-delete.txt");
+    write_disk_backed_fixture(&path);
+
+    let mut doc = Document::open(path.clone()).unwrap();
+    // Materialize the disk-backed piece table without an edit so the
+    // dirty assertions actually pin the refusal behavior.
+    doc.prepare_edit_at(0).unwrap();
+    assert!(doc.has_piece_table());
+    assert!(!doc.is_dirty());
+
+    {
+        let piece_table = doc.piece_table.as_mut().expect("piece table expected");
+        piece_table.pieces.poison_persistence_for_test();
+        piece_table.pieces.fill_resident_window_for_test(
+            crate::piece_tree::RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
+        );
+    }
+
+    let expected = doc.text_lossy();
+
+    let delete_result = doc.try_delete_forward_at(0, 0);
+    assert!(
+        matches!(delete_result, Err(DocumentError::Write { .. })),
+        "the refused delete must surface a write error, got {delete_result:?}"
+    );
+    assert!(
+        !doc.is_dirty(),
+        "a refused delete changed nothing and must not report the document modified"
+    );
+    assert_eq!(doc.text_lossy(), expected);
+
+    let backspace_result = doc.try_backspace_at(0, 1);
+    assert!(
+        matches!(backspace_result, Err(DocumentError::Write { .. })),
+        "the refused backspace must surface a write error, got {backspace_result:?}"
+    );
+    assert!(
+        !doc.is_dirty(),
+        "a refused backspace changed nothing and must not report the document modified"
+    );
+    assert_eq!(doc.text_lossy(), expected);
+
+    clear_session_sidecar(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn save_with_failed_persistence_streams_complete_content() {
+    // Hostile save scenario: persistence is down (the resident window is
+    // the only guaranteed home for new piece pages) and the save
+    // pipeline's forced-compaction pass rewrites the live root via
+    // `replace_current_root_with_pieces`. The rewritten root must obey
+    // the same resident-window contract as insert/delete: a root that
+    // references pages the window refused reads back silently truncated
+    // (`visit_range_ref` skips unreadable pages) — the page lingers in
+    // the small editlog read cache at first, but as soon as later
+    // refusals evict it the document reads back empty and the save
+    // streamer would persist that truncation as a "successful" save.
+    // The rewrite must be refused instead, and the save must stream the
+    // complete content.
+    let dir = std::env::temp_dir().join(format!(
+        "qem-doc-save-failed-persistence-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("save-failed-persistence.txt");
+    write_disk_backed_fixture(&path);
+    let mut expected_bytes = b"123".to_vec();
+    expected_bytes.extend_from_slice(&std::fs::read(&path).unwrap());
+    let expected_text = String::from_utf8_lossy(&expected_bytes).to_string();
+
+    let mut doc = Document::open(path.clone()).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
+    assert!(doc.has_piece_table());
+    {
+        let piece_table = doc.piece_table.as_mut().expect("piece table expected");
+        piece_table.pieces.poison_persistence_for_test();
+        piece_table.pieces.fill_resident_window_for_test(
+            crate::piece_tree::RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
+        );
+        // Keep the debounced session flush deferred while the forced
+        // compaction runs: a flush attempt would detach persistence,
+        // which would mask the root-rewrite bug this pins.
+        piece_table.last_session_flush = Some(Instant::now());
+    }
+
+    // A deliberately tiny policy forces the compaction pass on this
+    // small document (the defaults need >8Ki pieces).
+    let policy = CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 2,
+        small_piece_threshold_bytes: 1,
+        max_average_piece_bytes: 1,
+        min_fragmentation_ratio: 0.0,
+        forced_piece_count: 2,
+        forced_fragmentation_ratio: 0.0,
+    };
+    let compacted = doc.compact_piece_table_if_recommended(policy).unwrap();
+    assert!(
+        compacted.is_none(),
+        "with the resident window exhausted the root rewrite must be refused"
+    );
+
+    // The live tree must stay intact whether or not the rewrite was
+    // attempted, and it must stay intact after the small editlog read
+    // cache has been churned past its bound by refused edits (each
+    // refusal still allocates candidate pages, evicting the pages the
+    // old LRU cache was hiding behind).
+    assert_eq!(doc.text_lossy(), expected_text);
+    {
+        let piece_table = doc.piece_table.as_mut().expect("piece table expected");
+        for _ in 0..(crate::piece_tree::EDITLOG_READ_CACHE_PAGES_FOR_TEST * 2) {
+            let _ = piece_table.insert_bytes(1, b"X");
+        }
+    }
+    assert_eq!(
+        doc.text_lossy(),
+        expected_text,
+        "the document must read back complete after refused edits churn the page cache"
+    );
+
+    let target = dir.join("save-failed-persistence-target.txt");
+    doc.save_to(&target).unwrap();
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        expected_bytes,
+        "the save streamer must not persist a truncated snapshot of a \
+         document whose persistence failed"
+    );
+
+    clear_session_sidecar(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn literal_search_reads_complete_document_across_resident_window() {
+    // Persistence failed mid-session: pages written before the failure
+    // live only on disk, pages written after it live only in the
+    // resident window (and any further page allocation is refused). The
+    // literal-search consumers must still see the whole document -
+    // complete match counts and positions across both regions - because
+    // the tree never references a page the window refused (insert and
+    // delete verify residency; the save-time compaction rewrite is
+    // refused the same way).
+    let dir = std::env::temp_dir().join(format!(
+        "qem-doc-search-resident-window-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("search-resident-window.txt");
+    write_disk_backed_fixture(&path);
+    let fixture = std::fs::read_to_string(&path).unwrap();
+
+    let mut doc = Document::open(path.clone()).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
+    {
+        let piece_table = doc.piece_table.as_mut().expect("piece table expected");
+        piece_table.pieces.poison_persistence_for_test();
+        // Keep the debounced session flush deferred: a flush attempt
+        // would detach persistence, which is not what this pins.
+        piece_table.last_session_flush = Some(Instant::now());
+    }
+    // The post-failure edit lands in the resident window: line 4000 is
+    // far inside the document, so its copy-on-write rebuild mixes
+    // window-resident pages with the on-disk pages around them.
+    let _ = doc.try_insert_text_at(4000, 0, "XYZ").unwrap();
+    {
+        let piece_table = doc.piece_table.as_mut().expect("piece table expected");
+        piece_table.pieces.fill_resident_window_for_test(
+            crate::piece_tree::RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
+        );
+        // Churn the small editlog read cache past its bound with refused
+        // edits: the window-resident marker pages must stay readable
+        // through the resident window itself, not through the
+        // short-lived LRU cache.
+        for _ in 0..(crate::piece_tree::EDITLOG_READ_CACHE_PAGES_FOR_TEST * 2) {
+            let _ = piece_table.insert_bytes(1, b"X");
+        }
+    }
+
+    // Full-content oracle built the same way the edit lands: the doc is
+    // "123" + fixture, and "XYZ" is inserted at the start of doc line
+    // 4000 (the first line after the 4000th '\n' of that text).
+    let base = format!("123{}", fixture);
+    let line_start = base
+        .match_indices('\n')
+        .nth(3999)
+        .map(|(i, _)| i + 1)
+        .expect("fixture has at least 4000 lines");
+    let expected = format!("{}XYZ{}", &base[..line_start], &base[line_start..]);
+    assert_eq!(doc.text_lossy(), expected);
+
+    // Position oracle: byte offsets of the oracle string map onto
+    // line/col the way the search API reports them.
+    fn text_position_of_byte_offset(text: &str, byte: usize) -> TextPosition {
+        let prefix = &text[..byte];
+        let line0 = prefix.bytes().filter(|&b| b == b'\n').count();
+        let line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        TextPosition::new(line0, byte - line_start)
+    }
+    let marker_byte = expected.find("XYZ").expect("oracle contains the marker");
+    let marker_pos = text_position_of_byte_offset(&expected, marker_byte);
+
+    // Match counts must cover the on-disk region, the resident region,
+    // and the marker itself.
+    assert_eq!(doc.find_all("abc").count(), expected.matches("abc").count());
+    assert_eq!(doc.find_all("def").count(), expected.matches("def").count());
+    assert_eq!(doc.find_all("XYZ").count(), 1);
+
+    let marker = doc
+        .find_next("XYZ", TextPosition::new(0, 0))
+        .expect("the resident-region marker must be found");
+    assert_eq!(marker.start(), marker_pos);
+
+    // The search continues past the marker on real positions.
+    let after_byte = expected[marker_byte + 3..]
+        .find("def")
+        .expect("oracle has a def past the marker");
+    let after_marker = doc
+        .find_next("def", marker.end())
+        .expect("the region past the marker must be found");
+    assert_eq!(
+        after_marker.start(),
+        text_position_of_byte_offset(&expected, marker_byte + 3 + after_byte)
+    );
+
+    let reversed = doc
+        .find_prev("XYZ", TextPosition::new(usize::MAX, 0))
+        .expect("reverse search finds the marker");
+    assert_eq!(reversed.start(), marker_pos);
+
+    clear_session_sidecar(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn class_b_regex_search_reads_complete_document_across_resident_window() {
+    // Same hostile state as the literal variant, driven through the
+    // Class B chunked regex windows: the Shift_JIS document spans
+    // on-disk pages (pre-failure) and resident-window pages
+    // (post-failure), and the chunked scan fetches window bytes through
+    // the piece tree (`fetch_class_b_window` ->
+    // `piece_table_uncapped_range`). Matches on both sides of the
+    // disk/resident split must survive with honest positions.
+    let dir = std::env::temp_dir().join(format!(
+        "qem-doc-regex-resident-window-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("regex-resident-window.txt");
+    let line = "\u{3042}\u{3044}\u{3046}\u{3048}\u{304A}\u{304B}\u{304D}\u{304F}\u{3051}\u{3053}\n";
+    // Enough lines that the marker line exists and the Shift_JIS file
+    // (20 bytes per line) crosses the disk-backed piece-table gate.
+    let sjis_line_bytes = SHIFT_JIS.encode(line).0.len();
+    let repeats = (2 * 1024 * 1024 / sjis_line_bytes) + 8;
+    let content = line.repeat(repeats);
+    let (encoded, used, had_errors) = SHIFT_JIS.encode(&content);
+    assert_eq!(used, SHIFT_JIS);
+    assert!(!had_errors, "shift_jis fixture must round-trip cleanly");
+    std::fs::write(&path, encoded.as_ref()).unwrap();
+
+    let mut doc =
+        Document::open_with_encoding(&path, DocumentEncoding::from_label("shift_jis").unwrap())
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while doc.is_indexing() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let _ = doc
+        .try_insert_text_at(0, 0, "\u{30C6}\u{30B9}\u{30C8}")
+        .unwrap();
+    {
+        let piece_table = doc.piece_table.as_mut().expect("piece table expected");
+        piece_table.pieces.poison_persistence_for_test();
+        piece_table.last_session_flush = Some(Instant::now());
+    }
+    let marker_line = 40000usize;
+    let _ = doc
+        .try_insert_text_at(marker_line, 0, "\u{30DE}\u{30FC}\u{30AB}\u{30FC}")
+        .unwrap();
+    {
+        let piece_table = doc.piece_table.as_mut().expect("piece table expected");
+        piece_table.pieces.fill_resident_window_for_test(
+            crate::piece_tree::RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
+        );
+        // Churn the small editlog read cache past its bound with refused
+        // edits: the window-resident marker pages must stay readable
+        // through the resident window itself, not through the
+        // short-lived LRU cache.
+        for _ in 0..(crate::piece_tree::EDITLOG_READ_CACHE_PAGES_FOR_TEST * 2) {
+            let _ = piece_table.insert_bytes(1, b"X");
+        }
+    }
+
+    // Full-content oracle: the head marker joins line 0, and the far
+    // marker opens doc line `marker_line` (doc line k is content line k
+    // for k >= 1; every fixture line is 10 chars / `line.len()` bytes).
+    let marker_byte = marker_line * line.len();
+    let expected = format!(
+        "\u{30C6}\u{30B9}\u{30C8}{}\u{30DE}\u{30FC}\u{30AB}\u{30FC}{}",
+        &content[..marker_byte],
+        &content[marker_byte..]
+    );
+    assert_eq!(doc.text_lossy(), expected);
+
+    // Tiny regex windows force the chunked scan to cross the
+    // disk/resident page split many times.
+    // Tiny regex windows force the chunked scan to cross the
+    // disk/resident page split many times.
+    super::regex_search::class_b_chunk_geometry_override::set(64 * 1024, 8 * 1024);
+
+    let marker_matches: Vec<_> = doc
+        .find_all_regex("\u{30DE}\u{30FC}\u{30AB}\u{30FC}")
+        .unwrap()
+        .collect();
+    assert_eq!(marker_matches.len(), 1);
+    assert_eq!(marker_matches[0].start(), TextPosition::new(marker_line, 0));
+    assert_eq!(marker_matches[0].len_chars(), 4);
+    assert_eq!(marker_matches.len(), 1);
+    assert_eq!(marker_matches[0].start(), TextPosition::new(marker_line, 0));
+    assert_eq!(marker_matches[0].len_chars(), 4);
+
+    let first = doc
+        .find_next_regex("\u{30DE}\u{30FC}\u{30AB}\u{30FC}", TextPosition::new(0, 0))
+        .unwrap()
+        .expect("the far marker must be found from the document head");
+    assert_eq!(first.start(), TextPosition::new(marker_line, 0));
+
+    clear_session_sidecar(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn recovered_piece_table_session_supports_undo_and_redo() {
     let dir = std::env::temp_dir().join(format!("qem-doc-session-history-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);

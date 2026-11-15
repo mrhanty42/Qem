@@ -216,7 +216,20 @@ impl PieceTable {
                 line_breaks,
             }]
         };
-        self.pieces.replace_current_root_with_pieces(replacement);
+        // The rewrite allocates fresh pages, so it can be refused while
+        // persistence is down and the resident window is exhausted (the
+        // same contract insert/delete enforce). Compaction is a
+        // maintenance optimization: skip it and keep the live tree
+        // untouched rather than leaving the root referencing pages reads
+        // would silently skip.
+        if self
+            .pieces
+            .replace_current_root_with_pieces(replacement)
+            .is_err()
+        {
+            self.add.truncate(add_start);
+            return Ok(false);
+        }
         self.total_len = compacted_len;
         self.known_byte_len = compacted_len;
         self.full_index = true;
