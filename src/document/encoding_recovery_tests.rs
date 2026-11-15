@@ -143,6 +143,39 @@ fn corrupt_encoding_label_rejects_the_session_and_rebuilds_from_source() {
 }
 
 #[test]
+fn corrupt_known_byte_len_rejects_the_session_and_rebuilds_from_source() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session-corrupt-known-len.txt");
+    write_windows_1251_fixture(&path);
+    flush_windows_1251_session(&path);
+
+    // `known_byte_len` is a raw unchecksummed header total. Pushing it
+    // above the committed root's byte count makes the header disagree
+    // with the root it describes while every page stays readable: the
+    // open must cross-validate the totals and reject the session
+    // (InvalidData) so recovery drops the sidecar and rebuilds from the
+    // source file instead of silently clamping the boundary.
+    let sidecar = editlog_path(&path);
+    assert!(sidecar.exists(), "expected persisted editlog sidecar");
+    let doc_len = std::fs::metadata(&path).unwrap().len() + 3; // "123" insert
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&sidecar)
+        .unwrap();
+    file.seek(std::io::SeekFrom::Start(104)).unwrap();
+    file.write_all(&(doc_len + 64).to_le_bytes()).unwrap();
+    file.flush().unwrap();
+    drop(file);
+
+    let reopened = Document::open(&path).unwrap();
+
+    assert!(!reopened.has_edit_buffer());
+    assert!(!reopened.has_piece_table());
+    assert!(reopened.text_lossy().starts_with("abc\u{FFFD}\n"));
+    assert!(!sidecar.exists(), "invalid sidecar must be dropped");
+}
+
+#[test]
 fn mismatched_explicit_encoding_does_not_recover_the_session() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("session-mismatch.txt");

@@ -422,6 +422,36 @@ impl PieceTree {
             history_batch_depth: 0,
             history_batch_dirty: false,
         };
+        // Cross-validate the raw (unchecksummed) header totals against the
+        // committed root they claim to describe. The header is the only
+        // checksummed-free place a divergent total can live: history and
+        // piece pages carry per-page CRCs, so a flipped header byte is the
+        // one corruption that changes a total while every page stays
+        // readable. The known boundary is a prefix of the document, so it
+        // can never exceed the committed root's byte count, and a full-index
+        // session must cover the whole document, so its boundary equals it.
+        // Without this check recovery silently clamped the disagreement
+        // (`meta.known_byte_len.min(total_len)`), reopening with a line
+        // index that claimed exactness over content it did not cover.
+        let root_bytes = root.map(|child| child.total_bytes).unwrap_or(0);
+        if meta.known_byte_len > root_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "qem editlog known_byte_len {} exceeds the committed root size {root_bytes}",
+                    meta.known_byte_len
+                ),
+            ));
+        }
+        if meta.full_index && meta.known_byte_len != root_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "qem editlog full-index known_byte_len {} does not match the committed root size {root_bytes}",
+                    meta.known_byte_len
+                ),
+            ));
+        }
         // A lazily-read piece page that fails its CRC answers `None` and
         // the read paths silently skip the subtree, so a session whose
         // live root reaches an unreadable page would open and advertise
@@ -3218,6 +3248,138 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Builds a small disk-backed session (original `abcdef\n` plus a
+    /// 2-byte insert, committed root total 9 bytes) flushed with the given
+    /// session metadata, so a test can shape the header totals that the
+    /// corruption below mutates.
+    fn flushed_disk_session_with_meta(
+        dir_name: &str,
+        meta: SessionMeta,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("qem-piece-tree-{dir_name}-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef\n").unwrap();
+        let mut tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 7,
+                line_breaks: 1,
+            }],
+        )
+        .unwrap();
+        let mut split = |piece: Piece, left_len: usize| {
+            let left = Piece {
+                src: piece.src,
+                start: piece.start,
+                len: left_len,
+                line_breaks: 0,
+            };
+            let right = Piece {
+                src: piece.src,
+                start: piece.start + left_len,
+                len: piece.len - left_len,
+                line_breaks: piece.line_breaks,
+            };
+            (Some(left), Some(right))
+        };
+        tree.insert(
+            3,
+            Piece {
+                src: PieceSource::Add,
+                start: 10,
+                len: 2,
+                line_breaks: 1,
+            },
+            &mut split,
+        )
+        .unwrap();
+        tree.flush_session(b"ignored-by-test", meta).unwrap();
+        drop(tree);
+        let sidecar = editlog_path(&source);
+        (source, sidecar)
+    }
+
+    fn corrupt_header_u64(sidecar: &std::path::Path, offset: u64, value: u64) {
+        let mut file = fs::OpenOptions::new().write(true).open(sidecar).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&value.to_le_bytes()).unwrap();
+        file.flush().unwrap();
+    }
+
+    #[test]
+    fn disk_open_rejects_known_byte_len_above_the_committed_root() {
+        // `known_byte_len` is a raw unchecksummed header field that
+        // recovery clamps against the committed root size
+        // (`meta.known_byte_len.min(total_len)`), so a corrupt value above
+        // the root's total byte count used to open as a session whose
+        // known-index boundary silently disagreed with the content it
+        // advertises. The known boundary is a prefix of the document, so
+        // it can never legally exceed the committed root: reject the
+        // session so the sidecar is dropped and rebuilt.
+        let (source, sidecar) = flushed_disk_session_with_meta(
+            "known-byte-len-above-root",
+            SessionMeta {
+                known_byte_len: 4,
+                full_index: false,
+                ..SessionMeta::default()
+            },
+        );
+
+        // The committed root totals 9 bytes (7 original + 2 add); a
+        // partial-index boundary of 4 is legal, 73 is not.
+        corrupt_header_u64(&sidecar, 104, 73);
+
+        let err = PieceTree::open_disk(&source).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a known_byte_len above the committed root must reject the session"
+        );
+
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(source.parent().unwrap());
+    }
+
+    #[test]
+    fn disk_open_rejects_full_index_known_byte_len_below_the_committed_root() {
+        // A full-index session carries the exact line index for the whole
+        // document, so its flushed `known_byte_len` always equals the
+        // committed root's total byte count (the edit paths maintain
+        // `known_byte_len == total_len` whenever `full_index` is set). A
+        // corrupt header that breaks that equality would reopen with a
+        // full index claiming exact line counts over a shorter known
+        // boundary; reject instead of silently clamping.
+        let (source, sidecar) = flushed_disk_session_with_meta(
+            "known-byte-len-full-index",
+            SessionMeta {
+                known_byte_len: 9,
+                full_index: true,
+                ..SessionMeta::default()
+            },
+        );
+
+        // One byte below the committed root total of 9: still a legal
+        // partial-index boundary, so only the full-index equality rule
+        // can catch this divergence.
+        corrupt_header_u64(&sidecar, 104, 8);
+
+        let err = PieceTree::open_disk(&source).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a full-index known_byte_len below the committed root must reject the session"
+        );
+
+        let _ = fs::remove_file(&sidecar);
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(source.parent().unwrap());
+    }
+
     #[test]
     fn disk_edit_fails_typed_when_a_piece_page_is_unreadable() {
         // A lazily-read piece page whose bytes no longer pass the page
@@ -3826,10 +3988,14 @@ mod tests {
         tree: &mut PieceTree,
         encoding: Option<crate::document::DocumentEncoding>,
     ) {
+        // The fixture roots total 6 bytes, and open cross-validates a
+        // full-index `known_byte_len` against that total, so the flushed
+        // metadata must stay consistent (a full index always covers the
+        // whole document).
         tree.flush_session(
             b"add",
             SessionMeta {
-                known_byte_len: 4,
+                known_byte_len: 6,
                 full_index: true,
                 encoding,
                 encoding_origin: Some(crate::document::DocumentEncodingOrigin::Utf8FastPath),
