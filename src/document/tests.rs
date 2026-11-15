@@ -5924,6 +5924,53 @@ fn literal_search_finds_next_match_from_nonzero_piece_table_anchor() {
 }
 
 #[test]
+fn piece_table_position_scan_is_engine_accurate_in_utf16le() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf16le-piece-table-scan.txt");
+    let filler_line = "filler XYZ\n";
+    let target_line = "TARGET line\n";
+    // The piece-table gate needs a >1 MiB document; UTF-16LE stores one
+    // 2-byte code unit per ASCII character, so the encoded file is twice
+    // the unit count.
+    let filler_units = filler_line.chars().count();
+    let prefix_units = 40 * filler_units + target_line.chars().count();
+    let filler_lines =
+        ((PIECE_TABLE_MIN_BYTES / 2 + 32 * 1024).saturating_sub(prefix_units) / filler_units) + 1;
+    let mut text = String::with_capacity((40 + filler_lines + 1) * filler_line.len());
+    for _ in 0..40 {
+        text.push_str(filler_line);
+    }
+    text.push_str(target_line);
+    for _ in 0..filler_lines {
+        text.push_str(filler_line);
+    }
+    assert!(text.chars().count() * 2 >= PIECE_TABLE_MIN_BYTES);
+    let mut bytes = Vec::with_capacity(text.len() * 2);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut doc = Document::open_with_encoding(&path, DocumentEncoding::utf16le()).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "X").unwrap();
+    assert!(doc.has_piece_table());
+
+    // The oracle comes from the constructed text: TARGET opens line 40
+    // (after the 40 filler lines), so its column must be exactly 0. The
+    // raw-byte position scan trips over the `[0x0A, 0x00]` LF cells and
+    // reports a phantom column instead.
+    let found = doc.find_next("TARGET", TextPosition::new(0, 0)).unwrap();
+    assert_eq!(found.start(), TextPosition::new(40, 0));
+    assert_eq!(found.end(), TextPosition::new(40, 6));
+
+    let previous = doc
+        .find_prev("TARGET", TextPosition::new(usize::MAX, usize::MAX))
+        .unwrap();
+    assert_eq!(previous.start(), TextPosition::new(40, 0));
+    assert_eq!(previous.end(), TextPosition::new(40, 6));
+}
+
+#[test]
 fn literal_search_finds_previous_match_with_end_before_boundary() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("search-prev-mmap.txt");

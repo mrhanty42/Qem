@@ -35,35 +35,81 @@ impl PositionScanState {
     }
 }
 
+/// Line-break classification for one encoding cell during a position scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellBreak {
+    /// The cell is a lone LF line break.
+    Lf,
+    /// The cell is a CR line break (possibly followed by LF: CRLF collapses
+    /// through the scan state's `prev_was_cr`).
+    Cr,
+    /// The cell is ordinary text — exactly one column.
+    Text,
+}
+
 fn scan_position_bytes(
     engine: &dyn super::encoding_engine::EncodingEngine,
     bytes: &[u8],
     state: &mut PositionScanState,
 ) {
+    // Line breaks must be recognised on WHOLE encoding cells, never on raw
+    // bytes. In UTF-16LE the LF cell is `[0x0A, 0x00]`: treating the lone
+    // `0x0A` byte as a break and its `0x00` trail as text corrupts both the
+    // column count and the following line's characters, and CJK multibyte
+    // trail bytes can alias `0x0A` / `0x0D`. Single-byte cells stay
+    // byte-exact, and multi-byte non-UTF-16 cells (CJK) can never classify
+    // as a break because the whole cell is compared.
+    let utf16_cells = match engine.encoding().name() {
+        "UTF-16LE" => Some(([0x0A, 0x00], [0x0D, 0x00])),
+        "UTF-16BE" => Some(([0x00, 0x0A], [0x00, 0x0D])),
+        _ => None,
+    };
+
     let mut i = 0usize;
     while i < bytes.len() {
-        match bytes[i] {
-            b'\n' => {
+        let step = engine.step(bytes, i, bytes.len()).max(1);
+        let cell_end = (i + step).min(bytes.len());
+        let cell = &bytes[i..cell_end];
+        let break_kind = if step == 1 {
+            match cell {
+                [b'\n'] => CellBreak::Lf,
+                [b'\r'] => CellBreak::Cr,
+                _ => CellBreak::Text,
+            }
+        } else if let Some((lf, cr)) = utf16_cells {
+            if step == 2 && cell == lf {
+                CellBreak::Lf
+            } else if step == 2 && cell == cr {
+                CellBreak::Cr
+            } else {
+                // BMP text cell, supplementary surrogate pair (`step == 4`,
+                // still one column), or a truncated malformed tail.
+                CellBreak::Text
+            }
+        } else {
+            CellBreak::Text
+        };
+
+        match break_kind {
+            CellBreak::Lf => {
                 if !state.prev_was_cr {
                     state.line0 = state.line0.saturating_add(1);
                 }
                 state.col0 = 0;
                 state.prev_was_cr = false;
-                i += 1;
             }
-            b'\r' => {
+            CellBreak::Cr => {
                 state.line0 = state.line0.saturating_add(1);
                 state.col0 = 0;
                 state.prev_was_cr = true;
-                i += 1;
             }
-            _ => {
+            CellBreak::Text => {
                 state.prev_was_cr = false;
                 state.col0 = state.col0.saturating_add(1);
-                let step = engine.step(bytes, i, bytes.len()).max(1);
-                i = i.saturating_add(step).min(bytes.len());
             }
         }
+        // `step >= 1` inside the slice, so `cell_end` always advances.
+        i = cell_end;
     }
 }
 
@@ -1848,6 +1894,14 @@ impl PieceTable {
         let mut overlap_start = start;
         let mut overlap_position = start_pos;
         let mut found = None;
+        // UTF-16 slices must stay on the 2-byte cell grid: the overlap is
+        // walked as text by `advance_position_by_bytes`, so an odd-length
+        // overlap would start the next window mid-cell and corrupt every
+        // position computed from it. Flooring `keep` to even never hides a
+        // real UTF-16 match: real matches sit on even offsets and an even
+        // needle (`2` bytes per unit) needs at most `needle_len - 2` overlap
+        // bytes to be detected across a segment boundary.
+        let cell_aligned_keep = is_utf16_name(self.engine.encoding().name());
 
         self.pieces
             .visit_range_while(start, self.total_len, |piece, local_start, local_end| {
@@ -1871,7 +1925,10 @@ impl PieceTable {
                     return false;
                 }
 
-                let keep = needle_len.saturating_sub(1).min(window.len());
+                let mut keep = needle_len.saturating_sub(1).min(window.len());
+                if cell_aligned_keep {
+                    keep &= !1;
+                }
                 let consumed = window.len().saturating_sub(keep);
                 if consumed > 0 {
                     overlap_position = advance_position_by_bytes(
