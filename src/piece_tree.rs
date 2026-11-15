@@ -33,7 +33,7 @@ const EDITLOG_PAGE_HEADER_BYTES: usize = 24;
 const EDITLOG_CACHE_PAGES: usize = 1024;
 /// Bound on pages kept resident while editlog persistence is down:
 /// each is an Arc'd page that only this map holds (see `alloc_page`).
-const RESIDENT_PAGES_FAILED_PERSISTENCE_CAP: usize = 4096;
+pub(crate) const RESIDENT_PAGES_FAILED_PERSISTENCE_CAP: usize = 4096;
 const LEAF_ENTRY_BYTES: usize = 32;
 const INTERNAL_ENTRY_BYTES: usize = 24;
 const HISTORY_ENTRY_BYTES: usize = 32;
