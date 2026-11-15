@@ -1,4 +1,4 @@
-use crate::document::DocumentEncodingOrigin;
+use crate::document::{DocumentEncoding, DocumentEncodingOrigin};
 use crate::sidecar::{le_u32, le_u64};
 use crate::source_identity::{sampled_content_fingerprint, sampled_file_fingerprint};
 use crate::storage::FileStorage;
@@ -25,10 +25,19 @@ const MAX_INTERNAL_CHILDREN: usize = 64;
 // - the format is internal and may change across Qem releases; callers should
 //   treat `.qem.editlog` as rebuildable implementation detail rather than a
 //   stable interchange format
+//
+// v3 stores the document encoding as a NUL-padded `encoding_rs` label in the
+// header tail (offset 128..192) so a reopened session can restore the exact
+// encoding contract instead of forcing the caller to guess it again. v2
+// sidecars carry no label and are rejected by the version check; recovery
+// drops them and rebuilds from the source file.
 const EDITLOG_MAGIC: &[u8; 8] = b"QEMEDT1\0";
-const EDITLOG_VERSION: u32 = 2;
+const EDITLOG_VERSION: u32 = 3;
 const EDITLOG_PAGE_SIZE: usize = 4096;
-const EDITLOG_HEADER_BYTES: usize = 128;
+const EDITLOG_HEADER_BYTES: usize = 192;
+/// v3 header tail: NUL-padded `encoding_rs` label of the document encoding.
+pub(crate) const EDITLOG_ENCODING_LABEL_OFFSET: usize = 128;
+pub(crate) const EDITLOG_ENCODING_LABEL_BYTES: usize = 64;
 const EDITLOG_PAGE_HEADER_BYTES: usize = 24;
 const EDITLOG_CACHE_PAGES: usize = 1024;
 /// Bound on pages kept resident while editlog persistence is down:
@@ -144,9 +153,13 @@ struct ChildRef {
 //   committed root
 // - `full_index` tells recovery whether the piece-table snapshot already had a
 //   complete line index when it was flushed
+// - `encoding` is the document encoding contract at flush time (v3 header
+//   label); `None` restores the pre-v3 behavior where reopened sessions were
+//   always interpreted as UTF-8
 pub(crate) struct SessionMeta {
     pub(crate) known_byte_len: usize,
     pub(crate) full_index: bool,
+    pub(crate) encoding: Option<DocumentEncoding>,
     pub(crate) encoding_origin: Option<DocumentEncodingOrigin>,
     pub(crate) decoding_had_errors: bool,
 }
@@ -174,6 +187,50 @@ fn decode_encoding_origin(raw: u32) -> Option<DocumentEncodingOrigin> {
         7 => Some(DocumentEncodingOrigin::SaveConversion),
         _ => None,
     }
+}
+
+/// Encodes a canonical `encoding_rs` label into the fixed NUL-padded header
+/// buffer. Canonical encoding names are short ASCII strings, so truncation is
+/// a defensive bound rather than an expected path.
+fn encode_encoding_label(label: &str) -> [u8; EDITLOG_ENCODING_LABEL_BYTES] {
+    let mut buf = [0u8; EDITLOG_ENCODING_LABEL_BYTES];
+    let bytes = label.as_bytes();
+    let len = bytes.len().min(buf.len());
+    buf[..len].copy_from_slice(&bytes[..len]);
+    buf
+}
+
+/// Decodes the NUL-padded header label back into a document encoding. An
+/// all-NUL buffer means the sidecar carries no encoding hint (v2 headers and
+/// freshly created sidecars) and restores `None`. Any non-empty label must be
+/// valid UTF-8 naming an encoding known to `encoding_rs`; anything else is a
+/// corrupt header and must reject the session so recovery drops and rebuilds
+/// the sidecar.
+fn decode_encoding_label(
+    raw: &[u8; EDITLOG_ENCODING_LABEL_BYTES],
+) -> io::Result<Option<DocumentEncoding>> {
+    let len = raw
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(EDITLOG_ENCODING_LABEL_BYTES);
+    let bytes = &raw[..len];
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let Ok(label) = std::str::from_utf8(bytes) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "qem editlog encoding label is not valid UTF-8",
+        ));
+    };
+    DocumentEncoding::from_label(label)
+        .map(Some)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog encoding label does not name a known encoding",
+            )
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -255,6 +312,8 @@ enum PageKind {
 // - `source_*` must match the source file identity at reopen time or recovery is
 //   rejected as stale
 // - `flags` is an append-only bitfield for recovery hints
+// - `encoding` is the NUL-padded document encoding label (v3 header tail);
+//   `None` encodes as an all-NUL buffer
 struct EditLogHeader {
     page_count: u64,
     source_len: u64,
@@ -270,6 +329,7 @@ struct EditLogHeader {
     known_byte_len: u64,
     flags: u64,
     encoding_origin: u32,
+    encoding: Option<DocumentEncoding>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -1391,6 +1451,7 @@ impl DiskPageStore {
         let meta = SessionMeta {
             known_byte_len,
             full_index: (header.flags & EDITLOG_FLAG_FULL_INDEX) != 0,
+            encoding: header.encoding,
             encoding_origin: ((header.flags & EDITLOG_FLAG_HAS_ENCODING_ORIGIN) != 0)
                 .then(|| decode_encoding_origin(header.encoding_origin))
                 .flatten(),
@@ -1605,6 +1666,7 @@ impl DiskPageStore {
                 .encoding_origin
                 .map(encode_encoding_origin)
                 .unwrap_or(0),
+            encoding: meta.encoding,
         };
         // Durability protocol:
         // 1. append all newly reachable pages first
@@ -1730,6 +1792,15 @@ fn write_editlog_header(file: &mut File, header: EditLogHeader) -> io::Result<()
     buf[104..112].copy_from_slice(&header.known_byte_len.to_le_bytes());
     buf[112..120].copy_from_slice(&header.flags.to_le_bytes());
     buf[120..124].copy_from_slice(&header.encoding_origin.to_le_bytes());
+    // v3 tail: NUL-padded `encoding_rs` label of the document encoding. An
+    // all-NUL buffer means "no stored encoding hint" and is valid.
+    let label = header
+        .encoding
+        .map(|encoding| encode_encoding_label(encoding.name()))
+        .unwrap_or([0u8; EDITLOG_ENCODING_LABEL_BYTES]);
+    buf[EDITLOG_ENCODING_LABEL_OFFSET
+        ..EDITLOG_ENCODING_LABEL_OFFSET + EDITLOG_ENCODING_LABEL_BYTES]
+        .copy_from_slice(&label);
     let committed_at_s = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1758,6 +1829,12 @@ fn read_editlog_header(file: &mut File) -> io::Result<EditLogHeader> {
             "unsupported qem editlog format",
         ));
     }
+    let mut encoding_label = [0u8; EDITLOG_ENCODING_LABEL_BYTES];
+    encoding_label.copy_from_slice(
+        &buf[EDITLOG_ENCODING_LABEL_OFFSET
+            ..EDITLOG_ENCODING_LABEL_OFFSET + EDITLOG_ENCODING_LABEL_BYTES],
+    );
+    let encoding = decode_encoding_label(&encoding_label)?;
     Ok(EditLogHeader {
         page_count: le_u64(&buf, 16, "qem editlog header")?,
         source_len: le_u64(&buf, 24, "qem editlog header")?,
@@ -1773,6 +1850,7 @@ fn read_editlog_header(file: &mut File) -> io::Result<EditLogHeader> {
         known_byte_len: le_u64(&buf, 104, "qem editlog header")?,
         flags: le_u64(&buf, 112, "qem editlog header")?,
         encoding_origin: le_u32(&buf, 120, "qem editlog header")?,
+        encoding,
     })
 }
 
@@ -2347,7 +2425,7 @@ mod tests {
         EDITLOG_CACHE_PAGES, EDITLOG_HEADER_BYTES, RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
     };
     use std::fs;
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
 
     fn collect(tree: &PieceTree) -> Vec<(PieceSource, usize, usize, usize)> {
         tree.to_vec()
@@ -3742,5 +3820,145 @@ mod tests {
         assert_eq!(bounded_page_count(Some(three_pages), 2), 2);
         // Huge files clamp to the caller-provided counter, not the other way.
         assert_eq!(bounded_page_count(Some(u64::MAX), 7), 7);
+    }
+
+    fn flush_session_with_encoding(
+        tree: &mut PieceTree,
+        encoding: Option<crate::document::DocumentEncoding>,
+    ) {
+        tree.flush_session(
+            b"add",
+            SessionMeta {
+                known_byte_len: 4,
+                full_index: true,
+                encoding,
+                encoding_origin: Some(crate::document::DocumentEncodingOrigin::Utf8FastPath),
+                decoding_had_errors: false,
+            },
+        )
+        .unwrap();
+    }
+
+    fn temp_editlog_dir(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("qem-editlog-{}-{}", label, std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn read_sidecar_header_bytes(path: &std::path::Path) -> Vec<u8> {
+        let mut file = fs::File::open(path).unwrap();
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn editlog_session_round_trips_the_encoding_label() {
+        let dir = temp_editlog_dir("encoding-label");
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef").unwrap();
+        let mut tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 6,
+                line_breaks: 1,
+            }],
+        )
+        .unwrap();
+
+        let windows_1251 =
+            crate::document::DocumentEncoding::from_label("windows-1251").expect("known label");
+        flush_session_with_encoding(&mut tree, Some(windows_1251));
+        drop(tree);
+
+        // The label bytes land in the v3 header tail, NUL-padded.
+        let header = read_sidecar_header_bytes(&editlog_path(&source));
+        let label = &header
+            [super::EDITLOG_ENCODING_LABEL_OFFSET..super::EDITLOG_ENCODING_LABEL_OFFSET + 13];
+        assert_eq!(label, b"windows-1251\x00");
+
+        let storage = crate::storage::FileStorage::open(&source).unwrap();
+        let (_, _, meta) = PieceTree::try_open_disk_session(&source, &storage)
+            .unwrap()
+            .expect("recoverable session");
+        assert_eq!(meta.encoding, Some(windows_1251));
+
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editlog_open_rejects_a_corrupt_encoding_label_as_invalid_data() {
+        let dir = temp_editlog_dir("corrupt-label");
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef").unwrap();
+        let mut tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 6,
+                line_breaks: 1,
+            }],
+        )
+        .unwrap();
+        flush_session_with_encoding(&mut tree, Some(crate::document::DocumentEncoding::utf8()));
+        drop(tree);
+
+        // Overwrite the v3 label with bytes that are neither valid UTF-8 nor
+        // a known label: the header is the commit record and must reject the
+        // session so recovery drops and rebuilds the sidecar.
+        let sidecar = editlog_path(&source);
+        let mut file = fs::OpenOptions::new().write(true).open(&sidecar).unwrap();
+        file.seek(SeekFrom::Start(super::EDITLOG_ENCODING_LABEL_OFFSET as u64))
+            .unwrap();
+        file.write_all(&[0xFF; super::EDITLOG_ENCODING_LABEL_BYTES])
+            .unwrap();
+        drop(file);
+
+        let storage = crate::storage::FileStorage::open(&source).unwrap();
+        let err = PieceTree::try_open_disk_session(&source, &storage).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editlog_open_rejects_a_legacy_v2_sidecar_as_unsupported() {
+        let dir = temp_editlog_dir("legacy-v2");
+        let source = dir.join("sample.txt");
+        fs::write(&source, b"abcdef").unwrap();
+        let mut tree = PieceTree::from_pieces_disk(
+            &source,
+            vec![Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 6,
+                line_breaks: 1,
+            }],
+        )
+        .unwrap();
+        flush_session_with_encoding(&mut tree, Some(crate::document::DocumentEncoding::utf8()));
+        drop(tree);
+
+        // Patch the version field back to v2: the historical sidecar carried
+        // no encoding label and is rejected by the version check so recovery
+        // drops and rebuilds it from the source file.
+        let sidecar = editlog_path(&source);
+        let mut file = fs::OpenOptions::new().write(true).open(&sidecar).unwrap();
+        file.seek(SeekFrom::Start(8)).unwrap();
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+        drop(file);
+
+        let storage = crate::storage::FileStorage::open(&source).unwrap();
+        let err = PieceTree::try_open_disk_session(&source, &storage).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

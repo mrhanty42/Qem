@@ -281,7 +281,7 @@ impl Document {
                     self.raw_disk_index_total_lines(),
                     self.encoding_origin,
                     self.decoding_had_errors,
-                    encoding_engine::engine_for_encoding(self.encoding),
+                    self.encoding,
                 ));
                 Ok(())
             }
@@ -301,6 +301,7 @@ impl Document {
                     exact_total_lines,
                     self.encoding_origin,
                     self.decoding_had_errors,
+                    self.encoding,
                     encoding_engine::engine_for_encoding(self.encoding),
                 ));
                 Ok(())

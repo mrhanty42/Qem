@@ -1172,6 +1172,11 @@ pub(crate) struct PieceTable {
     known_byte_len: usize,
     total_len: usize,
     full_index: bool,
+    /// The document encoding contract at piece-table build time. Persisted
+    /// through the `.qem.editlog` v3 header label so reopened sessions
+    /// restore the same encoding instead of forcing the caller to guess it
+    /// again.
+    encoding: DocumentEncoding,
     encoding_origin: DocumentEncodingOrigin,
     decoding_had_errors: bool,
     pending_session_flush: bool,
@@ -1242,13 +1247,15 @@ impl PieceTable {
             exact_base_total_lines,
             encoding_origin,
             decoding_had_errors,
-            encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
+            DocumentEncoding::utf8(),
         )
     }
 
     /// Builds the piece table with the document's engine wired in, so
     /// column / text-unit arithmetic and line decoding stay encoding-aware
-    /// for non-UTF-8 documents.
+    /// for non-UTF-8 documents. `encoding` is the document's current
+    /// encoding contract; it is persisted through the session sidecar so
+    /// reopened sessions restore the same encoding.
     #[allow(clippy::too_many_arguments)] // mirrors the encoding-state constructor shape
     fn new_with_encoding_state_for_engine(
         original: FileStorage,
@@ -1257,7 +1264,7 @@ impl PieceTable {
         exact_base_total_lines: Option<usize>,
         encoding_origin: DocumentEncodingOrigin,
         decoding_had_errors: bool,
-        engine: &'static dyn encoding_engine::EncodingEngine,
+        encoding: DocumentEncoding,
     ) -> Self {
         let total_len = original.len();
         if line_lengths.is_empty() {
@@ -1278,7 +1285,7 @@ impl PieceTable {
             original,
             add: Vec::new(),
             pieces,
-            engine,
+            engine: encoding_engine::engine_for_encoding(encoding),
             known_line_count,
             exact_base_line_breaks: Some(exact_base_line_breaks),
             exact_base_total_lines: exact_base_total_lines
@@ -1286,6 +1293,7 @@ impl PieceTable {
             known_byte_len,
             total_len,
             full_index,
+            encoding,
             encoding_origin,
             decoding_had_errors,
             pending_session_flush: false,
@@ -1299,8 +1307,10 @@ impl PieceTable {
         this
     }
 
-    /// Rebuilds a piece table from a persisted session. Recovered sessions
-    /// are only created for UTF-8 documents, so the UTF-8 engine is used.
+    /// Rebuilds a piece table from a persisted session. The engine is
+    /// derived from the encoding stored in the session metadata; sessions
+    /// flushed before the v3 sidecar format carried no encoding and are
+    /// treated as UTF-8, matching the historical recovery behavior.
     #[cfg_attr(not(test), allow(dead_code))]
     fn from_recovered_session(
         original: FileStorage,
@@ -1308,12 +1318,13 @@ impl PieceTable {
         pieces: PieceTree,
         meta: SessionMeta,
     ) -> Self {
+        let encoding = meta.encoding.unwrap_or_default();
         Self::from_recovered_session_with_engine(
             original,
             add,
             pieces,
             meta,
-            encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
+            encoding_engine::engine_for_encoding(encoding),
         )
     }
 
@@ -1344,6 +1355,7 @@ impl PieceTable {
             known_byte_len,
             total_len,
             full_index: meta.full_index,
+            encoding: meta.encoding.unwrap_or_default(),
             encoding_origin: meta
                 .encoding_origin
                 .unwrap_or(DocumentEncodingOrigin::Utf8FastPath),
@@ -1368,6 +1380,7 @@ impl PieceTable {
         exact_base_total_lines: Option<usize>,
         encoding_origin: DocumentEncodingOrigin,
         decoding_had_errors: bool,
+        encoding: DocumentEncoding,
         engine: &'static dyn encoding_engine::EncodingEngine,
     ) -> Self {
         let total_len: usize = pieces.iter().map(|piece| piece.len).sum();
@@ -1388,6 +1401,7 @@ impl PieceTable {
             known_byte_len: known_byte_len.min(total_len),
             total_len,
             full_index: false,
+            encoding,
             encoding_origin,
             decoding_had_errors,
             pending_session_flush: false,
@@ -1633,6 +1647,7 @@ impl PieceTable {
         SessionMeta {
             known_byte_len: self.known_byte_len,
             full_index: self.full_index,
+            encoding: Some(self.encoding),
             encoding_origin: Some(self.encoding_origin),
             decoding_had_errors: self.decoding_had_errors,
         }
@@ -2710,13 +2725,14 @@ impl PieceTable {
         let bytes = self.source_bytes(piece.src);
         let start = piece.start.min(bytes.len());
         let end = piece.start.saturating_add(piece.len).min(bytes.len());
+        let utf8 = self.engine.encoding().is_utf8();
         let mut seen = 0usize;
         let mut i = start;
         while i < end {
             match bytes[i] {
                 b'\n' => {
                     if seen == local_break_idx {
-                        return Some(i + 1 - start);
+                        return Some(self.offset_after_break_cell(bytes, i, i + 1, utf8) - start);
                     }
                     seen += 1;
                     i += 1;
@@ -2724,13 +2740,17 @@ impl PieceTable {
                 b'\r' => {
                     if i + 1 < end && bytes[i + 1] == b'\n' {
                         if seen == local_break_idx {
-                            return Some(i + 2 - start);
+                            return Some(
+                                self.offset_after_break_cell(bytes, i, i + 2, utf8) - start,
+                            );
                         }
                         seen += 1;
                         i += 2;
                     } else {
                         if seen == local_break_idx {
-                            return Some(i + 1 - start);
+                            return Some(
+                                self.offset_after_break_cell(bytes, i, i + 1, utf8) - start,
+                            );
                         }
                         seen += 1;
                         i += 1;
@@ -2740,6 +2760,33 @@ impl PieceTable {
             }
         }
         None
+    }
+
+    /// Byte offset just past the full line-ending cell that starts at
+    /// `break_at`, given the raw scan's answer `raw_after`.
+    ///
+    /// The raw `0x0A` / `0x0D` byte scan above stops right after the
+    /// line-ending *byte*. For UTF-8 and Class A encodings a line-ending
+    /// cell is exactly that byte, so the raw answer is already the cell
+    /// end. For multi-byte-cell encodings (UTF-16) a line-ending cell is
+    /// a full code unit — e.g. the LF cell is `[0x0A, 0x00]` in LE — and
+    /// stopping after the raw byte would land in the middle of the cell,
+    /// making every reader that slices a line from this offset decode
+    /// mid-cell garbage. There the cell width comes from the engine's
+    /// `step`, and the wider of the raw answer and the cell end wins so
+    /// a truncated tail can never shrink the offset behind the raw byte.
+    fn offset_after_break_cell(
+        &self,
+        bytes: &[u8],
+        break_at: usize,
+        raw_after: usize,
+        utf8: bool,
+    ) -> usize {
+        if utf8 {
+            return raw_after;
+        }
+        let cell_end = break_at.saturating_add(self.engine.step(bytes, break_at, bytes.len()));
+        cell_end.max(raw_after)
     }
 }
 
@@ -3011,6 +3058,8 @@ fn clear_session_sidecar(path: &Path) {
     persistence::clear_session_sidecar(path);
 }
 
+#[cfg(test)]
+mod encoding_recovery_tests;
 #[cfg(test)]
 mod regex_tests;
 #[cfg(test)]

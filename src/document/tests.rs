@@ -5115,6 +5115,7 @@ fn try_insert_rejects_large_piece_table_promotion_to_rope() {
             known_byte_len: 1,
             total_len: MAX_ROPE_EDIT_FILE_BYTES + 1,
             full_index: false,
+            encoding: DocumentEncoding::utf8(),
             encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
             decoding_had_errors: false,
             pending_session_flush: false,
@@ -5968,6 +5969,46 @@ fn piece_table_position_scan_is_engine_accurate_in_utf16le() {
         .unwrap();
     assert_eq!(previous.start(), TextPosition::new(40, 0));
     assert_eq!(previous.end(), TextPosition::new(40, 6));
+}
+
+#[test]
+fn piece_table_line_text_is_engine_accurate_in_utf16le() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf16le-piece-table-line-text.txt");
+    let filler_line = "filler XYZ\n";
+    let target_line = "TARGET line\n";
+    // The piece-table gate needs a >1 MiB document; UTF-16LE stores one
+    // 2-byte code unit per ASCII character, so the encoded file is twice
+    // the unit count.
+    let filler_units = filler_line.chars().count();
+    let prefix_units = 40 * filler_units + target_line.chars().count();
+    let filler_lines =
+        ((PIECE_TABLE_MIN_BYTES / 2 + 32 * 1024).saturating_sub(prefix_units) / filler_units) + 1;
+    let mut text = String::with_capacity((40 + filler_lines + 1) * filler_line.len());
+    for _ in 0..40 {
+        text.push_str(filler_line);
+    }
+    text.push_str(target_line);
+    for _ in 0..filler_lines {
+        text.push_str(filler_line);
+    }
+    assert!(text.chars().count() * 2 >= PIECE_TABLE_MIN_BYTES);
+    let mut bytes = Vec::with_capacity(text.len() * 2);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut doc = Document::open_with_encoding(&path, DocumentEncoding::utf16le()).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "X").unwrap();
+    assert!(doc.has_piece_table());
+
+    // The line model derives the line's byte start from `line_start_byte`,
+    // which must land past the full `[0x0A, 0x00]` LF cell. Stopping after
+    // the raw `0x0A` byte reads the line from mid-cell, and the decoder
+    // hands back garbage instead of the line's text.
+    let line = doc.line_slice(40, 0, 256);
+    assert_eq!(line.text(), "TARGET line");
 }
 
 #[test]
@@ -6851,6 +6892,7 @@ fn edit_capability_reports_partial_piece_table_promotion_limits() {
             known_byte_len: 1,
             total_len: MAX_ROPE_EDIT_FILE_BYTES + 1,
             full_index: false,
+            encoding: DocumentEncoding::utf8(),
             encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
             decoding_had_errors: false,
             pending_session_flush: false,

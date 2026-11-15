@@ -10,6 +10,30 @@ fn should_drop_invalid_session_sidecar(err: &io::Error) -> bool {
     )
 }
 
+/// Resolves the encoding a recovered session must be interpreted with, given
+/// the label stored in the v3 sidecar header and the caller's explicit open
+/// encoding (if any).
+///
+/// Returns `None` when the session must not be recovered: the caller's
+/// explicit contract disagrees with the stored label (the caller wins and a
+/// fresh open proceeds), the session encoding cannot be recovered through the
+/// byte-indexed session path (UTF-16 / CJK need engine-aware line indexing),
+/// or an unlabeled v2 session was requested through a non-UTF-8 encoding.
+fn resolve_session_encoding(
+    stored: Option<DocumentEncoding>,
+    requested: Option<DocumentEncoding>,
+) -> Option<DocumentEncoding> {
+    let encoding = match (stored, requested) {
+        (Some(stored), None) => stored,
+        (Some(stored), Some(requested)) if stored == requested => stored,
+        (None, Some(requested)) if requested.is_utf8() => requested,
+        (None, None) => DocumentEncoding::utf8(),
+        _ => return None,
+    };
+    (encoding.is_utf8() || encoding_engine::SingleByteEngine::supports(encoding))
+        .then_some(encoding)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenProgressPhase {
     OpeningStorage,
@@ -385,7 +409,14 @@ impl Document {
                 phase,
             )?
         } else {
-            Self::from_storage_with_progress(path, storage, encoding_origin, &mut tracker, phase)
+            Self::from_storage_with_progress(
+                path,
+                storage,
+                encoding_origin,
+                None,
+                &mut tracker,
+                phase,
+            )
         };
         phase(OpenProgressPhase::Ready);
         tracker.complete();
@@ -404,6 +435,7 @@ impl Document {
             path,
             storage,
             encoding_origin,
+            Some(DocumentEncoding::utf8()),
             &mut tracker,
             &mut ignore_open_phase,
         )
@@ -470,6 +502,7 @@ impl Document {
                 path,
                 storage,
                 encoding_origin,
+                Some(encoding),
                 progress,
                 phase,
             ));
@@ -493,6 +526,30 @@ impl Document {
         // away from the guard by `from_storage_class_b_native` further
         // down, just like Class A.
         if encoding_engine::SingleByteEngine::supports(encoding) {
+            // Route explicit Class A opens through session recovery first: a
+            // v3 sidecar whose header label matches the requested encoding
+            // restores the persisted session (edits included) instead of
+            // silently discarding it. v2 sidecars carry no label and keep
+            // the historical fresh-open behavior.
+            if Self::has_candidate_session_sidecar(&path, &storage) {
+                let bytes = storage.bytes();
+                let probe = &bytes[..bytes.len().min(LINE_ENDING_PROBE_MAX_BYTES)];
+                let line_ending = detect_line_ending(probe);
+                let disk_index = DiskLineIndex::open_or_build(&path, &storage);
+                if let Some(doc) = Self::try_recover_disk_session(
+                    &path,
+                    &storage,
+                    Some(encoding),
+                    encoding_origin,
+                    disk_index,
+                    line_ending,
+                    storage.len(),
+                    progress,
+                    phase,
+                ) {
+                    return Ok(doc);
+                }
+            }
             return Ok(Self::from_storage_class_a_native(
                 path,
                 storage,
@@ -862,10 +919,108 @@ impl Document {
         doc
     }
 
+    /// Cheap gate for the session-recovery probe on explicit open paths:
+    /// only a source of recoverable size that actually has a sidecar on
+    /// disk justifies the probe (and the disk line index it may build).
+    fn has_candidate_session_sidecar(path: &Path, storage: &FileStorage) -> bool {
+        storage.len() >= PIECE_TREE_DISK_MIN_BYTES && crate::piece_tree::editlog_path(path).exists()
+    }
+
+    /// Attempts to recover the persisted piece-table session for `storage`
+    /// into a session-backed [`Document`].
+    ///
+    /// The `.qem.editlog` v3 header stores the document encoding as a
+    /// NUL-padded label. Resolution rules ([`resolve_session_encoding`]):
+    ///
+    /// - an implicit open (no requested encoding) trusts the stored label,
+    ///   so a session flushed in e.g. `windows-1251` reopens with that
+    ///   contract without the caller having to guess it again;
+    /// - an explicit request must agree with the stored label, otherwise
+    ///   the caller's contract governs a fresh open (`None` is returned and
+    ///   the caller falls through to its native open path);
+    /// - unlabeled (v2) sessions keep their historical behavior: recoverable
+    ///   on the UTF-8 fast path, never recoverable through an explicit
+    ///   non-UTF-8 request, because the label is the only proof of what the
+    ///   session bytes were encoded in.
+    ///
+    /// Only encodings whose line breaks are plain byte candidates (UTF-8 and
+    /// the Class A single-byte engines) are recoverable here: UTF-16 / CJK
+    /// sessions need engine-aware line indexing and keep the fresh-open
+    /// behavior. Invalid sidecars (bad magic, version mismatch, corrupt
+    /// label) are dropped and rebuilt from the source file.
+    #[allow(clippy::too_many_arguments)] // mirrors the open-path constructor shape
+    fn try_recover_disk_session(
+        path: &Path,
+        storage: &FileStorage,
+        requested_encoding: Option<DocumentEncoding>,
+        fallback_encoding_origin: DocumentEncodingOrigin,
+        disk_index: Option<DiskLineIndex>,
+        line_ending: LineEnding,
+        file_len: usize,
+        progress: &mut OpenProgressTracker<'_>,
+        phase: &mut dyn FnMut(OpenProgressPhase),
+    ) -> Option<Self> {
+        phase(OpenProgressPhase::RecoveringSession);
+        let inspected = crate::source_identity::sampled_content_fingerprint_budget(file_len);
+        let (pieces, add, meta) = match PieceTree::try_open_disk_session(path, storage) {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                progress.report_inspected(inspected);
+                return None;
+            }
+            Err(err) => {
+                if should_drop_invalid_session_sidecar(&err) {
+                    super::persistence::clear_session_sidecar(path);
+                }
+                progress.report_inspected(inspected);
+                return None;
+            }
+        };
+        let Some(encoding) = resolve_session_encoding(meta.encoding, requested_encoding) else {
+            // The stored label and the caller's contract disagree, or the
+            // session encoding cannot be recovered through the byte-indexed
+            // path. The sidecar stays on disk for a future open that agrees
+            // with it.
+            progress.report_inspected(inspected);
+            return None;
+        };
+        progress.report_inspected(inspected);
+        let engine = encoding_engine::engine_for_encoding(encoding);
+        Some(Self {
+            path: Some(path.to_path_buf()),
+            storage: Some(storage.clone()),
+            line_offsets: Arc::new(RwLock::new(LineOffsets::new_for_file_len(file_len))),
+            disk_index,
+            indexing: Arc::new(AtomicBool::new(false)),
+            indexing_started: Some(Instant::now()),
+            file_len,
+            indexed_bytes: Arc::new(AtomicUsize::new(file_len)),
+            avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+            line_ending,
+            encoding,
+            encoding_origin: meta.encoding_origin.unwrap_or(fallback_encoding_origin),
+            encoding_engine: engine,
+            decoding_had_errors: meta.decoding_had_errors,
+            preserve_save_error_cache: Cell::new(None),
+            rope_file_len_cache: Cell::new(None),
+            rope: None,
+            piece_table: Some(PieceTable::from_recovered_session_with_engine(
+                storage.clone(),
+                add,
+                pieces,
+                meta,
+                engine,
+            )),
+            rope_history: RopeHistory::new(),
+            dirty: true,
+        })
+    }
+
     fn from_storage_with_progress(
         path: PathBuf,
         storage: FileStorage,
         encoding_origin: DocumentEncodingOrigin,
+        requested_encoding: Option<DocumentEncoding>,
         progress: &mut OpenProgressTracker<'_>,
         phase: &mut dyn FnMut(OpenProgressPhase),
     ) -> Self {
@@ -907,58 +1062,19 @@ impl Document {
         // Persistent piece-table sessions are only created for large documents,
         // so skipping this sidecar probe avoids useless I/O on small-file opens.
         if file_len >= PIECE_TREE_DISK_MIN_BYTES {
-            phase(OpenProgressPhase::RecoveringSession);
-            inspected_source_bytes = inspected_source_bytes.saturating_add(
-                crate::source_identity::sampled_content_fingerprint_budget(file_len),
-            );
-            match PieceTree::try_open_disk_session(&path, &storage) {
-                Ok(Some((pieces, add, meta))) => {
-                    progress.report_inspected(inspected_source_bytes);
-                    indexing.store(false, Ordering::Relaxed);
-                    indexed_bytes.store(file_len, Ordering::Relaxed);
-                    return Self {
-                        path: Some(path),
-                        storage: Some(storage.clone()),
-                        line_offsets: new_line_offsets(),
-                        disk_index,
-                        indexing,
-                        indexing_started: Some(indexing_started),
-                        file_len,
-                        indexed_bytes,
-                        avg_line_len,
-                        line_ending,
-                        encoding: DocumentEncoding::utf8(),
-                        encoding_origin: meta.encoding_origin.unwrap_or(encoding_origin),
-                        encoding_engine: encoding_engine::engine_for_encoding(
-                            DocumentEncoding::utf8(),
-                        ),
-                        decoding_had_errors: meta.decoding_had_errors,
-                        preserve_save_error_cache: Cell::new(None),
-                        rope_file_len_cache: Cell::new(None),
-                        rope: None,
-                        // Persistent sessions are only created for UTF-8
-                        // documents, so the recovered piece table uses the
-                        // UTF-8 engine, matching the document's own
-                        // `encoding` above.
-                        piece_table: Some(PieceTable::from_recovered_session_with_engine(
-                            storage,
-                            add,
-                            pieces,
-                            meta,
-                            encoding_engine::engine_for_encoding(DocumentEncoding::utf8()),
-                        )),
-                        rope_history: RopeHistory::new(),
-                        dirty: true,
-                    };
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    if should_drop_invalid_session_sidecar(&err) {
-                        super::persistence::clear_session_sidecar(&path);
-                    }
-                }
+            if let Some(doc) = Self::try_recover_disk_session(
+                &path,
+                &storage,
+                requested_encoding,
+                encoding_origin,
+                disk_index.clone(),
+                line_ending,
+                file_len,
+                progress,
+                phase,
+            ) {
+                return doc;
             }
-            progress.report_inspected(inspected_source_bytes);
         }
 
         if file_len == 0 {
