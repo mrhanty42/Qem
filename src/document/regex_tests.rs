@@ -1750,3 +1750,97 @@ fn find_next_regex_match_units_count_collision_pairs_per_byte() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Class B window-boundary phase tracking
+//
+// Regex windows over Shift_JIS / GB18030 / EUC-KR backings must be cut
+// on whole encoding cells. A boundary that lands mid-cell corrupts the
+// window decode at both ends: the leading fragment of the next window
+// decodes as plain ASCII (a phantom character that does not exist in
+// the document text) and the trailing fragment of the previous window
+// decodes as U+FFFD. The fixture below pins the phantom variant on the
+// forward scan; the splice variant (a real boundary-straddling match
+// being missed because the boundary fragment cannot participate in a
+// valid match) is prevented by the same alignment and covered by the
+// multi-window drift tests above.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn find_next_regex_rejects_phantom_match_at_shift_jis_window_head() {
+    // Window geometry is pinned to chunk = 48 / overlap = 8 through the
+    // test-only override so the boundary behaviour is observable on a
+    // 50-byte fixture. Fixture layout (Shift_JIS bytes):
+    //
+    //   0..39   'z' filler
+    //   39..41  Y = [0x81, 0x40] - its trail byte 0x40 is '@'; that byte
+    //           sits exactly on the pre-fix window-2 head target
+    //           (48 - 8 = 40), so window 2 used to open mid-cell and
+    //           decode the trail byte as a phantom '@'
+    //   41..44  'aaa'
+    //   44      '@' - the real match starts here
+    //   45..47  'aa'
+    //   47..49  Z = [0x82, 0xA0] ("あ") - window 1's end target (48)
+    //           cuts Z between its lead byte (47) and trail byte (48)
+    //   49      'x' - the real match ends here
+    //
+    // The real match "@aaあx" (bytes [44, 50)) straddles the 48-byte
+    // window boundary with a multibyte cell cut mid-way. Before the
+    // fix, window 2 opened on Y's trail byte, decoded it as '@', and
+    // the lazy pattern matched from the phantom instead of the real
+    // '@' - a match reported four bytes left of where the text is.
+    super::regex_search::class_b_chunk_geometry_override::set(48, 8);
+
+    let mut bytes = vec![b'z'; 39];
+    bytes.extend_from_slice(&[0x81, 0x40]); // Y: trail byte is '@'
+    bytes.extend_from_slice(b"aaa");
+    bytes.push(b'@');
+    bytes.extend_from_slice(b"aa");
+    bytes.extend_from_slice(&[0x82, 0xA0]); // Z: "あ", cut by the window edge
+    bytes.push(b'x');
+    // Trailing filler keeps the real match away from the document's
+    // EOF edge (the Class B position mapper answers the virtual
+    // next-line position for a match ending exactly at EOF).
+    bytes.extend_from_slice(b"zzzzzzzz");
+    assert_eq!(bytes.len(), 58);
+
+    // The fixture must be well-formed Shift_JIS end to end, and the
+    // decoded view pins the char columns the assertions below rely on:
+    // 48 characters total, the real '@' at char 43, "あ" at char 46.
+    let (decoded, _, had_errors) = SHIFT_JIS.decode(&bytes);
+    assert!(!had_errors, "fixture must be well-formed Shift_JIS");
+    assert_eq!(decoded.chars().count(), 56);
+    let at_char = decoded
+        .chars()
+        .position(|c| c == '@')
+        .expect("fixture has '@'");
+    let han_char = decoded
+        .chars()
+        .position(|c| c == 'あ')
+        .expect("fixture has あ");
+    assert_eq!(at_char, 43, "fixture phase drifted");
+    assert_eq!(han_char, 46, "fixture phase drifted");
+
+    let dir = fresh_test_dir("shift-jis-regex-window-head-phantom");
+    let path = dir.join("source.txt");
+    fs::write(&path, &bytes).unwrap();
+
+    let doc =
+        Document::open_with_encoding(&path, DocumentEncoding::from_label("shift_jis").unwrap())
+            .unwrap();
+    wait_until_indexed(&doc);
+
+    let m = doc
+        .find_next_regex("@.+?x", TextPosition::new(0, 0))
+        .unwrap()
+        .expect("the real @aaあx match must be found");
+    assert_eq!(
+        m.start(),
+        TextPosition::new(0, 43),
+        "match must start at the real '@' (char 43), not at a phantom trail-byte '@'"
+    );
+    assert_eq!(m.end(), TextPosition::new(0, 48));
+    assert_eq!(m.len_chars(), 5);
+
+    let _ = fs::remove_dir_all(&dir);
+}

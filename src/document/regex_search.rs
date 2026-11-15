@@ -66,6 +66,83 @@ const REGEX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 /// streaming-regex limit on huge files.
 const REGEX_CHUNK_OVERLAP_BYTES: usize = 1024 * 1024;
 
+/// Test-only escape hatch: override the Class B regex chunk geometry
+/// (chunk size / overlap) used by [`scan_class_b_regex_candidates`].
+///
+/// Production geometry is the compiled-in `REGEX_CHUNK_BYTES` /
+/// `REGEX_CHUNK_OVERLAP_BYTES` pair (8 MiB / 1 MiB); a unit test that
+/// needs to observe window-boundary behaviour on a tiny fixture cannot
+/// build a multi-megabyte document for every case, so it pins a small
+/// geometry for the duration of one call. The override is thread-local
+/// (the test harness runs each `#[test]` on its own thread), is asserted
+/// to stay non-degenerate (`overlap < chunk`), and is read only by the
+/// Class B chunked decode path — the UTF-8 / Class A byte-engine paths
+/// keep the compiled-in constants.
+#[cfg(test)]
+pub(crate) mod class_b_chunk_geometry_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CHUNK_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
+        static OVERLAP_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Pins the Class B chunk geometry for the current test thread.
+    pub(crate) fn set(chunk_bytes: usize, overlap_bytes: usize) {
+        assert!(
+            overlap_bytes < chunk_bytes,
+            "degenerate geometry: overlap must stay below the chunk size"
+        );
+        CHUNK_BYTES.with(|cell| cell.set(Some(chunk_bytes)));
+        OVERLAP_BYTES.with(|cell| cell.set(Some(overlap_bytes)));
+    }
+
+    pub(crate) fn chunk_bytes() -> Option<usize> {
+        CHUNK_BYTES.with(Cell::get)
+    }
+
+    pub(crate) fn overlap_bytes() -> Option<usize> {
+        OVERLAP_BYTES.with(Cell::get)
+    }
+}
+
+/// The chunk size the Class B regex scan windows use (see
+/// [`scan_class_b_regex_candidates`]); routes through the test-only
+/// override when one is pinned.
+fn regex_chunk_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(overridden) = class_b_chunk_geometry_override::chunk_bytes() {
+        return overridden;
+    }
+    REGEX_CHUNK_BYTES
+}
+
+/// The overlap the Class B regex scan windows keep (see
+/// [`scan_class_b_regex_candidates`]); routes through the test-only
+/// override when one is pinned.
+fn regex_chunk_overlap_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(overridden) = class_b_chunk_geometry_override::overlap_bytes() {
+        return overridden;
+    }
+    REGEX_CHUNK_OVERLAP_BYTES
+}
+
+/// Largest supported encoding cell width across the Class B encodings
+/// (a GB18030 four-byte sequence is the widest); used to size the
+/// boundary-walk peek past a window's target end.
+const MAX_CLASS_B_CELL_BYTES: usize = 4;
+
+/// Fetches `[start, end)` from the Class B byte storage: mmap zero-copy
+/// when available, otherwise a piece-tree byte slice.
+fn fetch_class_b_window(doc: &Document, start: usize, end: usize) -> Option<Vec<u8>> {
+    if let Some(slice) = doc.mmap_search_slice(start, end) {
+        Some(slice.to_vec())
+    } else {
+        doc.piece_table_uncapped_range(start, end)
+    }
+}
+
 /// Small byte-backed ranges are cheaper to scan through the already compiled
 /// byte regex than to determinize a reverse DFA. Repeated calls rescan shrinking
 /// prefixes, but the range remains capped and the path avoids the much larger
@@ -1664,8 +1741,9 @@ fn class_b_requires_even_alignment(encoding: DocumentEncoding) -> bool {
 /// backings.
 ///
 /// Iterates `[start_offset, end_offset)` in `REGEX_CHUNK_BYTES` windows
-/// (aligned to even byte boundaries for UTF-16; arbitrary boundaries
-/// for CJK multibyte, which has no global alignment grid), with
+/// (even-byte aligned for UTF-16; walked to whole encoding cells through
+/// `EncodingEngine::step` for CJK multibyte, whose byte grids are not
+/// self-synchronizing — see the geometry comment in the body), with
 /// `REGEX_CHUNK_OVERLAP_BYTES` of overlap on continuation chunks so a
 /// match that straddles a chunk boundary is still observed. Each
 /// window is decoded through the document's encoding via
@@ -1727,61 +1805,121 @@ fn scan_class_b_regex_candidates(
     // on an odd byte, so rounding up cannot skip one). Callers normally
     // provide an even start through `search_byte_offset_for_position`;
     // this guards a truncated odd-length file tail. For CJK
-    // multibyte the start can be any byte: callers ensure the initial
-    // `start_offset` lands on a character boundary by going through
-    // `search_byte_offset_for_position`, but the fixed-size slide does
-    // NOT preserve character alignment for variable-length encodings,
-    // so each window re-aligns itself on the leading bytes below before
-    // decoding.
+    // multibyte the start is a character boundary: callers provide it
+    // through `search_byte_offset_for_position`, and every later window
+    // head is walked to a whole cell below, so no head ever opens
+    // mid-sequence on well-formed input.
     let mut chunk_start = if requires_even_alignment {
         start_offset.saturating_add(start_offset & 1)
     } else {
         start_offset
     };
+    let engine = doc.encoding_engine();
     let mut first_chunk = true;
+    let mut prev_chunk_end: Option<usize> = None;
     while chunk_start < end_offset {
-        let chunk_end = chunk_start
-            .saturating_add(REGEX_CHUNK_BYTES)
+        let target_end = chunk_start
+            .saturating_add(regex_chunk_bytes())
             .min(end_offset);
-        // For UTF-16 ensure chunk_end is even so the trailing code-
-        // unit cell is never split across two chunks. For CJK
-        // multibyte encodings every chunk boundary is allowed; if a
-        // multibyte sequence is split across the boundary, the
-        // overlap region brings it back into the next window so the
-        // decoder sees a complete sequence.
-        let chunk_end = if requires_even_alignment && chunk_end & 1 == 1 && chunk_end > chunk_start
-        {
-            chunk_end - 1
+        // Window geometry, encoding-dispatched:
+        //
+        // * UTF-16: the 2-byte cell grid makes even arithmetic enough.
+        //   An odd `chunk_end` rounds down so the trailing code-unit
+        //   cell is never split, and the slide (`chunk_end` minus the
+        //   even overlap) stays on the grid.
+        //
+        // * CJK multibyte (Shift_JIS, GB18030, EUC-KR): the byte grids
+        //   are not self-synchronizing, so BOTH window edges are walked
+        //   to whole encoding cells from the known character boundary
+        //   `chunk_start` through `engine.step` — the same discipline
+        //   `boundary_walk_ok` applies to literal-search candidates in
+        //   `super::search`. A raw byte cut here used to split a
+        //   multibyte cell at the window tail (the fragment decoded to
+        //   U+FFFD, so a match straddling the boundary was invisible in
+        //   this window) and, worse, at the next window's head: the
+        //   leading trail byte decodes as a plain ASCII character (a
+        //   phantom that does not exist in the document text), and a
+        //   match anchored on it was reported at a position where the
+        //   text has no such character. With whole-cell boundaries every
+        //   window decodes exactly as its source bytes would as a whole
+        //   document, and the decode -> re-encode source mapping stays
+        //   drift-free.
+        let (chunk_end, next_head, window) = if requires_even_alignment {
+            let chunk_end = if target_end & 1 == 1 && target_end > chunk_start {
+                target_end - 1
+            } else {
+                target_end
+            };
+            let next_head = chunk_end.saturating_sub(regex_chunk_overlap_bytes());
+            let window = fetch_class_b_window(doc, chunk_start, chunk_end)?;
+            (chunk_end, next_head, window)
         } else {
-            chunk_end
+            let overlap = regex_chunk_overlap_bytes();
+            // Peek up to one extra cell past the target so the walk can
+            // see the full width of the cell that straddles the target
+            // byte (the largest supported cell is 4 bytes).
+            let peek_end = target_end
+                .saturating_add(MAX_CLASS_B_CELL_BYTES)
+                .min(end_offset);
+            let peek = fetch_class_b_window(doc, chunk_start, peek_end)?;
+            // Walk the cell boundaries from the known boundary
+            // `chunk_start`. `floor` tracks the last boundary at or
+            // before the target (the window end); `head` tracks the
+            // last boundary at or before `floor - overlap` (the next
+            // window's start, so the overlap between adjacent windows
+            // stays at least `overlap` bytes wide).
+            let mut cursor = chunk_start;
+            let mut floor = chunk_start;
+            let mut head = chunk_start;
+            while cursor < target_end {
+                let step = engine.step(&peek, cursor - chunk_start, peek.len()).max(1);
+                let next = cursor.saturating_add(step);
+                if next > target_end {
+                    break;
+                }
+                floor = next;
+                while head < floor {
+                    let head_step = engine.step(&peek, head - chunk_start, peek.len()).max(1);
+                    let head_next = head.saturating_add(head_step);
+                    if head_next.saturating_add(overlap) <= floor {
+                        head = head_next;
+                    } else {
+                        break;
+                    }
+                }
+                cursor = next;
+            }
+            // If the very first cell already straddles the target
+            // (reachable only with a tiny test-override chunk), fall
+            // back to the first boundary past `chunk_start` so the
+            // window still covers a whole cell.
+            let chunk_end = if floor > chunk_start {
+                floor
+            } else {
+                let step = engine.step(&peek, 0, peek.len()).max(1);
+                (chunk_start + step).min(end_offset)
+            };
+            let window = peek[..chunk_end - chunk_start].to_vec();
+            (chunk_end, head, window)
         };
         if chunk_end <= chunk_start {
             break;
         }
 
-        // Fetch the byte window: mmap zero-copy when possible, otherwise
-        // a piece-tree byte slice. We materialise both as a `Vec<u8>` so
-        // the rest of the loop body shares one code path.
-        let window: Vec<u8> = if let Some(slice) = doc.mmap_search_slice(chunk_start, chunk_end) {
-            slice.to_vec()
-        } else {
-            doc.piece_table_uncapped_range(chunk_start, chunk_end)?
-        };
-
         // For UTF-16 the even grid keeps every window on a code-unit
-        // cell. For CJK multibyte the slide (chunk_end minus the fixed
-        // overlap) lands on an arbitrary byte, so a window can open
-        // mid-sequence: the leading fragment decodes to a U+FFFD whose
+        // cell. For CJK multibyte the window head is already walked to
+        // a whole cell above, so on well-formed input the probe below
+        // never fires; it stays as a safety net for genuinely corrupt
+        // heads (a leading fragment that decodes to U+FFFD whose
         // re-encode length has nothing to do with the fragment's source
-        // width (Shift_JIS / EUC-KR emit an 8-byte numeric character
-        // reference for it), and every `class_b_source_bytes_for_decoded_prefix`
-        // mapping after it would drift. Drop leading bytes until a probe
-        // of the window head no longer decodes with a replacement as its
-        // first character: the dropped fragment belongs to the previous
-        // window's tail, which the overlap already covered. Genuinely
-        // corrupt bytes inside the window still decode to U+FFFD and
-        // keep the re-encode mapping approximate (see the ROADMAP
-        // reverse-regex item).
+        // width — Shift_JIS / EUC-KR emit an 8-byte numeric character
+        // reference — would otherwise make every
+        // `class_b_source_bytes_for_decoded_prefix` mapping after it
+        // drift). The dropped bytes belong to the previous window's
+        // tail, which the overlap already covered. Genuinely corrupt
+        // bytes inside the window still decode to U+FFFD and keep the
+        // re-encode mapping approximate (see the ROADMAP reverse-regex
+        // item).
         let cjk_window_skip = if requires_even_alignment {
             0usize
         } else {
@@ -1827,8 +1965,9 @@ fn scan_class_b_regex_candidates(
             // are rejected without also rejecting matches that end
             // within the `skip` bytes past the previous window's end -
             // those live outside anything the previous window scanned.
-            let overlap_source_bytes = REGEX_CHUNK_OVERLAP_BYTES
-                .saturating_sub(cjk_window_skip)
+            let overlap_source_bytes = prev_chunk_end
+                .unwrap_or(0)
+                .saturating_sub(chunk_start.saturating_add(cjk_window_skip))
                 .min(window.len());
             decoded_prefix_for_source_byte_count(doc_encoding, &decoded, overlap_source_bytes)
         };
@@ -1901,23 +2040,24 @@ fn scan_class_b_regex_candidates(
         if chunk_end >= end_offset {
             break;
         }
-        // Slide forward keeping the overlap. For UTF-16 both the
-        // overlap and the chunk size are even, so the resulting
-        // offset stays on a 2-byte boundary. Forward progress
-        // is guaranteed by the `next_chunk_start > chunk_start`
-        // check below: if the slide would not advance (e.g. when the
-        // trimmed chunk is shorter than the overlap), we step forward
-        // by the alignment quantum (2 bytes for UTF-16, 1 byte for
-        // CJK multibyte) so the loop cannot stall.
-        let next_chunk_start = chunk_end.saturating_sub(REGEX_CHUNK_OVERLAP_BYTES);
-        chunk_start = if next_chunk_start > chunk_start {
-            next_chunk_start
+        // Slide forward keeping the overlap. `next_head` was walked to a
+        // whole cell for CJK multibyte (and stays on the even grid for
+        // UTF-16), so the next window opens on a character boundary.
+        // Forward progress is guaranteed by the
+        // `next_head > chunk_start` check below: if the slide would not
+        // advance (degenerate geometry where the overlap covers the
+        // whole window), we step forward by one whole encoding cell
+        // (2 bytes for UTF-16) so the loop cannot stall and the next
+        // window head stays aligned.
+        chunk_start = if next_head > chunk_start {
+            next_head
         } else if requires_even_alignment {
             chunk_start.saturating_add(2)
         } else {
-            chunk_start.saturating_add(1)
+            chunk_start.saturating_add(engine.step(&window, 0, window.len()).max(1))
         };
         first_chunk = false;
+        prev_chunk_end = Some(chunk_end);
     }
 
     last_match
