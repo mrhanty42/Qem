@@ -530,6 +530,35 @@ fn literal_search_rejects_unaligned_utf16_candidates() {
 }
 
 #[test]
+fn literal_search_reports_engine_accurate_columns_in_utf16le() {
+    // The literal match position for Class B documents must come through
+    // the encoding-aware mapper (engine cell sizes and line starts), not
+    // the raw byte scan: "TARGET" sits at column 7 of line 1 (after
+    // "second "), and the raw 0x0A/0x00 byte scan reported 8.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("literal-utf16le-col.txt");
+    let text = "first
+second TARGET line
+third
+";
+    let mut encoded: Vec<u8> = Vec::new();
+    for unit in text.encode_utf16() {
+        encoded.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, &encoded).unwrap();
+
+    let doc = Document::open_with_encoding(&path, DocumentEncoding::utf16le()).unwrap();
+    let m = doc
+        .find_next("TARGET", TextPosition::new(0, 0))
+        .expect("literal search must find the ASCII marker");
+    assert_eq!(m.start(), TextPosition::new(1, 7));
+    assert_eq!(m.end(), TextPosition::new(1, 13));
+    assert_eq!(m.len_chars(), 6);
+
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+#[test]
 fn literal_search_finds_multibyte_word_in_shift_jis_document() {
     // Encoding-aware literal search for CJK multibyte: the needle is
     // encoded into Shift_JIS bytes and searched over the stored bytes

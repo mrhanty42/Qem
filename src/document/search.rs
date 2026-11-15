@@ -1145,8 +1145,16 @@ impl Document {
             let match_end = match_start
                 .saturating_add(query.bytes().len())
                 .min(file_len);
-            let start_pos =
-                self.mmap_position_for_byte_offset_from(start_offset, from, match_start);
+            // For non-UTF-8 backends the position must come through the
+            // engine-aware mapper: the raw byte scan miscounts columns and
+            // line breaks inside multi-byte cells (documented 1.0 line
+            // model item — but a wrong column in a plain literal match is
+            // user-visible, and the engine-aware mapper already exists).
+            let start_pos = if self.encoding.is_utf8() {
+                self.mmap_position_for_byte_offset_from(start_offset, from, match_start)
+            } else {
+                self.position_for_byte_offset_in_class_b(match_start)
+            };
             let end_pos = advance_position_by_bytes(start_pos, query.bytes(), engine);
             return Some((
                 SearchMatch::new(TextRange::new(start_pos, query.len_chars()), end_pos),
@@ -1187,8 +1195,18 @@ impl Document {
             let match_end = match_start
                 .saturating_add(query.bytes().len())
                 .min(file_len);
-            let start_pos = self.mmap_position_for_byte_offset(match_start);
-            let end_pos = self.mmap_position_for_byte_offset(match_end);
+            // Engine-aware position for non-UTF-8 backends, same as the
+            // forward path above.
+            let start_pos = if self.encoding.is_utf8() {
+                self.mmap_position_for_byte_offset(match_start)
+            } else {
+                self.position_for_byte_offset_in_class_b(match_start)
+            };
+            let end_pos = if self.encoding.is_utf8() {
+                self.mmap_position_for_byte_offset(match_end)
+            } else {
+                self.position_for_byte_offset_in_class_b(match_end)
+            };
             return Some(SearchMatch::new(
                 TextRange::new(start_pos, query.len_chars()),
                 end_pos,
