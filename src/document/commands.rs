@@ -608,9 +608,19 @@ impl Document {
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
             let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
-            let outcome = piece_table
-                .replace_range_at(self.line_ending, line0, col0, len_chars, text)
-                .map_err(|source| DocumentError::Write { path, source })?;
+            let result =
+                piece_table.replace_range_at(self.line_ending, line0, col0, len_chars, text);
+            // The replace batch is a delete + insert pair: when the insert
+            // was refused after the delete landed, the document did change
+            // even though the edit reports an error, and `dirty` must match
+            // the content (same convention as the rope composite below).
+            if matches!(&result, Err(err) if err.mutated) {
+                self.mark_dirty();
+            }
+            let outcome = result.map_err(|err| DocumentError::Write {
+                path,
+                source: err.into(),
+            })?;
             if outcome.edited {
                 self.mark_dirty();
             }
@@ -756,9 +766,17 @@ impl Document {
             .as_mut()
             .expect("piece_table presence checked above");
         let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
-        let outcome = piece_table
-            .replace_encoded_bytes_at(aligned_start, aligned_end, &encoded)
-            .map_err(|source| DocumentError::Write { path, source })?;
+        let result = piece_table.replace_encoded_bytes_at(aligned_start, aligned_end, &encoded);
+        // Same half-landed convention as the UTF-8 replace above: when the
+        // insert was refused after the delete landed, the document did
+        // change and `dirty` must match the content.
+        if matches!(&result, Err(err) if err.mutated) {
+            self.mark_dirty();
+        }
+        let outcome = result.map_err(|err| DocumentError::Write {
+            path,
+            source: err.into(),
+        })?;
         if outcome {
             self.mark_dirty();
         }

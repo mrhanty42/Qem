@@ -1193,6 +1193,27 @@ impl EditOutcome {
     }
 }
 
+/// Error from a piece-table replace batch
+/// ([`PieceTable::replace_encoded_bytes_at`] / [`PieceTable::replace_range_at`]).
+///
+/// A replace runs as a delete + insert pair inside one edit batch, so a
+/// failure can arrive after the delete half already landed - the same
+/// situation the rope composite documents in `Document::try_replace_range`:
+/// the document did change and the deletion must stay undoable. `mutated`
+/// tells the caller whether the content changed despite the error, so the
+/// document can be marked dirty before the failure is surfaced.
+#[derive(Debug)]
+pub(crate) struct ReplaceBatchError {
+    pub(crate) source: io::Error,
+    pub(crate) mutated: bool,
+}
+
+impl From<ReplaceBatchError> for io::Error {
+    fn from(err: ReplaceBatchError) -> Self {
+        err.source
+    }
+}
+
 impl PieceTable {
     #[cfg_attr(not(test), allow(dead_code))]
     fn new(original: FileStorage, line_lengths: Vec<usize>, full_index: bool) -> Self {
@@ -1916,7 +1937,7 @@ impl PieceTable {
         start: usize,
         end: usize,
         encoded: &[u8],
-    ) -> io::Result<bool> {
+    ) -> Result<bool, ReplaceBatchError> {
         let start = start.min(self.total_len);
         let end = end.min(self.total_len).max(start);
         if start == end && encoded.is_empty() {
@@ -1933,9 +1954,11 @@ impl PieceTable {
         }
 
         self.begin_edit_batch();
+        let mut deleted = false;
         let result = (|| -> io::Result<()> {
             if end > start {
                 self.delete_range(start, end - start)?;
+                deleted = true;
             }
             if !encoded.is_empty() {
                 let insert_at = start.min(self.total_len);
@@ -1944,8 +1967,24 @@ impl PieceTable {
             Ok(())
         })();
         let end_batch = self.end_edit_batch();
-        result?;
-        end_batch?;
+        if let Err(source) = result {
+            // A refused insert after a landed delete still changed the
+            // document: the deletion is committed to the tree and stays
+            // undoable, so the caller must keep the document dirty
+            // instead of treating the batch as a no-op.
+            return Err(ReplaceBatchError {
+                source,
+                mutated: deleted,
+            });
+        }
+        // Both halves landed. The end-of-batch session flush never rolls
+        // the tree edits back (a failed flush detaches persistence and
+        // keeps the in-memory content), so a flush error still means the
+        // content changed.
+        end_batch.map_err(|source| ReplaceBatchError {
+            source,
+            mutated: true,
+        })?;
         Ok(true)
     }
 
@@ -1956,9 +1995,14 @@ impl PieceTable {
         col0: usize,
         len_chars: usize,
         text: &str,
-    ) -> io::Result<EditOutcome> {
+    ) -> Result<EditOutcome, ReplaceBatchError> {
         if len_chars == 0 {
-            return self.insert_text_at(line_ending, line0, col0, text);
+            return self
+                .insert_text_at(line_ending, line0, col0, text)
+                .map_err(|source| ReplaceBatchError {
+                    source,
+                    mutated: false,
+                });
         }
 
         let actual_col0 = self.line_len_chars(line0);
@@ -1981,19 +2025,41 @@ impl PieceTable {
         }
 
         self.begin_edit_batch();
+        let mut deleted = false;
         let result = (|| -> io::Result<EditOutcome> {
             let mut edited = false;
             if end > start {
                 self.delete_range(start, end - start)?;
+                deleted = true;
                 edited = true;
             }
             let outcome = self.insert_text_at(line_ending, line0, start_col0, text)?;
             Ok(EditOutcome::new(edited || outcome.edited, outcome.cursor))
         })();
         let end_batch = self.end_edit_batch();
-        let outcome = result?;
-        end_batch?;
-        Ok(EditOutcome::new(true, outcome.cursor))
+        match result {
+            Ok(outcome) => {
+                // Both halves landed. The end-of-batch session flush never
+                // rolls the tree edits back (a failed flush detaches
+                // persistence and keeps the in-memory content), so a flush
+                // error still means the content changed.
+                end_batch.map_err(|source| ReplaceBatchError {
+                    source,
+                    mutated: true,
+                })?;
+                Ok(EditOutcome::new(true, outcome.cursor))
+            }
+            Err(source) => {
+                // A refused insert after a landed delete still changed the
+                // document: the deletion is committed to the tree and stays
+                // undoable, so the caller must keep the document dirty
+                // instead of treating the batch as a no-op.
+                Err(ReplaceBatchError {
+                    source,
+                    mutated: deleted,
+                })
+            }
+        }
     }
 
     pub(crate) fn backspace_at(

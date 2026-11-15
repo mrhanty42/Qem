@@ -4832,6 +4832,47 @@ fn editlog_flush_failure_surfaces_error_and_falls_back_to_memory() {
 }
 
 #[test]
+fn refused_insert_truncates_add_buffer() {
+    // With persistence poisoned and the resident window full, an
+    // insert is refused (verify_pages_resident_since); the refused
+    // piece's bytes must be truncated out of the add buffer instead of
+    // leaking into every later session flush.
+    let dir = std::env::temp_dir().join(format!(
+        "standpad-doc-refused-insert-add-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("refused-add.txt");
+    write_disk_backed_fixture(&path);
+
+    let mut doc = Document::open(path.clone()).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
+    assert!(doc.has_piece_table());
+    let piece_table = doc.piece_table.as_mut().unwrap();
+    piece_table.pieces.poison_persistence_for_test();
+    piece_table
+        .pieces
+        .fill_resident_window_for_test(crate::piece_tree::RESIDENT_PAGES_FAILED_PERSISTENCE_CAP);
+
+    let insert_result = piece_table.insert_bytes(3, b"X");
+    assert!(
+        matches!(&insert_result,
+            Err(err) if err.to_string().contains("resident window exhausted")),
+        "the refused insert must surface the resident-window error"
+    );
+    assert_eq!(
+        piece_table.read_range(0, 11),
+        b"123abc
+def
+"
+        .to_vec(),
+        "reads must stay intact past the refusal"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn scheduled_editlog_flush_failure_does_not_rollback_piece_table_edit() {
     let dir = std::env::temp_dir().join(format!(
         "qem-doc-session-scheduled-failure-{}",
