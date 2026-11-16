@@ -4931,6 +4931,91 @@ fn scheduled_editlog_flush_failure_does_not_rollback_piece_table_edit() {
 }
 
 #[test]
+fn first_edit_after_persistence_failure_lands_in_resident_window() {
+    // Audit finding В3 (conservative): "the first edit after a real
+    // disk failure is refused". Since the resident-window change
+    // (`RESIDENT_PAGES_FAILED_PERSISTENCE_CAP`) this is no longer a
+    // refusal: the failed page write marks persistence down, the new
+    // page stays readable in the resident window
+    // (`verify_pages_resident_since`), and the edit lands. This pins
+    // the honest chain end to end: the first edit after the failure is
+    // accepted and reads back complete, the second edit lands through
+    // the resident window too while the debounced flush is still
+    // deferred, undo stays coherent, the forced flush reports the real
+    // disk failure once, and the in-memory fallback keeps accepting
+    // edits with the full content.
+    let dir = std::env::temp_dir().join(format!(
+        "qem-doc-first-edit-after-failure-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("first-edit-after-failure.txt");
+    write_disk_backed_fixture(&path);
+    let original = std::fs::read(&path).unwrap();
+
+    let mut doc = Document::open(path.clone()).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
+    assert!(doc.has_piece_table());
+    {
+        let piece_table = doc.piece_table.as_mut().expect("piece table expected");
+        piece_table.pieces.poison_persistence_for_test();
+        // Defer the debounced session flush: the pin is the edit itself
+        // landing through the resident window before any flush attempt
+        // detaches persistence.
+        piece_table.last_session_flush = Some(Instant::now());
+    }
+
+    let mut expected = b"123".to_vec();
+    expected.extend_from_slice(&original);
+
+    // First edit after the disk failure: accepted, not refused, and
+    // the page allocated by the failed write reads back.
+    let cursor = doc.try_insert_text_at(0, 3, "X").unwrap();
+    assert_eq!(cursor, (0, 4));
+    let mut expected_x = expected.clone();
+    expected_x.insert(3, b'X');
+    assert_eq!(doc.text_lossy(), String::from_utf8_lossy(&expected_x));
+
+    // The flush is still deferred and the disk is still down: the
+    // second edit lands through the resident window too.
+    {
+        let piece_table = doc.piece_table.as_mut().expect("piece table expected");
+        piece_table.last_session_flush = Some(Instant::now());
+    }
+    let _ = doc.try_insert_text_at(0, 4, "Y").unwrap();
+    assert!(doc.is_dirty(), "landed edits must report dirty");
+    let mut expected_xy = expected_x.clone();
+    expected_xy.insert(4, b'Y');
+    assert_eq!(doc.text_lossy(), String::from_utf8_lossy(&expected_xy));
+
+    // Undo stays coherent while persistence is down: undoing drops the
+    // last landed edit and nothing else.
+    {
+        let piece_table = doc.piece_table.as_mut().expect("piece table expected");
+        piece_table.last_session_flush = Some(Instant::now());
+    }
+    assert!(doc.try_undo().unwrap());
+    assert_eq!(doc.text_lossy(), String::from_utf8_lossy(&expected_x));
+
+    // The forced flush reports the real disk failure once, detaches
+    // persistence, and the in-memory fallback keeps accepting edits
+    // with the full content (nothing truncated behind the resident
+    // window).
+    let err = doc.flush_session();
+    assert!(matches!(err, Err(DocumentError::Write { .. })));
+    assert!(
+        doc.flush_session().is_ok(),
+        "in-memory fallback should stop retrying failed persistence"
+    );
+    let _ = doc.try_insert_text_at(0, 4, "Y").unwrap();
+    assert_eq!(doc.text_lossy(), String::from_utf8_lossy(&expected_xy));
+
+    clear_session_sidecar(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn replace_batch_partial_land_reports_dirty() {
     // Regression for the half-landed replace batch: `replace_range_at`
     // runs delete + insert inside one edit batch, and the insert can be
