@@ -308,7 +308,7 @@
 pub mod document;
 #[cfg(feature = "editor")]
 pub mod editor;
-pub mod index;
+pub(crate) mod index;
 pub(crate) mod piece_tree;
 pub(crate) mod sidecar;
 pub(crate) mod source_identity;

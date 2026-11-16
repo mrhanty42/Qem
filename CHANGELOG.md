@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- The `qem::index` module is no longer part of the public API. Every item
+  inside it was already `pub(crate)`, so the module re-export exposed an
+  empty namespace; closing it keeps the disk line index an internal detail
+  the 1.0.0 freeze does not have to promise compatibility for.
+
 ### Fixed
 
 - Saving a document whose editlog persistence had failed no longer
