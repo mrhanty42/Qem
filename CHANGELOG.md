@@ -11,6 +11,21 @@
 
 ### Fixed
 
+- Dense `find_all_regex` over Class B (UTF-16 / CJK) documents is linear
+  in the match count. The chunked Class B scan fetched and redecoded a
+  full window and remapped the match position from byte 0 for EVERY
+  match, so a document with a match in every line turned find-all into a
+  quadratic run (measured: 1500 matches 119 s, 3000 matches 546 s; ~100k
+  matches did not finish within 2 minutes). Consecutive matches inside
+  one window are now served from an amortized decoded-window cache with
+  an incremental decoded→source cursor, and the piece-table position
+  mapping starts from the verified search origin instead of byte 0
+  (measured: 5000 matches ~5 s, linear scaling). The floor-stability
+  property caught the first anchor variant mapping positions through a
+  floor-aligned origin byte, regressing the iterator's cursor into an
+  endless loop; anchors are now round-trip verified against the
+  document's position→byte helper, and the iterator finishes instead of
+  looping if a match ever lands at or before the previous one.
 - Saving a document whose editlog persistence had failed no longer
   streams truncated (or empty) content. The forced compaction before a
   save rebuilt the piece tree root from freshly allocated pages without

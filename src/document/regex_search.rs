@@ -397,6 +397,12 @@ impl std::error::Error for RegexCompileError {}
 /// match, mirroring [`super::search::LiteralSearchIter`]. Empty matches still
 /// advance by at least one document text unit so the iterator cannot loop
 /// indefinitely on patterns like `(a*)`.
+///
+/// On Class B (UTF-16 / CJK multibyte) backings the iterator also carries an
+/// amortized window cache ([`ClassBRegexWindowCache`]): consecutive matches
+/// inside one decoded window are served from the cache, so a dense
+/// `find_all_regex` over a multi-thousand-match document does not refetch,
+/// redecode, and remap the same window per match.
 #[derive(Debug)]
 pub struct RegexSearchIter<'a> {
     doc: &'a Document,
@@ -404,6 +410,13 @@ pub struct RegexSearchIter<'a> {
     next_from: TextPosition,
     end: Option<TextPosition>,
     finished: bool,
+    class_b_window_cache: Option<ClassBRegexWindowCache>,
+    /// Start position of the previously returned match. Forward
+    /// non-overlapping regex search is strictly monotone, so a later match
+    /// must start strictly after the earlier one; the iterator finishes
+    /// instead of looping when a position-mapping regression breaks that
+    /// invariant.
+    last_match_start: Option<TextPosition>,
 }
 
 impl<'a> RegexSearchIter<'a> {
@@ -421,6 +434,8 @@ impl<'a> RegexSearchIter<'a> {
             next_from,
             end,
             finished: false,
+            class_b_window_cache: None,
+            last_match_start: None,
         }
     }
 }
@@ -434,21 +449,60 @@ impl Iterator for RegexSearchIter<'_> {
         }
 
         let from = self.next_from;
-        let found = match self.end {
-            Some(end) => {
-                if from >= end {
-                    self.finished = true;
-                    return None;
-                }
-                self.doc.find_next_regex_bounded(&self.query, from, end)
+        let found = 'found: {
+            // Amortized continuation first: a match inside the cached Class
+            // B window skips the fetch + decode + remap the scan would
+            // repeat per match. When the resume helper cannot serve the
+            // request it clears the cache, and the fallback below refills
+            // it from a fresh scan.
+            if let Some(found) = try_resume_class_b_window_cache(
+                self.doc,
+                &self.query,
+                &mut self.class_b_window_cache,
+                from,
+                self.end,
+            ) {
+                break 'found Some(found);
             }
-            None => self.doc.find_next_regex_query(&self.query, from),
+            match self.end {
+                Some(end) => {
+                    if from >= end {
+                        self.finished = true;
+                        break 'found None;
+                    }
+                    self.doc.find_next_regex_bounded_with_cache(
+                        &self.query,
+                        from,
+                        end,
+                        &mut self.class_b_window_cache,
+                    )
+                }
+                None => self.doc.find_next_regex_query_with_cache(
+                    &self.query,
+                    from,
+                    &mut self.class_b_window_cache,
+                ),
+            }
         };
 
         let Some(found) = found else {
             self.finished = true;
             return None;
         };
+
+        // Forward non-overlapping regex search is strictly monotone: each
+        // match starts strictly after the previously returned one. A
+        // position-mapping regression that lands a match at or before the
+        // previous start would otherwise loop this iterator forever (the
+        // failure the prop_alignment floor-stability property caught in the
+        // amortized-anchor mapping); finish instead of looping.
+        if let Some(last) = self.last_match_start {
+            if found.start() <= last {
+                self.finished = true;
+                return None;
+            }
+        }
+        self.last_match_start = Some(found.start());
 
         let advanced = if found.end() <= from {
             // Empty or zero-width match at the same position: nudge forward
@@ -519,11 +573,26 @@ impl Document {
         query: &RegexSearchQuery,
         from: TextPosition,
     ) -> Option<SearchMatch> {
+        self.find_next_regex_query_with_cache(query, from, &mut None)
+    }
+
+    /// [`Document::find_next_regex_query`] with an amortized Class B window
+    /// cache. `cache_out` carries the decoded window between consecutive
+    /// calls at monotonically advancing origins (a `find_all` iteration);
+    /// consecutive matches inside one cached window reuse the fetch, the
+    /// decode, and the incremental position mapping instead of repeating
+    /// them per match. A one-shot caller passes `&mut None`.
+    fn find_next_regex_query_with_cache(
+        &self,
+        query: &RegexSearchQuery,
+        from: TextPosition,
+        cache_out: &mut Option<ClassBRegexWindowCache>,
+    ) -> Option<SearchMatch> {
         let from = self.clamp_position(from);
         if let Some(rope) = &self.rope {
             return find_next_regex_in_rope(self, rope, query, from);
         }
-        find_next_regex_in_bytes(self, query, from, None)
+        find_next_regex_in_bytes(self, query, from, None, cache_out)
     }
 
     /// Finds the previous regex match for a reusable compiled query.
@@ -692,13 +761,25 @@ impl Document {
         start: TextPosition,
         end: TextPosition,
     ) -> Option<SearchMatch> {
+        self.find_next_regex_bounded_with_cache(query, start, end, &mut None)
+    }
+
+    /// [`Document::find_next_regex_bounded`] with the amortized Class B
+    /// window cache (see [`Document::find_next_regex_query_with_cache`]).
+    fn find_next_regex_bounded_with_cache(
+        &self,
+        query: &RegexSearchQuery,
+        start: TextPosition,
+        end: TextPosition,
+        cache_out: &mut Option<ClassBRegexWindowCache>,
+    ) -> Option<SearchMatch> {
         if start >= end {
             return None;
         }
         if let Some(rope) = &self.rope {
             return find_next_regex_in_rope_bounded(self, rope, query, start, end);
         }
-        find_next_regex_in_bytes(self, query, start, Some(end))
+        find_next_regex_in_bytes(self, query, start, Some(end), cache_out)
     }
 
     pub(super) fn find_prev_regex_bounded(
@@ -902,6 +983,7 @@ fn find_next_regex_in_bytes(
     query: &RegexSearchQuery,
     from: TextPosition,
     end: Option<TextPosition>,
+    cache_out: &mut Option<ClassBRegexWindowCache>,
 ) -> Option<SearchMatch> {
     let start_offset = doc.search_byte_offset_for_position(from);
     let end_offset = match end {
@@ -932,10 +1014,29 @@ fn find_next_regex_in_bytes(
     // UTF-8 and Class A keep the existing byte-engine fast path below.
     let encoding = doc.encoding();
     if !encoding.is_utf8() && !SingleByteEngine::supports(encoding) {
-        return scan_class_b_regex_candidates(doc, query, start_offset, end_offset, false)
-            .and_then(|(match_start, match_end, match_bytes)| {
-                build_class_b_search_match(doc, match_start, match_end, &match_bytes, end)
-            });
+        return scan_class_b_regex_candidates(
+            doc,
+            query,
+            start_offset,
+            end_offset,
+            false,
+            Some(cache_out),
+        )
+        .and_then(|(match_start, match_end, match_bytes)| {
+            build_class_b_search_match(
+                doc,
+                match_start,
+                match_end,
+                &match_bytes,
+                end,
+                // Amortized anchor: `start_offset` is the byte offset of
+                // `from` (the end of the previously returned match in a
+                // find_all iteration), so the piece-table position mapper
+                // walks only the gap since the previous match instead of
+                // the whole document prefix per match.
+                Some((start_offset, from)),
+            )
+        });
     }
 
     // Mmap backing: zero-copy. The regex engine walks the mmap slice
@@ -1114,7 +1215,7 @@ fn find_prev_regex_via_reverse_dfa(
     // last non-overlapping match, like the small-span byte fallback does.
     let encoding = doc.encoding();
     if !encoding.is_utf8() && !SingleByteEngine::supports(encoding) {
-        return scan_class_b_regex_candidates(doc, query, start_off, end_off, true).and_then(
+        return scan_class_b_regex_candidates(doc, query, start_off, end_off, true, None).and_then(
             |(match_start, match_end, match_bytes)| {
                 build_class_b_search_match(
                     doc,
@@ -1122,6 +1223,10 @@ fn find_prev_regex_via_reverse_dfa(
                     match_end,
                     &match_bytes,
                     Some(bound_end),
+                    // Reverse scans start at `bound_start`; the anchor maps
+                    // the single reverse match from the range head. The
+                    // window cache is a forward-iterator artifact.
+                    Some((start_off, bound_start)),
                 )
             },
         );
@@ -1737,6 +1842,199 @@ fn class_b_requires_even_alignment(encoding: DocumentEncoding) -> bool {
     matches!(encoding.name(), "UTF-16LE" | "UTF-16BE")
 }
 
+/// Amortized Class B regex window cache carried by [`RegexSearchIter`].
+///
+/// `scan_class_b_regex_candidates` fetches and decodes a window of up to
+/// `REGEX_CHUNK_BYTES` source bytes per call, but a forward scan returns only
+/// its FIRST accepted match — so a dense `find_all_regex` over a document
+/// with a match every few bytes used to repeat the fetch + decode (and, via
+/// the origin-anchored position mapper, the whole-document prefix scan) for
+/// every single match: quadratic in the match count. The cache hands the
+/// window that produced a match back to the iterator together with an
+/// incremental decoded→source cursor, so the remaining matches inside the
+/// same window are served by continuing the regex over the already decoded
+/// text and walking the cursor forward from the previous match.
+#[derive(Debug)]
+struct ClassBRegexWindowCache {
+    /// Absolute source-byte offset of `window[0]` (after the
+    /// cell-alignment skip).
+    chunk_start: usize,
+    /// Raw source bytes of the window (post cell-alignment skip).
+    window: Vec<u8>,
+    /// The window decoded through the document encoding.
+    decoded: String,
+    /// Encoding the window was decoded with.
+    encoding: DocumentEncoding,
+    /// Decoded-byte cursor; always a UTF-8 char boundary in `decoded`.
+    decoded_cursor: usize,
+    /// Absolute source-byte offset corresponding to `decoded_cursor`.
+    source_cursor: usize,
+    /// Decoded offset where the next resume search starts. Equals
+    /// `decoded_cursor` right after a mapped match; a mismatch between the
+    /// two at resume time means the caller advanced by other means (e.g. a
+    /// zero-width-match nudge) and the cache must be discarded.
+    resume_decoded: usize,
+}
+
+/// Advances the incremental decoded→source cursor of a cached Class B
+/// regex window to `target_decoded` and returns the absolute source-byte
+/// offset.
+///
+/// Mirrors [`class_b_source_bytes_for_decoded_prefix`] exactly (UTF-16:
+/// `len_utf16() * 2` per scalar; CJK multibyte: per-character re-encode
+/// through encoding_rs) but walks forward one character at a time from the
+/// cursor instead of re-encoding the whole prefix, so mapping every match
+/// in a window costs O(characters between matches) instead of
+/// O(window prefix).
+///
+/// Returns `None` when `target_decoded` is behind the cursor (monotone
+/// contract violation), past the decoded text, or not on a char boundary;
+/// the caller then discards the cache and falls back to a fresh scan.
+fn advance_class_b_window_cursor(
+    cache: &mut ClassBRegexWindowCache,
+    target_decoded: usize,
+) -> Option<usize> {
+    if target_decoded < cache.decoded_cursor
+        || target_decoded > cache.decoded.len()
+        || !cache.decoded.is_char_boundary(target_decoded)
+    {
+        return None;
+    }
+    let is_utf16 = matches!(cache.encoding.name(), "UTF-16LE" | "UTF-16BE");
+    let encoding = cache.encoding.as_encoding();
+    let mut buf = [0u8; 4];
+    while cache.decoded_cursor < target_decoded {
+        let c = cache.decoded[cache.decoded_cursor..].chars().next()?;
+        let width = if is_utf16 {
+            c.len_utf16().saturating_mul(2)
+        } else {
+            let s = c.encode_utf8(&mut buf);
+            encoding.encode(s).0.len()
+        };
+        cache.decoded_cursor += c.len_utf8();
+        cache.source_cursor = cache.source_cursor.saturating_add(width);
+    }
+    Some(cache.source_cursor)
+}
+
+/// Outcome of one resume attempt against the cached Class B window.
+enum CachedResume {
+    /// No cache was present; the caller proceeds with a fresh scan.
+    NoCache,
+    /// The cache was present but could not serve the request (cursor out
+    /// of sync, window exhausted, mapping drift). The caller must clear
+    /// the cache before falling back to a fresh scan.
+    Bail,
+    /// A match was served from the cache; the cursor state inside the
+    /// cache is already updated past the returned match.
+    Serve(SearchMatch),
+}
+
+/// Serves the next regex match from the iterator's cached Class B window.
+///
+/// Returns [`CachedResume::Serve`] when the cached window still holds a
+/// match at or after `from`; [`CachedResume::Bail`] otherwise (the caller
+/// clears the cache and falls back to a fresh `scan_class_b_regex_candidates`,
+/// which refills it). The cursor validity check keeps the amortized path
+/// sound: it resumes only when the cache cursor sits exactly at the search
+/// origin, i.e. the previous match ended there.
+fn try_resume_class_b_window_cache(
+    doc: &Document,
+    query: &RegexSearchQuery,
+    cache: &mut Option<ClassBRegexWindowCache>,
+    from: TextPosition,
+    end: Option<TextPosition>,
+) -> Option<SearchMatch> {
+    match resume_cached_class_b_window(doc, query, cache.as_mut(), from, end) {
+        CachedResume::Serve(found) => Some(found),
+        CachedResume::NoCache | CachedResume::Bail => {
+            *cache = None;
+            None
+        }
+    }
+}
+
+fn resume_cached_class_b_window(
+    doc: &Document,
+    query: &RegexSearchQuery,
+    cache: Option<&mut ClassBRegexWindowCache>,
+    from: TextPosition,
+    end: Option<TextPosition>,
+) -> CachedResume {
+    let Some(cache) = cache else {
+        return CachedResume::NoCache;
+    };
+    let from_source = doc.search_byte_offset_for_position(from);
+    if from_source != cache.source_cursor || cache.decoded_cursor != cache.resume_decoded {
+        // The origin does not sit at the cached cursor (zero-width nudge,
+        // clamped origin, or interleaved search from another position):
+        // discard the cache and let the fresh scan re-establish state.
+        return CachedResume::Bail;
+    }
+    let requires_even_alignment = class_b_requires_even_alignment(cache.encoding);
+    let mut search_decoded = cache.resume_decoded;
+    loop {
+        let m = match query.text_regex().find(&cache.decoded[search_decoded..]) {
+            Some(m) => m,
+            None => {
+                // Window exhausted: everything the cached window could
+                // offer has been returned. Bail; the fallback scan
+                // continues from `from` into the next window.
+                return CachedResume::Bail;
+            }
+        };
+        let start_decoded = search_decoded + m.start();
+        let end_decoded = search_decoded + m.end();
+        let Some(match_start_abs) = advance_class_b_window_cursor(cache, start_decoded) else {
+            return CachedResume::Bail;
+        };
+        let Some(match_end_abs) = advance_class_b_window_cursor(cache, end_decoded) else {
+            return CachedResume::Bail;
+        };
+        let start_rel = match_start_abs - cache.chunk_start;
+        let end_rel = match_end_abs - cache.chunk_start;
+        if end_rel > cache.window.len() {
+            // The incremental mapping drifted past the cached window
+            // (reachable only on ill-formed input where U+FFFD re-encode
+            // widths disagree with the source bytes): fall back to the
+            // scan's whole-prefix mapping.
+            return CachedResume::Bail;
+        }
+        // Same alignment post-filter as `map_and_keep_class_b_candidate`:
+        // an odd-offset UTF-16 candidate straddles a U+FFFD cell and must
+        // be skipped, not returned.
+        if requires_even_alignment && (match_start_abs & 1 != 0 || match_end_abs & 1 != 0) {
+            search_decoded = end_decoded;
+            cache.resume_decoded = end_decoded;
+            continue;
+        }
+        let match_bytes = cache.window[start_rel..end_rel].to_vec();
+        cache.resume_decoded = end_decoded;
+        let found = build_class_b_search_match(
+            doc,
+            match_start_abs,
+            match_end_abs,
+            &match_bytes,
+            end,
+            // The cached cursor is the search origin: the piece-table
+            // position mapper walks only the gap since the previous match.
+            Some((from_source, from)),
+        );
+        return match found {
+            Some(found) => CachedResume::Serve(found),
+            // The match crosses the typed end bound: mirroring the scan
+            // path, the whole search is finished.
+            None => CachedResume::Bail,
+        };
+    }
+}
+
+/// A forward-accepted scan candidate — `(match_start, match_end,
+/// match_bytes)` in absolute source bytes — paired with the decoded offset
+/// of the match end (the resume point for the amortized
+/// [`ClassBRegexWindowCache`]).
+type AcceptedClassBCandidate = ((usize, usize, Vec<u8>), usize);
+
 /// Chunked decode + glue regex for Class B (UTF-16 and CJK multibyte)
 /// backings.
 ///
@@ -1790,6 +2088,7 @@ fn scan_class_b_regex_candidates(
     start_offset: usize,
     end_offset: usize,
     keep_last: bool,
+    cache_out: Option<&mut Option<ClassBRegexWindowCache>>,
 ) -> Option<(usize, usize, Vec<u8>)> {
     if start_offset >= end_offset {
         return None;
@@ -1998,6 +2297,11 @@ fn scan_class_b_regex_candidates(
                     .filter(move |m| overlap_filter(*m)),
             )
         };
+        // Forward mode takes the first accepted candidate of the window and
+        // returns immediately (below); the `accepted` flag only defers the
+        // return past the iterator borrow so the window can be handed to the
+        // amortized `RegexSearchIter` cache.
+        let mut accepted: Option<AcceptedClassBCandidate> = None;
         for m in window_matches {
             // Skip matches fully inside the previous-chunk overlap on
             // continuation chunks; they were either already returned or
@@ -2032,9 +2336,36 @@ fn scan_class_b_regex_candidates(
                     match_source_len,
                     &window,
                 ) {
-                    return Some(candidate);
+                    accepted = Some((candidate, m.end()));
+                    break;
                 }
             }
+        }
+        if let Some(((match_start_abs, match_end_abs, match_bytes), accepted_decoded_end)) =
+            accepted
+        {
+            // Hand the window that produced the match to the iterator's
+            // amortized cache (forward mode only): the remaining matches of
+            // this window are then served from the already fetched and
+            // decoded window instead of repeating the fetch + decode per
+            // match (the quadratic dense-find_all regression). The cache
+            // cursor sits at the accepted match's end, so the resume search
+            // continues strictly past everything already returned.
+            if let Some(cache_slot) = cache_out {
+                // `decoded`'s type borrows `window`; consume the Cow first so
+                // the window can move into the cache.
+                let decoded_owned = decoded.into_owned();
+                *cache_slot = Some(ClassBRegexWindowCache {
+                    chunk_start,
+                    window,
+                    decoded: decoded_owned,
+                    encoding: doc_encoding,
+                    decoded_cursor: accepted_decoded_end,
+                    source_cursor: match_end_abs,
+                    resume_decoded: accepted_decoded_end,
+                });
+            }
+            return Some((match_start_abs, match_end_abs, match_bytes));
         }
 
         if chunk_end >= end_offset {
@@ -2170,6 +2501,16 @@ fn decoded_prefix_for_source_byte_count(
 /// Builds a `SearchMatch` from a Class B chunked match expressed in
 /// absolute source-byte offsets.
 ///
+/// `anchor` is an optional `(byte_offset, position)` pair known to
+/// correspond exactly and to sit at or before the match (the search origin:
+/// the end of the previously returned match in a `find_all` iteration).
+/// When present, the piece-table start-position mapping scans forward from
+/// the anchor instead of from byte 0, which keeps dense `find_all_regex`
+/// runs linear: per match the mapper then walks only the gap since the
+/// previous match rather than the whole document prefix. An anchor at or
+/// past the match (or `None`) falls back to the origin scan, preserving the
+/// exact previous semantics whenever the anchor cannot be trusted.
+///
 /// Computes encoding-aware start / end `TextPosition`s through
 /// `Document::position_for_byte_offset_in_class_b` and counts text-units
 /// over the matched byte slice via the document's encoding engine. CRLF
@@ -2184,6 +2525,7 @@ fn build_class_b_search_match(
     match_end: usize,
     match_bytes: &[u8],
     end: Option<TextPosition>,
+    anchor: Option<(usize, TextPosition)>,
 ) -> Option<SearchMatch> {
     // Resolve positions in the same byte space the match was found in:
     // edited Class B documents promote to the piece table while the
@@ -2192,12 +2534,35 @@ fn build_class_b_search_match(
     // lines and columns.
     let (start_pos, end_pos) = if let Some(piece_table) = doc.piece_table.as_ref() {
         let engine = doc.encoding_engine();
-        let start_pos = piece_table.position_for_byte_offset_from(
-            0,
-            TextPosition::new(0, 0),
+        let (anchor_offset, anchor_position) = anchor
+            .filter(|(offset, _)| *offset <= match_start)
+            .unwrap_or((0, TextPosition::new(0, 0)));
+        let anchored_start = piece_table.position_for_byte_offset_from(
+            anchor_offset,
+            anchor_position,
             match_start,
             engine,
         );
+        // The anchor pair must be exact, and it is not guaranteed to be:
+        // `search_byte_offset_for_position` floor-aligns its answer, so a
+        // caller-origin byte can sit below the origin position's true cell
+        // start, and a mapping seeded with the origin position at that byte
+        // drifts every subsequent position. A drifted start would regress
+        // `RegexSearchIter`'s cursor and loop a dense `find_all_regex`
+        // forever (the failure the prop_alignment floor-stability property
+        // caught). Match starts are cell-aligned, so a CORRECT anchored
+        // mapping round-trips exactly through the document's position→byte
+        // helper; anything else falls back to the exact absolute mapping.
+        let start_pos = if doc.search_byte_offset_for_position(anchored_start) == match_start {
+            anchored_start
+        } else {
+            piece_table.position_for_byte_offset_from(
+                0,
+                TextPosition::new(0, 0),
+                match_start,
+                engine,
+            )
+        };
         let end_pos =
             piece_table.position_for_byte_offset_from(match_start, start_pos, match_end, engine);
         (start_pos, end_pos)

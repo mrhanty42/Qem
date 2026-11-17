@@ -1844,3 +1844,94 @@ fn find_next_regex_rejects_phantom_match_at_shift_jis_window_head() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Dense find_all_regex on a Class B piece-table document (quadratic-mapping
+// reproduction, guard test).
+// ---------------------------------------------------------------------------
+
+/// Builds a Shift_JIS fixture with `n_lines` lines, each carrying exactly one
+/// `TARGET` match at column 0, padded to `LINE_BYTES` bytes per line. The
+/// payload is pure ASCII (identical in Shift_JIS and in UTF-8), so the
+/// trivial line-by-line oracle below is exact without any decoding.
+fn build_dense_shift_jis_fixture(n_lines: usize) -> Vec<u8> {
+    // Wide lines keep the fixture above the 1 MiB piece-table promotion
+    // threshold even for small N (any N >= 1500 satisfies N * 716 > 1 MiB).
+    const LINE_BYTES: usize = 716; // 6 TARGET + 709 filler + 1 newline
+    let filler = LINE_BYTES - 6 - 1;
+    let mut line = String::with_capacity(LINE_BYTES);
+    line.push_str("TARGET");
+    for j in 0..filler {
+        line.push(char::from(b'a' + (j % 26) as u8));
+    }
+    line.push('\n');
+    let encoded = SHIFT_JIS.encode(&line).0;
+    assert_eq!(encoded.len(), LINE_BYTES, "fixture line width drifted");
+    let mut out = Vec::with_capacity(n_lines * LINE_BYTES);
+    for _ in 0..n_lines {
+        out.extend_from_slice(encoded.as_ref());
+    }
+    out
+}
+
+/// Opens the fixture as a Shift_JIS document and promotes it to the
+/// piece-table backing (seed edit + undo, mirroring
+/// `open_piece_table_doc`) — the backing whose Class B regex path maps
+/// match positions through the piece table.
+fn open_dense_shift_jis_piece_table_doc(bytes: &[u8], label: &str) -> Document {
+    let dir = fresh_test_dir(label);
+    let path = dir.join("source.txt");
+    fs::write(&path, bytes).unwrap();
+    let mut doc =
+        Document::open_with_encoding(&path, DocumentEncoding::from_label("shift_jis").unwrap())
+            .unwrap();
+    wait_until_indexed(&doc);
+    let _ = doc
+        .try_insert(TextPosition::new(0, 0), "X")
+        .expect("seed edit promotes to piece-table");
+    let _ = doc
+        .try_replace(TextRange::new(TextPosition::new(0, 0), 1), "")
+        .expect("undo seed edit");
+    assert!(
+        doc.has_piece_table(),
+        "fixture must stay piece-table backed"
+    );
+    doc
+}
+
+#[test]
+fn find_all_regex_dense_class_b_piece_table_stays_linear() {
+    // Dense find_all over a Class B piece-table document: one match per
+    // line. The old path refetched and redecoded a full window and remapped
+    // the match position from byte 0 for EVERY match, so the run was
+    // quadratic in the match count (measured: N=1500 -> 118.7 s,
+    // N=3000 -> 545.9 s in debug, a 4.6x step for 2x the input). The
+    // amortized window cache + origin-anchored position mapping make the
+    // run linear (measured: N=1500 -> 2.35 s, N=3000 -> 4.61 s, ~1.96x
+    // step; N=5000 -> ~7.7 s). The threshold is 10x the measured
+    // post-fix debug time (and 15x under it), while the old quadratic
+    // path needs ~25 minutes at N=5000 — the guard cannot pass it by
+    // timing noise and cannot fail it on a slow CI machine.
+    let n_lines = 5_000usize;
+    let bytes = build_dense_shift_jis_fixture(n_lines);
+    let doc = open_dense_shift_jis_piece_table_doc(&bytes, "dense-find-all");
+
+    let started = Instant::now();
+    let matches: Vec<_> = doc.find_all_regex("TARGET").unwrap().collect();
+    let elapsed = started.elapsed();
+    println!("N={n_lines} elapsed={elapsed:?}");
+
+    // Correctness oracle (trivial, independent of the regex machinery):
+    // exactly one match per line, at column 0 of its line, 6 units wide.
+    assert_eq!(matches.len(), n_lines, "one match per line expected");
+    for (index, m) in matches.iter().enumerate() {
+        assert_eq!(m.start(), TextPosition::new(index, 0), "match {index} line");
+        assert_eq!(m.end(), TextPosition::new(index, 6), "match {index} end");
+        assert_eq!(m.len_chars(), 6, "match {index} width");
+    }
+    assert!(
+        elapsed < Duration::from_secs(120),
+        "dense Class B find_all_regex regressed to quadratic mapping: \
+         {elapsed:?} for {n_lines} matches (threshold 120 s)"
+    );
+}
