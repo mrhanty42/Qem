@@ -533,11 +533,58 @@ impl Iterator for RegexSearchIter<'_> {
 impl std::iter::FusedIterator for RegexSearchIter<'_> {}
 
 fn advance_one_text_unit(doc: &Document, position: TextPosition) -> TextPosition {
-    let line_len = doc.line_len_chars(position.line0());
-    if position.col0() < line_len {
-        return TextPosition::new(position.line0(), position.col0().saturating_add(1));
+    // Zero-width matches advance one text unit. Rope documents have exact
+    // line metadata, so the column walk stays there. For byte-backed
+    // documents the nudge goes through the BYTE model — position → byte →
+    // one engine cell → byte → position: the metadata walk (`line_len_
+    // chars` → `line_start_byte` → piece line-break counts) can disagree
+    // with the cell-exact byte model on edited non-UTF-8 documents, and
+    // such a disagreement turned this nudge into an endless column walk
+    // (a zero-width match at a line end crawled thousands of phantom
+    // columns per line on a 70-byte fixture — the third randomized
+    // floor-stability hang mechanism). The byte model is exact by
+    // construction: the byte→position mapper walks the bytes with the
+    // engine, so the nudged position is always a real, scannable
+    // position, and a phantom origin snaps back onto true ground.
+    if let Some(rope) = &doc.rope {
+        let line_len = Document::rope_line_len_chars_without_newline(rope, position.line0());
+        if position.col0() < line_len {
+            return TextPosition::new(position.line0(), position.col0().saturating_add(1));
+        }
+        return TextPosition::new(position.line0().saturating_add(1), 0);
     }
-    TextPosition::new(position.line0().saturating_add(1), 0)
+    let byte = doc.search_byte_offset_for_position(position);
+    let file_len = doc.file_len();
+    if byte >= file_len {
+        return position;
+    }
+    let window_end = file_len.min(byte.saturating_add(8));
+    let window = if let Some(slice) = doc.mmap_search_slice(byte, window_end) {
+        slice.to_vec()
+    } else {
+        match doc.piece_table_uncapped_range(byte, window_end) {
+            Some(bytes) => bytes,
+            None => return position,
+        }
+    };
+    let engine = doc.encoding_engine();
+    let step = engine
+        .step(&window, 0, window.len())
+        .max(1)
+        .min(window.len());
+    let next_byte = byte + step;
+    let next = if let Some(piece_table) = doc.piece_table.as_ref() {
+        piece_table.position_for_byte_offset_from(0, TextPosition::new(0, 0), next_byte, engine)
+    } else {
+        doc.position_for_byte_offset_in_class_b(next_byte)
+    };
+    // Trust the byte model unconditionally: comparing against the origin
+    // would compare against a possibly-phantom position, and nudging that
+    // phantom by one column is exactly the endless crawl. If the snapped
+    // answer lands at or before the origin, the iterator's own guards
+    // (the nudge's `advanced <= from` finish and the monotone-start guard)
+    // end the iteration instead of looping.
+    next
 }
 
 impl Document {
@@ -992,6 +1039,31 @@ fn find_next_regex_in_bytes(
     };
     if start_offset >= end_offset {
         return None;
+    }
+
+    // Snap a phantom origin onto true ground. The position→byte mapping
+    // saturates at the end of the line for columns past the line's width,
+    // so a phantom origin (a position whose column exceeds its line's
+    // true width — reachable through the zero-width nudge on a document
+    // whose line metadata drifted) pairs with a byte whose true position
+    // differs, and an anchor built on that pair echoes the phantom origin
+    // for every match at the saturated byte: the iterator then crawls one
+    // column per full window scan forever (the randomized floor-stability
+    // hang). The byte→position mapper walks the bytes with the engine, so
+    // it is cell-exact; when its answer round-trips back to the start
+    // byte, that answer is the true position of the origin byte and the
+    // scan anchors on it instead of the phantom.
+    if let Some(piece_table) = doc.piece_table.as_ref() {
+        let engine = doc.encoding_engine();
+        let snapped = piece_table.position_for_byte_offset_from(
+            0,
+            TextPosition::new(0, 0),
+            start_offset,
+            engine,
+        );
+        if snapped != from && doc.search_byte_offset_for_position(snapped) == start_offset {
+            return find_next_regex_in_bytes(doc, query, snapped, end, cache_out);
+        }
     }
 
     // Class B routing: for UTF-16 and the CJK

@@ -11,6 +11,25 @@
 
 ### Fixed
 
+- A phantom search origin snaps to true ground. The position→byte mapping
+  saturates at the end of the line for columns past the line's width, so
+  an origin whose column exceeds its line's true width (reachable through
+  the zero-width nudge on an edited non-UTF-8 document whose line
+  metadata drifted) pairs with a byte whose true position differs; the
+  anchored position mapping then echoed the phantom origin for every
+  match at the saturated byte, and the iterator crawled one column per
+  full window scan forever — 49,662 identical scans of an 8-byte window
+  on a 56-byte fixture in the randomized floor-stability property. The
+  byte→position mapper walks the bytes with the engine and is
+  cell-exact, so the scan now snaps its origin onto the true position of
+  the saturated byte whenever the round trip disagrees; the zero-width
+  nudge also walks the byte model (position → byte → one engine cell →
+  byte → position) instead of trusting line metadata, so a phantom
+  origin cannot survive a step. The randomized floor-stability property
+  ran 10/10 seeds clean after hanging on 4 of 8; the deterministic
+  phantom-origin search (a column of 999,999 over a 56-byte document)
+  previously died with a stack overflow and now answers with the snapped
+  position.
 - Line-break counts for UTF-16 pieces are computed on whole cells. The
   counter scanned raw `0x0A` / `0x0D` bytes; in UTF-16LE characters like
   U+4E0A (`[0x0A, 0x4E]`) or U+0A41 (`[0x41, 0x0A]`) alias those bytes,

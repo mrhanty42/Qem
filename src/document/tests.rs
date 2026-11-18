@@ -6498,6 +6498,22 @@ fn inserted_utf16le_break_cells_survive_aliasing_characters() {
         .expect("line 2 filler after the phantom breaks");
     assert_eq!(m.start(), TextPosition::new(2, 0), "line 2 start");
     assert_eq!(m.len_chars(), 6);
+
+    // A phantom origin (a column far past the line's width) must snap to
+    // true ground instead of echoing itself: the position→byte mapping
+    // saturates at the line end, so the search anchors on the true
+    // position of the saturated byte — the next line's start — and finds
+    // the content after it.
+    let m = doc
+        .find_next_regex("filler", TextPosition::new(0, 999_999))
+        .unwrap()
+        .expect("search from a phantom origin must snap and find");
+    assert_eq!(
+        m.start(),
+        TextPosition::new(1, 0),
+        "snapped origin finds line 1"
+    );
+    assert_eq!(m.len_chars(), 6);
 }
 
 #[test]
