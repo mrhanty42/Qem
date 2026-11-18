@@ -11,6 +11,17 @@
 
 ### Fixed
 
+- Text-unit counting and the scanned column→byte mapper recognize line
+  breaks on whole UTF-16 cells. `count_text_units_in_bytes` (the char
+  index builder) counted one UTF-16LE non-break character (U+4E0A is
+  `[0x0A, 0x4E]`) as TWO units — the aliased "break" plus its high byte —
+  and `byte_offset_for_text_col_with_engine` (the scanned position→byte
+  mapper for lines past the annotated region) stopped its column walk at
+  the same aliased byte, mapping every later column onto the wrong byte.
+  Both now classify whole cells (CRLF collapses into one unit, matching
+  the other line-model walks). The aliasing-character fixture asserts
+  the char indexes and the edit landing point; the raw counter and the
+  raw mapper under mutation fail both.
 - Column and viewport line walks recognize line breaks on whole UTF-16
   cells. `byte_offset_for_col_with_engine` and the viewport line segment
   checked a raw `0x0A` / `0x0D` byte before stepping the encoding cell:

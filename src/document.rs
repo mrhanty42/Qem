@@ -1081,14 +1081,22 @@ fn byte_offset_for_text_col_with_engine(
     if col0 == 0 || start >= end {
         return start.min(end);
     }
+    // Line breaks are recognised on WHOLE encoding cells (the same
+    // discipline as the other line-model walks): a raw byte check fires
+    // on the first byte of a non-break UTF-16LE cell like U+4E0A
+    // (`[0x0A, 0x4E]`), mapping every later column of the line onto the
+    // wrong byte.
+    let utf16_cells = utf16_break_cells(engine.encoding().name());
     let mut col = 0;
     let mut i = start;
     while i < end && col < col0 {
-        if matches!(bytes[i], b'\n' | b'\r') {
-            break;
-        }
-        let step = engine.step(bytes, i, end);
-        if step == 0 {
+        let step = engine.step(bytes, i, end).max(1).min(end.saturating_sub(i));
+        let cell = &bytes[i..i + step];
+        let is_break = match utf16_cells {
+            Some((lf, cr)) => cell == lf.as_slice() || cell == cr.as_slice(),
+            None => cell == b"\n" || cell == b"\r",
+        };
+        if is_break {
             break;
         }
         i = i.saturating_add(step);

@@ -47,8 +47,48 @@ pub(super) fn count_text_units_in_bytes(
     engine: &dyn super::encoding_engine::EncodingEngine,
     bytes: &[u8],
 ) -> usize {
+    count_text_units_in_bytes_with_cells(
+        engine,
+        bytes,
+        crate::document::utf16_break_cells(engine.encoding().name()),
+    )
+}
+
+/// The cell-aware counter: line breaks are WHOLE encoding cells. A raw
+/// `0x0A` byte scan counts one UTF-16LE non-break character (U+4E0A is
+/// `[0x0A, 0x4E]`) as TWO units — the aliased "break" plus its high byte —
+/// inflating every char index built from it.
+pub(super) fn count_text_units_in_bytes_with_cells(
+    engine: &dyn super::encoding_engine::EncodingEngine,
+    bytes: &[u8],
+    utf16_cells: Option<([u8; 2], [u8; 2])>,
+) -> usize {
     let mut units = 0usize;
     let mut i = 0usize;
+    if let Some((lf, cr)) = utf16_cells {
+        while i + 1 < bytes.len() {
+            let cell = [bytes[i], bytes[i + 1]];
+            if cell == lf {
+                units = units.saturating_add(1);
+                i += 2;
+            } else if cell == cr {
+                units = units.saturating_add(1);
+                if i + 3 < bytes.len() && [bytes[i + 2], bytes[i + 3]] == lf {
+                    i += 4; // CRLF collapses into one unit
+                } else {
+                    i += 2;
+                }
+            } else {
+                units = units.saturating_add(1);
+                i += 2;
+            }
+        }
+        // A truncated one-byte tail is one unit of text.
+        if i < bytes.len() {
+            units = units.saturating_add(1);
+        }
+        return units;
+    }
     while i < bytes.len() {
         match bytes[i] {
             b'\r' => {

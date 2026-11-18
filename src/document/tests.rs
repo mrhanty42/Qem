@@ -6529,6 +6529,12 @@ fn inserted_utf16le_break_cells_survive_aliasing_characters() {
     // inserted content up to the line break.
     let line = doc.line_slice(0, 0, 256);
     assert_eq!(line.text(), "\u{4E0A}\u{0A41}XQYZ", "line 0 full content");
+
+    // A char index built from a raw 0x0A scan counts U+4E0A as TWO units
+    // (the aliased "break" plus its high byte); the cell-aware count says
+    // one. Column 1 is U+0A41, column 2 is X.
+    assert_eq!(doc.char_index_for_position(TextPosition::new(0, 1)), 1);
+    assert_eq!(doc.char_index_for_position(TextPosition::new(0, 2)), 2);
 }
 
 #[test]
