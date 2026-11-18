@@ -106,6 +106,7 @@ impl Document {
                 scan_start,
                 required_lines.saturating_sub(line_lengths.len()),
                 PARTIAL_PIECE_TABLE_SCAN_BYTES,
+                crate::document::utf16_break_cells(self.encoding_engine().encoding().name()),
             );
             line_lengths.extend(scanned);
         }

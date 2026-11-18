@@ -9316,3 +9316,23 @@ fn piece_table_literal_search_survives_tiny_window_chunk_cap_utf16le() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn scan_line_lengths_and_cursor_scan_skip_aliased_break_bytes() {
+    // U+4E0A ([0x0A, 0x4E]) + 'A' + LF ([0x0A, 0x00]) + 'A': one line of
+    // 3 units (6 bytes), then a 1-unit tail line (2 bytes).
+    let bytes = [0x0A, 0x4E, 0x41, 0x00, 0x0A, 0x00, 0x41, 0x00];
+    let cells = crate::document::utf16_break_cells("UTF-16LE");
+    let lengths = scan_line_lengths_from(&bytes, 0, 10, 100, cells);
+    assert_eq!(lengths, vec![6, 2], "aliased 0x0A must not split the line");
+
+    // The cursor scan counts the aliased cell as one column on line 0.
+    let mut state = CursorScanState::new(100);
+    scan_cursor_position_bytes(
+        &bytes,
+        &mut state,
+        encoding_engine::engine_for_encoding(DocumentEncoding::utf16le()),
+    );
+    assert_eq!(state.line0, 1);
+    assert_eq!(state.col0, 1);
+}

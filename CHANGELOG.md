@@ -11,6 +11,18 @@
 
 ### Fixed
 
+- The line-length scanner and the cursor position scanner recognize line
+  breaks on whole UTF-16 cells. `scan_line_lengths_from` (the
+  partial-index line-length source for edited documents) measured lines
+  with a raw `memchr2` over `0x0A` / `0x0D` bytes, splitting a line at
+  every aliased byte — a UTF-16LE line containing U+4E0A scanned as three
+  phantom lines — and `scan_cursor_position_bytes` counted the same
+  aliases as phantom line breaks and columns. Both classify whole cells
+  now (CRLF collapses into one break, matching the other line-model
+  walks); raw scanning stays for UTF-8, Class A, and CJK, whose trail
+  ranges exclude the break bytes. The aliasing-byte fixture asserts the
+  line lengths ([6, 2], not [1, 4, 3]) and the cursor line/column; both
+  raw scanners under mutation fail it.
 - Text-unit counting and the scanned column→byte mapper recognize line
   breaks on whole UTF-16 cells. `count_text_units_in_bytes` (the char
   index builder) counted one UTF-16LE non-break character (U+4E0A is

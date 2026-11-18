@@ -510,16 +510,50 @@ fn scan_line_lengths_from(
     start: usize,
     max_lines: usize,
     max_bytes: usize,
+    utf16_cells: Option<([u8; 2], [u8; 2])>,
 ) -> Vec<usize> {
     if max_lines == 0 || start >= bytes.len() {
         return Vec::new();
     }
 
     let end = start.saturating_add(max_bytes).min(bytes.len());
-    let slice = &bytes[start..end];
     let mut lengths = Vec::with_capacity(max_lines.min(256));
-    let mut line_start = 0usize;
+    let mut line_start = start;
+    if let Some((lf, cr)) = utf16_cells {
+        // Cell-aware UTF-16 walk (the same discipline as the other
+        // line-model walks): line lengths are measured to the end of the
+        // whole LF / CR cell, and a raw 0x0A byte inside a non-break cell
+        // (U+4E0A is [0x0A, 0x4E] in LE) must not split the line.
+        let mut i = start;
+        while i + 1 < end {
+            let cell = [bytes[i], bytes[i + 1]];
+            if cell == lf {
+                lengths.push(i + 2 - line_start);
+                line_start = i + 2;
+                if lengths.len() >= max_lines {
+                    return lengths;
+                }
+                i += 2;
+            } else if cell == cr {
+                let crlf = i + 3 < end && [bytes[i + 2], bytes[i + 3]] == lf;
+                let after = if crlf { i + 4 } else { i + 2 };
+                lengths.push(after - line_start);
+                line_start = after;
+                if lengths.len() >= max_lines {
+                    return lengths;
+                }
+                i = after;
+            } else {
+                i += 2;
+            }
+        }
+        if end == bytes.len() && lengths.len() < max_lines {
+            lengths.push(end.saturating_sub(line_start));
+        }
+        return lengths;
+    }
 
+    let slice = &bytes[start..end];
     for rel in memchr2_iter(b'\n', b'\r', slice) {
         let i = start + rel;
         let b = bytes[i];
@@ -927,38 +961,45 @@ fn scan_cursor_position_bytes(
     state: &mut CursorScanState,
     engine: &dyn encoding_engine::EncodingEngine,
 ) {
+    // Line breaks are recognised on WHOLE encoding cells (the same
+    // discipline as the other line-model walks): a raw byte check fires on
+    // the first byte of a non-break UTF-16LE cell like U+4E0A
+    // (`[0x0A, 0x4E]`), counting a phantom line break and a phantom column.
+    let utf16_cells = utf16_break_cells(engine.encoding().name());
     let mut i = 0usize;
     while i < bytes.len() && !state.is_done() {
-        match bytes[i] {
-            b'\n' => {
-                state.seen = state.seen.saturating_add(1);
-                if !state.prev_was_cr {
-                    state.line0 = state.line0.saturating_add(1);
-                }
-                state.col0 = 0;
-                state.prev_was_cr = false;
-                i += 1;
-            }
-            b'\r' => {
-                state.seen = state.seen.saturating_add(1);
+        let step = engine
+            .step(bytes, i, bytes.len())
+            .max(1)
+            .min(bytes.len() - i);
+        let cell = &bytes[i..i + step];
+        let is_lf = match utf16_cells {
+            Some((lf, _)) => cell == lf.as_slice(),
+            None => cell == b"\n",
+        };
+        let is_cr = match utf16_cells {
+            Some((_, cr)) => cell == cr.as_slice(),
+            None => cell == b"\r",
+        };
+        if is_lf {
+            state.seen = state.seen.saturating_add(1);
+            if !state.prev_was_cr {
                 state.line0 = state.line0.saturating_add(1);
-                state.col0 = 0;
-                state.prev_was_cr = true;
-                i += 1;
             }
-            _ => {
-                state.prev_was_cr = false;
-                state.seen = state.seen.saturating_add(1);
-                state.col0 = state.col0.saturating_add(1);
-                // Engine-aware cell stepping: for Class A every byte is one
-                // text unit, so columns are byte-exact; for UTF-8 the engine
-                // matches `utf8_step` behavior. The `.max(1)` guard keeps the
-                // scan moving when an engine reports a zero-byte step at a
-                // truncated tail cell (e.g. an odd-length UTF-16 segment) —
-                // mirroring `scan_position_bytes`, which has the same guard.
-                let step = engine.step(bytes, i, bytes.len()).max(1);
-                i = i.saturating_add(step).min(bytes.len());
-            }
+            state.col0 = 0;
+            state.prev_was_cr = false;
+            i += step;
+        } else if is_cr {
+            state.seen = state.seen.saturating_add(1);
+            state.line0 = state.line0.saturating_add(1);
+            state.col0 = 0;
+            state.prev_was_cr = true;
+            i += step;
+        } else {
+            state.prev_was_cr = false;
+            state.seen = state.seen.saturating_add(1);
+            state.col0 = state.col0.saturating_add(1);
+            i = i.saturating_add(step).min(bytes.len());
         }
     }
 }
