@@ -11,6 +11,15 @@
 
 ### Fixed
 
+- Line-break counts for UTF-16 pieces are computed on whole cells. The
+  counter scanned raw `0x0A` / `0x0D` bytes; in UTF-16LE characters like
+  U+4E0A (`[0x0A, 0x4E]`) or U+0A41 (`[0x41, 0x0A]`) alias those bytes,
+  so an inserted piece's line-break metadata exploded and every position
+  resolved from it drifted into phantom columns (searches crawled one
+  column per scan). The counter now classifies whole cells — CRLF
+  collapses into one break, matching the position scanner — while raw
+  counting stays for UTF-8, Class A, and CJK, whose trail ranges exclude
+  `0x0A` / `0x0D`.
 - Literal search over edited piece-table documents no longer copies whole
   piece segments into the search window. A search window held the entire
   remaining bytes of the piece it entered, and edited documents carry

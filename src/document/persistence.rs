@@ -181,6 +181,7 @@ fn remap_discarded_history_piece(
     old_original: &FileStorage,
     add_bytes: &[u8],
     rebased_add: &mut Vec<u8>,
+    utf16_cells: Option<([u8; 2], [u8; 2])>,
 ) -> io::Result<Vec<Piece>> {
     let mut remapped = Vec::new();
     let piece_end = piece.start.saturating_add(piece.len);
@@ -201,7 +202,10 @@ fn remap_discarded_history_piece(
                 src: PieceSource::Original,
                 start: saved_start,
                 len,
-                line_breaks: count_line_breaks_in_bytes(&saved_bytes[saved_start..saved_end]),
+                line_breaks: count_line_breaks_in_bytes(
+                    &saved_bytes[saved_start..saved_end],
+                    utf16_cells,
+                ),
             });
             cursor = overlap_end;
             continue;
@@ -230,7 +234,7 @@ fn remap_discarded_history_piece(
                     src: PieceSource::Add,
                     start: add_start,
                     len: bytes.len(),
-                    line_breaks: count_line_breaks_in_bytes(bytes),
+                    line_breaks: count_line_breaks_in_bytes(bytes, utf16_cells),
                 });
             }
             PieceSource::Add => {
@@ -241,7 +245,7 @@ fn remap_discarded_history_piece(
                     src: PieceSource::Add,
                     start: cursor,
                     len: gap_end.saturating_sub(cursor),
-                    line_breaks: count_line_breaks_in_bytes(bytes),
+                    line_breaks: count_line_breaks_in_bytes(bytes, utf16_cells),
                 });
             }
         }
@@ -418,6 +422,7 @@ impl Document {
                     &old_original,
                     &add_bytes,
                     &mut rebased_add,
+                    crate::document::utf16_break_cells(piece_table.engine().encoding().name()),
                 )
             });
         let Ok(mut rebuilt_pieces) = remap_result else {

@@ -6445,6 +6445,62 @@ fn piece_table_line_text_is_engine_accurate_in_utf16le() {
 }
 
 #[test]
+fn inserted_utf16le_break_cells_survive_aliasing_characters() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf16le-alias-insert.txt");
+    let filler_line = "filler XYZ\n";
+    // The piece-table gate needs a >1 MiB document; UTF-16LE stores one
+    // 2-byte code unit per ASCII character.
+    let filler_units = filler_line.chars().count();
+    let filler_lines = (PIECE_TABLE_MIN_BYTES / 2 / filler_units) + 1;
+    let mut text = String::new();
+    for _ in 0..filler_lines {
+        text.push_str(filler_line);
+    }
+    assert!(text.chars().count() * 2 >= PIECE_TABLE_MIN_BYTES);
+    let mut bytes = Vec::with_capacity(text.len() * 2);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut doc = Document::open_with_encoding(&path, DocumentEncoding::utf16le()).unwrap();
+    // U+4E0A is [0x0A, 0x4E] and U+0A41 is [0x41, 0x0A] in UTF-16LE: a raw
+    // 0x0A byte scan counted both as line breaks, exploding the inserted
+    // piece's line-break metadata and dragging the whole position model
+    // with it (searches crawled one column per scan over phantom positions).
+    let _ = doc
+        .try_insert_text_at(0, 0, "\u{4E0A}\u{0A41}XYZ\n")
+        .unwrap();
+    assert!(doc.has_piece_table());
+
+    // The inserted text occupies line 0: U+4E0A at col 0, U+0A41 at col 1,
+    // XYZ at cols 2..5. Both searches must land exactly there.
+    let m = doc
+        .find_next_regex("XYZ", TextPosition::new(0, 1))
+        .unwrap()
+        .expect("XYZ after the aliasing chars");
+    assert_eq!(m.start(), TextPosition::new(0, 2), "XYZ position");
+    assert_eq!(m.end(), TextPosition::new(0, 5), "XYZ end");
+    let m = doc
+        .find_next_regex("\u{4E0A}", TextPosition::new(0, 0))
+        .unwrap()
+        .expect("the aliasing char itself");
+    assert_eq!(m.start(), TextPosition::new(0, 0));
+    assert_eq!(m.len_chars(), 1);
+
+    // The phantom breaks the raw count reports sit inside line 0; lines
+    // BEYOND them must still resolve: line 2 is the first filler line and
+    // its "filler" must be found exactly at (2, 0).
+    let m = doc
+        .find_next_regex("filler", TextPosition::new(2, 0))
+        .unwrap()
+        .expect("line 2 filler after the phantom breaks");
+    assert_eq!(m.start(), TextPosition::new(2, 0), "line 2 start");
+    assert_eq!(m.len_chars(), 6);
+}
+
+#[test]
 fn piece_table_regex_greedy_runs_in_utf16be_after_edit() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("utf16be-piece-table-greedy.txt");

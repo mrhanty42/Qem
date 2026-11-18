@@ -541,26 +541,68 @@ fn scan_line_lengths_from(
     lengths
 }
 
-fn count_line_breaks_in_bytes(bytes: &[u8]) -> usize {
-    let mut count = 0usize;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\n' => {
-                count += 1;
-                i += 1;
-            }
-            b'\r' => {
-                count += 1;
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                    i += 2;
-                } else {
+/// The UTF-16 LF / CR cells for `name`, when the encoding's cells are two
+/// bytes wide. Every other encoding counts line breaks on raw bytes:
+/// single-byte cells are one byte, and the CJK multibyte trail ranges
+/// (Shift_JIS 0x40-0xFC, GB18030 0x30-0xFE, EUC-KR 0xA1-0xFE) exclude
+/// 0x0A / 0x0D, so a trail byte can never alias a break byte there.
+pub(crate) fn utf16_break_cells(name: &str) -> Option<([u8; 2], [u8; 2])> {
+    match name {
+        "UTF-16LE" => Some(([0x0A, 0x00], [0x0D, 0x00])),
+        "UTF-16BE" => Some(([0x00, 0x0A], [0x00, 0x0D])),
+        _ => None,
+    }
+}
+
+/// Counts line breaks on WHOLE encoding cells. In UTF-16 the LF cell is a
+/// two-byte code unit (`[0x0A, 0x00]` in LE, `[0x00, 0x0A]` in BE), so a
+/// raw byte scan miscounts inserted text whose characters alias `0x0A` /
+/// `0x0D` bytes — e.g. U+4E0A is `[0x0A, 0x4E]` in LE — and the piece's
+/// line-break metadata explodes, dragging the whole position model with
+/// it. CRLF collapses into one break, matching `scan_position_bytes`.
+fn count_line_breaks_in_bytes(bytes: &[u8], utf16_cells: Option<([u8; 2], [u8; 2])>) -> usize {
+    let Some((lf, cr)) = utf16_cells else {
+        let mut count = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\n' => {
+                    count += 1;
                     i += 1;
                 }
+                b'\r' => {
+                    count += 1;
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
             }
-            _ => i += 1,
+        }
+        return count;
+    };
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        let cell = [bytes[i], bytes[i + 1]];
+        if cell == lf {
+            count += 1;
+            i += 2;
+        } else if cell == cr {
+            if i + 3 < bytes.len() && [bytes[i + 2], bytes[i + 3]] == lf {
+                count += 1;
+                i += 4;
+            } else {
+                count += 1;
+                i += 2;
+            }
+        } else {
+            i += 2;
         }
     }
+    // A truncated one-byte tail is text and carries no break.
     count
 }
 
@@ -2474,7 +2516,10 @@ impl PieceTable {
             src: PieceSource::Add,
             start: add_start,
             len: bytes.len(),
-            line_breaks: count_line_breaks_in_bytes(bytes),
+            line_breaks: count_line_breaks_in_bytes(
+                bytes,
+                utf16_break_cells(self.engine().encoding().name()),
+            ),
         };
         let original = &self.original;
         let add = &self.add;
@@ -2750,11 +2795,7 @@ impl PieceTable {
         // matches and walked a long line one column per scan. There the
         // walk advances in fixed 2-byte cells and compares each cell
         // whole, keeping the same cost class as the raw scan.
-        let utf16_lf_cr: Option<([u8; 2], [u8; 2])> = match self.engine.encoding().name() {
-            "UTF-16LE" => Some(([0x0A, 0x00], [0x0D, 0x00])),
-            "UTF-16BE" => Some(([0x00, 0x0A], [0x00, 0x0D])),
-            _ => None,
-        };
+        let utf16_lf_cr = utf16_break_cells(self.engine.encoding().name());
         let mut seen = 0usize;
         let mut i = start;
         if let Some((lf, cr)) = utf16_lf_cr {
@@ -2981,6 +3022,7 @@ fn count_piece_line_breaks_with_sources(
     piece: Piece,
     local_start: usize,
     local_end: usize,
+    engine: &dyn encoding_engine::EncodingEngine,
 ) -> usize {
     let bytes = piece_source_bytes(original, add, piece.src);
     let start = piece.start.saturating_add(local_start).min(bytes.len());
@@ -2989,7 +3031,10 @@ fn count_piece_line_breaks_with_sources(
         .saturating_add(local_end)
         .min(bytes.len())
         .max(start);
-    count_line_breaks_in_bytes(&bytes[start..end])
+    count_line_breaks_in_bytes(
+        &bytes[start..end],
+        utf16_break_cells(engine.encoding().name()),
+    )
 }
 
 fn split_piece_with_sources(
@@ -3013,14 +3058,16 @@ fn split_piece_with_sources(
         src: piece.src,
         start: piece.start,
         len: left_len,
-        line_breaks: count_piece_line_breaks_with_sources(original, add, piece, 0, left_len),
+        line_breaks: count_piece_line_breaks_with_sources(
+            original, add, piece, 0, left_len, engine,
+        ),
     });
     let right = (right_len > 0).then_some(Piece {
         src: piece.src,
         start: piece.start + left_len,
         len: right_len,
         line_breaks: count_piece_line_breaks_with_sources(
-            original, add, piece, left_len, piece.len,
+            original, add, piece, left_len, piece.len, engine,
         ),
     });
     (left, right)
@@ -3055,7 +3102,9 @@ fn trim_piece_with_sources(
         src: piece.src,
         start: piece.start,
         len: left_len,
-        line_breaks: count_piece_line_breaks_with_sources(original, add, piece, 0, left_len),
+        line_breaks: count_piece_line_breaks_with_sources(
+            original, add, piece, 0, left_len, engine,
+        ),
     });
     let right = (right_len > 0).then_some(Piece {
         src: piece.src,
@@ -3067,6 +3116,7 @@ fn trim_piece_with_sources(
             piece,
             right_start,
             piece.len,
+            engine,
         ),
     });
     (left, right)

@@ -202,7 +202,10 @@ impl PieceTable {
 
         let mut compacted = self.read_range(0, self.total_len);
         let compacted_len = compacted.len();
-        let line_breaks = count_line_breaks_in_bytes(&compacted);
+        let line_breaks = count_line_breaks_in_bytes(
+            &compacted,
+            crate::document::utf16_break_cells(self.engine.encoding().name()),
+        );
         let add_start = self.add.len();
         self.add.append(&mut compacted);
 
