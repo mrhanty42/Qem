@@ -6514,6 +6514,21 @@ fn inserted_utf16le_break_cells_survive_aliasing_characters() {
         "snapped origin finds line 1"
     );
     assert_eq!(m.len_chars(), 6);
+
+    // A column walk that breaks on the raw `0x0A` byte stops at U+4E0A's
+    // first byte, mapping column 3 onto byte 0: an edit "at column 3"
+    // would land inside the wrong text. The cell-aware walk puts the
+    // edit exactly between Y and Z.
+    doc.try_insert_text_at(0, 3, "Q").unwrap();
+    let text = doc.text_lossy();
+    let head: String = text.chars().take(6).collect();
+    assert_eq!(head, "\u{4E0A}\u{0A41}XQYZ", "edit must land at column 3");
+
+    // The viewport line segment must not truncate at a raw 0x0A byte
+    // inside a non-break cell: line 0's visible text is the whole
+    // inserted content up to the line break.
+    let line = doc.line_slice(0, 0, 256);
+    assert_eq!(line.text(), "\u{4E0A}\u{0A41}XQYZ", "line 0 full content");
 }
 
 #[test]

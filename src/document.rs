@@ -1835,6 +1835,7 @@ impl PieceTable {
         // here corrupted every non-UTF-8 document: a windows-1251 or
         // UTF-16 cell is not valid UTF-8, so the whole line came back
         // as U+FFFD replacement characters.
+        let utf16_cells = utf16_break_cells(self.engine.encoding().name());
         let mut out = Vec::with_capacity(max_cols.min(4096).saturating_mul(4));
         let mut cols = 0usize;
         self.pieces
@@ -1849,10 +1850,6 @@ impl PieceTable {
                 let mut i = seg_start;
 
                 while i < seg_end {
-                    let b = src[i];
-                    if b == b'\n' || b == b'\r' {
-                        return false;
-                    }
                     let step = self.engine.step(src, i, seg_end);
                     if step == 0 || i.saturating_add(step) > seg_end {
                         // Known limitation (the piece-table line-model item
@@ -1866,7 +1863,19 @@ impl PieceTable {
                         // is the engine-aware line model, not this guard.
                         return false;
                     }
-                    out.extend_from_slice(&src[i..i + step]);
+                    // The line break is a WHOLE encoding cell: a raw byte
+                    // check fires on the first byte of a non-break UTF-16LE
+                    // cell like U+4E0A (`[0x0A, 0x4E]`) and truncates the
+                    // visible segment mid-content.
+                    let cell = &src[i..i + step];
+                    let is_break = match utf16_cells {
+                        Some((lf, cr)) => cell == lf.as_slice() || cell == cr.as_slice(),
+                        None => cell == b"\n" || cell == b"\r",
+                    };
+                    if is_break {
+                        return false;
+                    }
+                    out.extend_from_slice(cell);
                     cols += 1;
                     if cols >= max_cols {
                         return false;
@@ -2307,15 +2316,26 @@ impl PieceTable {
         }
         let bytes = self.read_range(start, end);
         let bytes_len = bytes.len();
+        // Line breaks are recognised on WHOLE encoding cells (the same
+        // discipline as `local_offset_after_break`): a raw byte check
+        // fires on the first byte of a non-break UTF-16LE cell like
+        // U+4E0A (`[0x0A, 0x4E]`), stopping the column walk mid-line and
+        // mapping every later column of the line onto the wrong byte —
+        // an edit at that position would land inside the wrong text.
+        let utf16_cells = utf16_break_cells(engine.encoding().name());
         let mut col = 0usize;
         let mut local = 0usize;
         while local < bytes_len && col < col0 {
-            let b = bytes[local];
-            if b == b'\n' || b == b'\r' {
-                break;
-            }
-            let step = engine.step(&bytes, local, bytes_len);
-            if step == 0 {
+            let step = engine
+                .step(&bytes, local, bytes_len)
+                .max(1)
+                .min(bytes_len - local);
+            let cell = &bytes[local..local + step];
+            let is_break = match utf16_cells {
+                Some((lf, cr)) => cell == lf.as_slice() || cell == cr.as_slice(),
+                None => cell == b"\n" || cell == b"\r",
+            };
+            if is_break {
                 break;
             }
             local += step;

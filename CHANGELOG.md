@@ -11,6 +11,18 @@
 
 ### Fixed
 
+- Column and viewport line walks recognize line breaks on whole UTF-16
+  cells. `byte_offset_for_col_with_engine` and the viewport line segment
+  checked a raw `0x0A` / `0x0D` byte before stepping the encoding cell:
+  in UTF-16LE a non-break character like U+4E0A (`[0x0A, 0x4E]`) fired
+  the check, so the column walk stopped mid-line — every later column of
+  the line mapped onto the wrong byte, and an edit typed at such a
+  column landed inside the wrong text (data corruption, not just drift);
+  the viewport segment truncated to nothing at the first aliased
+  character. Both walks now compare the whole cell (CRLF-aware, matching
+  the other line-model walks); single-byte cells keep the byte check,
+  and CJK multibyte cells never compare equal to the one-byte break
+  cells.
 - A phantom search origin snaps to true ground. The position→byte mapping
   saturates at the end of the line for columns past the line's width, so
   an origin whose column exceeds its line's true width (reachable through
