@@ -212,24 +212,30 @@ none.
   non-Windows snapshot backing cheaper than a full file copy; snapshot
   `save_async` state through `Arc` instead of cloning the edit buffer
   on the UI thread.
-- **Engine-aware line model for multi-byte-cell piece tables (1.0):**
-  the piece-table line model scans raw `0x0A` / `0x0D` bytes, which is
-  byte-exact for UTF-8 and Class A but wrong for UTF-16 (a `0x0A` byte
-  can be the low or high half of a non-line-ending code unit) and CJK
-  (a trail byte can coincide with a line-ending byte). Class A is fixed
-  end to end (engine-owned decode + column arithmetic, 1.0.0); the
-  remaining design work is to drive the piece-table line indexing,
-  `local_offset_after_break`, `scan_line_lengths_from`,
-  `scan_cursor_position_bytes`, and the partial-window scan fallbacks
-  through `EncodingEngine::next_line_start` / cell-aware break
-  detection (a full trace of affected sites was compiled during the
-  1.0-track audit). When this lands, the 64 KiB bounded-read context in
-  `advance_offset_by_text_units_with_engine` must also become
-  engine-aware (2 bytes for UTF-16, up to 4 for gb18030) instead of the
-  current single CRLF-context byte, and
-  `advance_position_by_bytes` / `scan_cursor_position_bytes` callers
-  must switch from raw-byte line-break detection to cell-aware
-  detection for multi-byte-cell documents.
+- **Engine-aware line model for multi-byte-cell piece tables (1.0) —
+  cell-exact for UTF-16 as of 2026-11-19; remaining items below:** the
+  piece-table line model used to scan raw `0x0A` / `0x0D` bytes —
+  byte-exact for UTF-8 and Class A, wrong for UTF-16 (a `0x0A` byte can
+  be the low or high half of a non-line-ending code unit) and CJK (a
+  trail byte can coincide with a line-ending byte). The UTF-16 half of
+  the item is closed end to end: `local_offset_after_break`,
+  `count_line_breaks_in_bytes` (all six counting sites),
+  `byte_offset_for_col_with_engine`, `line_visible_segment`,
+  `count_text_units_in_bytes`, `byte_offset_for_text_col_with_engine`,
+  all three `next_piece_table_scan_line_range` copies,
+  `scan_line_lengths_from`, `scan_cursor_position_bytes`, and the
+  regex/literal search walks classify whole cells, with the aliasing
+  fixtures (`inserted_utf16le_break_cells_survive_aliasing_characters`,
+  the UTF-16BE greedy run, the scan unit tests) pinning each. CJK trail
+  bytes never alias a break byte (Shift_JIS 0x40-0xFC, GB18030
+  0x30-0xFE, EUC-KR 0xA1-0xFE exclude 0x0A / 0x0D), so the raw scans are
+  exact there by construction. Still raw by design:
+  `advance_offset_by_text_units_with_engine`'s 64 KiB bounded-read
+  context keeps a single CRLF-context byte (UTF-16 CRLF spans two
+  cells; a split exactly between them is the residual edge), and the
+  open-time mmap estimates (`estimated_mmap_line_byte_range`, the
+  lifecycle seed scans) stay approximate for pre-edit viewports per the
+  documented estimate contract.
 - **Bounded piece-tree session history (audit 2026-11-06):** the
   in-memory edit history and its sidecar rewrite are unbounded - every
   flush re-serializes all history entries and appends fresh history
