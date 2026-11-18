@@ -2737,14 +2737,57 @@ impl PieceTable {
         let bytes = self.source_bytes(piece.src);
         let start = piece.start.min(bytes.len());
         let end = piece.start.saturating_add(piece.len).min(bytes.len());
-        let utf8 = self.engine.encoding().is_utf8();
+        // Line breaks are recognised on WHOLE encoding cells. For every
+        // encoding except UTF-16 the raw byte scan is already cell-exact:
+        // single-byte cells are one byte, and the CJK multibyte trail
+        // ranges (Shift_JIS 0x40-0xFC, GB18030 0x30-0xFE, EUC-KR 0xA1-0xFE)
+        // exclude 0x0A / 0x0D, so a trail byte can never alias a break
+        // byte. UTF-16 is the one exception: in BE the LF cell is
+        // `[0x00, 0x0A]` and a raw byte scan fires on its second byte,
+        // handing back a mid-cell (+1 byte) line start that leaves every
+        // later reader of the line decoding mid-cell garbage — the
+        // `prop_alignment` crawl, where `[a-z]+` degraded to one-letter
+        // matches and walked a long line one column per scan. There the
+        // walk advances in fixed 2-byte cells and compares each cell
+        // whole, keeping the same cost class as the raw scan.
+        let utf16_lf_cr: Option<([u8; 2], [u8; 2])> = match self.engine.encoding().name() {
+            "UTF-16LE" => Some(([0x0A, 0x00], [0x0D, 0x00])),
+            "UTF-16BE" => Some(([0x00, 0x0A], [0x00, 0x0D])),
+            _ => None,
+        };
         let mut seen = 0usize;
         let mut i = start;
+        if let Some((lf, cr)) = utf16_lf_cr {
+            while i + 1 < end {
+                let cell = [bytes[i], bytes[i + 1]];
+                if cell == lf {
+                    if seen == local_break_idx {
+                        return Some(i + 2 - start);
+                    }
+                    seen += 1;
+                    i += 2;
+                } else if cell == cr {
+                    // CRLF collapses into one break: a CR cell immediately
+                    // followed by an LF cell advances past both.
+                    let crlf = i + 3 < end && [bytes[i + 2], bytes[i + 3]] == lf;
+                    let after = if crlf { i + 4 } else { i + 2 };
+                    if seen == local_break_idx {
+                        return Some(after - start);
+                    }
+                    seen += 1;
+                    i = after;
+                } else {
+                    i += 2;
+                }
+            }
+            // A truncated one-byte tail is text and carries no break.
+            return None;
+        }
         while i < end {
             match bytes[i] {
                 b'\n' => {
                     if seen == local_break_idx {
-                        return Some(self.offset_after_break_cell(bytes, i, i + 1, utf8) - start);
+                        return Some(i + 1 - start);
                     }
                     seen += 1;
                     i += 1;
@@ -2752,17 +2795,13 @@ impl PieceTable {
                 b'\r' => {
                     if i + 1 < end && bytes[i + 1] == b'\n' {
                         if seen == local_break_idx {
-                            return Some(
-                                self.offset_after_break_cell(bytes, i, i + 2, utf8) - start,
-                            );
+                            return Some(i + 2 - start);
                         }
                         seen += 1;
                         i += 2;
                     } else {
                         if seen == local_break_idx {
-                            return Some(
-                                self.offset_after_break_cell(bytes, i, i + 1, utf8) - start,
-                            );
+                            return Some(i + 1 - start);
                         }
                         seen += 1;
                         i += 1;
@@ -2772,33 +2811,6 @@ impl PieceTable {
             }
         }
         None
-    }
-
-    /// Byte offset just past the full line-ending cell that starts at
-    /// `break_at`, given the raw scan's answer `raw_after`.
-    ///
-    /// The raw `0x0A` / `0x0D` byte scan above stops right after the
-    /// line-ending *byte*. For UTF-8 and Class A encodings a line-ending
-    /// cell is exactly that byte, so the raw answer is already the cell
-    /// end. For multi-byte-cell encodings (UTF-16) a line-ending cell is
-    /// a full code unit — e.g. the LF cell is `[0x0A, 0x00]` in LE — and
-    /// stopping after the raw byte would land in the middle of the cell,
-    /// making every reader that slices a line from this offset decode
-    /// mid-cell garbage. There the cell width comes from the engine's
-    /// `step`, and the wider of the raw answer and the cell end wins so
-    /// a truncated tail can never shrink the offset behind the raw byte.
-    fn offset_after_break_cell(
-        &self,
-        bytes: &[u8],
-        break_at: usize,
-        raw_after: usize,
-        utf8: bool,
-    ) -> usize {
-        if utf8 {
-            return raw_after;
-        }
-        let cell_end = break_at.saturating_add(self.engine.step(bytes, break_at, bytes.len()));
-        cell_end.max(raw_after)
     }
 }
 

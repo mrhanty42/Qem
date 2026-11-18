@@ -11,6 +11,22 @@
 
 ### Fixed
 
+- Regex and literal searches over an edited UTF-16BE piece-table document
+  no longer crawl. `line_start_byte` located every line break with a raw
+  `0x0A` / `0x0D` byte scan; in UTF-16BE the LF cell is `[0x00, 0x0A]`, so
+  the scan fired on the cell's second byte and handed back a mid-cell
+  (+1 byte) line start. Every read of such a line decoded mid-cell
+  garbage, and a greedy `[a-z]+` over a long run degraded to one-letter
+  matches that walked the line one column per scan — minutes of pure CPU
+  on lines that are tens of thousands of characters wide (caught by the
+  randomized floor-stability property as a 60+ second stall). The break
+  walk now advances in whole cells: fixed 2-byte cells with whole-cell
+  compares for UTF-16 (CRLF collapses into one break, matching the
+  position scanner), and the raw scan stays for every other encoding,
+  where it was already exact — single-byte cells are one byte and the CJK
+  multibyte trail ranges (Shift_JIS 0x40-0xFC, GB18030 0x30-0xFE,
+  EUC-KR 0xA1-0xFE) exclude 0x0A / 0x0D, so a trail byte can never alias
+  a break byte.
 - Dense `find_all_regex` over Class B (UTF-16 / CJK) documents is linear
   in the match count. The chunked Class B scan fetched and redecoded a
   full window and remapped the match position from byte 0 for EVERY

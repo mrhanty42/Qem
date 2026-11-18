@@ -6445,6 +6445,64 @@ fn piece_table_line_text_is_engine_accurate_in_utf16le() {
 }
 
 #[test]
+fn piece_table_regex_greedy_runs_in_utf16be_after_edit() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf16be-piece-table-greedy.txt");
+    let filler_line = "filler XYZ\n";
+    // Line 40 is one long `[a-z]` run; a greedy `[a-z]+` search starting
+    // mid-run must match through the end of the run. The piece-table gate
+    // needs a >1 MiB document, and UTF-16BE stores one 2-byte code unit
+    // per ASCII character.
+    let run_len = 2000usize;
+    let mut run_line = String::with_capacity(run_len + 1);
+    for _ in 0..run_len {
+        run_line.push('q');
+    }
+    run_line.push('\n');
+    let filler_units = filler_line.chars().count();
+    let prefix_units = 40 * filler_units + run_line.chars().count();
+    let filler_lines =
+        ((PIECE_TABLE_MIN_BYTES / 2 + 32 * 1024).saturating_sub(prefix_units) / filler_units) + 1;
+    let mut text = String::with_capacity((40 + filler_lines + 1) * filler_line.len());
+    for _ in 0..40 {
+        text.push_str(filler_line);
+    }
+    text.push_str(&run_line);
+    for _ in 0..filler_lines {
+        text.push_str(filler_line);
+    }
+    assert!(text.chars().count() * 2 >= PIECE_TABLE_MIN_BYTES);
+    let mut bytes = Vec::with_capacity(text.len() * 2);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut doc =
+        Document::open_with_encoding(&path, DocumentEncoding::from_label("UTF-16BE").unwrap())
+            .unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "X").unwrap();
+    assert!(doc.has_piece_table());
+
+    // `line_start_byte` must land past the full `[0x00, 0x0A]` LF cell. A
+    // raw byte scan fires on the cell's second byte and returns a mid-cell
+    // (+1 byte) line start, so the scan window decodes garbage and `[a-z]+`
+    // degrades to one-letter matches that crawl one column per step.
+    let from = TextPosition::new(40, 1500);
+    let m = doc
+        .find_next_regex("[a-z]+", from)
+        .unwrap()
+        .expect("the q-run must be found");
+    assert_eq!(m.start(), TextPosition::new(40, 1500), "match origin");
+    assert_eq!(
+        m.end(),
+        TextPosition::new(40, run_len),
+        "greedy match must span the run through the line end"
+    );
+    assert_eq!(m.len_chars(), run_len - 1500);
+}
+
+#[test]
 fn literal_search_finds_previous_match_with_end_before_boundary() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("search-prev-mmap.txt");
