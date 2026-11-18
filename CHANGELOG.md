@@ -11,6 +11,15 @@
 
 ### Fixed
 
+- The reverse search recognizes the trailing line break on whole UTF-16
+  cells. `newline_len_before` classified the trailing break from the last
+  single byte: in UTF-16LE the LF cell is `[0x0A, 0x00]`, whose last byte
+  is `0x00`, so a document ending in a line break answered "no trailing
+  break" and the reverse-search window included the break itself. The
+  classifier reads the whole cell now (CRLF counts its two cells);
+  single-byte cells keep the byte check, and CJK multibyte cells never
+  compare equal to the one-byte break cells. The aliasing fixture asserts
+  the trailing LF cell's width; the raw check under mutation answers 0.
 - The disk line index counts UTF-16 lines on whole cells. The index
   builder located line breaks with a raw `memchr2` over `0x0A` / `0x0D`
   bytes; in UTF-16LE a non-break character like U+4E0A (`[0x0A, 0x4E]`)

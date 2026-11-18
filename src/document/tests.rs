@@ -6515,6 +6515,16 @@ fn inserted_utf16le_break_cells_survive_aliasing_characters() {
     );
     assert_eq!(m.len_chars(), 6);
 
+    // The trailing break is a WHOLE UTF-16LE cell: a raw single-byte check
+    // reads the cell's 0x00 high byte and never recognises it, so the
+    // reverse-search window included the trailing line break.
+    let piece_table = doc.piece_table.as_ref().expect("piece table");
+    assert_eq!(
+        piece_table.newline_len_before(piece_table.total_len),
+        2,
+        "trailing LE LF cell is 2 bytes"
+    );
+
     // A column walk that breaks on the raw `0x0A` byte stops at U+4E0A's
     // first byte, mapping column 3 onto byte 0: an edit "at column 3"
     // would land inside the wrong text. The cell-aware walk puts the
@@ -6593,6 +6603,15 @@ fn piece_table_regex_greedy_runs_in_utf16be_after_edit() {
         "greedy match must span the run through the line end"
     );
     assert_eq!(m.len_chars(), run_len - 1500);
+
+    // The trailing break is a WHOLE BE LF cell ([0x00, 0x0A]): the raw
+    // single-byte check reads its 0x00 first byte and misses it.
+    let piece_table = doc.piece_table.as_ref().expect("piece table");
+    assert_eq!(
+        piece_table.newline_len_before(piece_table.total_len),
+        2,
+        "trailing BE LF cell is 2 bytes"
+    );
 }
 
 #[test]

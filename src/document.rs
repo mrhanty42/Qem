@@ -580,6 +580,16 @@ fn scan_line_lengths_from(
 /// single-byte cells are one byte, and the CJK multibyte trail ranges
 /// (Shift_JIS 0x40-0xFC, GB18030 0x30-0xFE, EUC-KR 0xA1-0xFE) exclude
 /// 0x0A / 0x0D, so a trail byte can never alias a break byte there.
+/// The disk-index header's record of which cell width the line numbers
+/// were counted in: 0 = raw bytes, 1 = UTF-16LE cells, 2 = UTF-16BE cells.
+pub(crate) fn utf16_cells_byte(name: &str) -> u8 {
+    match name {
+        "UTF-16LE" => 1,
+        "UTF-16BE" => 2,
+        _ => 0,
+    }
+}
+
 pub(crate) fn utf16_break_cells(name: &str) -> Option<([u8; 2], [u8; 2])> {
     match name {
         "UTF-16LE" => Some(([0x0A, 0x00], [0x0D, 0x00])),
@@ -2648,6 +2658,38 @@ impl PieceTable {
 
     fn newline_len_before(&self, line_start: usize) -> usize {
         if line_start == 0 {
+            return 0;
+        }
+        let utf16_cells = utf16_break_cells(self.engine.encoding().name());
+        if let Some((lf, cr)) = utf16_cells {
+            // The trailing break is a WHOLE cell: in UTF-16LE the LF cell is
+            // [0x0A, 0x00], whose last byte is 0x00 — a raw single-byte
+            // check never recognises it, and the reverse-search window
+            // would include the trailing line break. Line starts are
+            // cell-aligned; an odd line_start means a truncated tail and
+            // stays unclassified.
+            if line_start % 2 != 0 || line_start < 2 {
+                return 0;
+            }
+            let cell = [
+                self.byte_at(line_start - 2).unwrap_or(0),
+                self.byte_at(line_start - 1).unwrap_or(0),
+            ];
+            if cell == lf {
+                if line_start >= 4 {
+                    let prev = [
+                        self.byte_at(line_start - 4).unwrap_or(0),
+                        self.byte_at(line_start - 3).unwrap_or(0),
+                    ];
+                    if prev == cr {
+                        return 4; // CRLF: two cells
+                    }
+                }
+                return 2;
+            }
+            if cell == cr {
+                return 2;
+            }
             return 0;
         }
         let b1 = self.byte_at(line_start - 1);
