@@ -20,13 +20,62 @@ fn next_piece_table_scan_line_range(
     bytes: &[u8],
     start0: usize,
     buffer_reaches_eof: bool,
+    utf16_cells: Option<([u8; 2], [u8; 2])>,
 ) -> Option<PieceTableScanRange> {
     if start0 >= bytes.len() {
         return None;
     }
 
     let slice = &bytes[start0..];
-    let end0 = if let Some(rel) = memchr::memchr2(b'\n', b'\r', slice) {
+    let end0 = if let Some((lf, cr)) = utf16_cells {
+        // Cell-aware UTF-16 scan: a raw 0x0A / 0x0D byte can be the half of
+        // a non-break cell (U+4E0A is [0x0A, 0x4E] in LE), so every memchr
+        // hit is validated as a whole cell — relative to `start0`, which is
+        // a line start and therefore cell-aligned. LE break cells are
+        // [0x0A, 0x00] / [0x0D, 0x00] with the break byte first; BE break
+        // cells are [0x00, 0x0A] / [0x00, 0x0D] with the break byte second.
+        let le = lf == [0x0A, 0x00];
+        let mut search_from = 0usize;
+        let mut found = None;
+        while let Some(rel) = memchr::memchr2(b'\n', b'\r', &slice[search_from..]) {
+            let hit = search_from + rel;
+            let (cell_start, _other) = if le {
+                if hit % 2 == start0 % 2 {
+                    (hit, hit + 1)
+                } else {
+                    (hit - 1, hit)
+                }
+            } else if hit % 2 == start0 % 2 {
+                // BE: the break byte is the cell's second byte; a hit on a
+                // cell-start byte is the lead of a non-break character.
+                search_from = hit + 1;
+                continue;
+            } else {
+                (hit - 1, hit)
+            };
+            if cell_start < start0 {
+                search_from = hit + 1;
+                continue;
+            }
+            let cell = [bytes[cell_start], bytes[cell_start + 1]];
+            let is_cr = cell == cr;
+            if !(cell == lf || is_cr) {
+                search_from = hit + 1;
+                continue;
+            }
+            let after = if is_cr
+                && cell_start + 3 < bytes.len()
+                && [bytes[cell_start + 2], bytes[cell_start + 3]] == lf
+            {
+                cell_start + 4 // CRLF collapses into one break
+            } else {
+                cell_start + 2
+            };
+            found = Some(after);
+            break;
+        }
+        found.unwrap_or(bytes.len())
+    } else if let Some(rel) = memchr::memchr2(b'\n', b'\r', slice) {
         let idx = start0 + rel;
         if bytes[idx] == b'\r' && idx + 1 < bytes.len() && bytes[idx + 1] == b'\n' {
             idx + 2
@@ -185,7 +234,12 @@ impl Document {
         let mut rel_start = 0usize;
         let mut skip_lines = line0.saturating_sub(piece_table.line_count());
         while skip_lines > 0 {
-            let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+            let scanned = next_piece_table_scan_line_range(
+                &bytes,
+                rel_start,
+                buffer_reaches_eof,
+                crate::document::utf16_break_cells(piece_table.engine().encoding().name()),
+            )?;
             if scanned.range.1 <= rel_start || !scanned.exact {
                 return None;
             }
@@ -193,7 +247,12 @@ impl Document {
             skip_lines -= 1;
         }
 
-        let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+        let scanned = next_piece_table_scan_line_range(
+            &bytes,
+            rel_start,
+            buffer_reaches_eof,
+            crate::document::utf16_break_cells(piece_table.engine().encoding().name()),
+        )?;
         Some(PieceTableScanRange {
             range: (
                 scan_start.saturating_add(scanned.range.0),
@@ -609,5 +668,37 @@ impl Document {
         let line_start = rope.line_to_char(line0);
         let line_len = Self::rope_line_len_chars_without_newline(rope, line0);
         line_start + col0.min(line_len)
+    }
+}
+
+#[cfg(test)]
+mod scan_line_range_tests {
+    use super::*;
+
+    #[test]
+    fn utf16le_scan_skips_aliased_break_bytes() {
+        // U+4E0A ([0x0A, 0x4E]) + 'A' + LF: the 0x0A at byte 0 is part of a
+        // text cell, the real break is the [0x0A, 0x00] cell at 4..6.
+        let bytes = [0x0A, 0x4E, 0x41, 0x00, 0x0A, 0x00];
+        let cells = crate::document::utf16_break_cells("UTF-16LE");
+        let r = next_piece_table_scan_line_range(&bytes, 0, true, cells).unwrap();
+        assert_eq!(r.range, (0, 6));
+        assert!(r.exact);
+        let r = next_piece_table_scan_line_range(&bytes, 0, false, cells).unwrap();
+        assert_eq!(r.range, (0, 6));
+        // The buffer ends at the break without reaching EOF: the scanner
+        // cannot know whether the file continues, so the range stays
+        // conservative.
+        assert!(!r.exact);
+    }
+
+    #[test]
+    fn utf16be_scan_skips_aliased_break_bytes() {
+        // U+0A41 ([0x0A, 0x41]) + LF ([0x00, 0x0A]): the raw hit at 0 is a
+        // cell-start lead byte, the real break is the cell at 2..4.
+        let bytes = [0x0A, 0x41, 0x00, 0x0A];
+        let cells = crate::document::utf16_break_cells("UTF-16BE");
+        let r = next_piece_table_scan_line_range(&bytes, 0, true, cells).unwrap();
+        assert_eq!(r.range, (0, 4));
     }
 }

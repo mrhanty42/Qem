@@ -199,13 +199,58 @@ fn next_piece_table_scan_line_range(
     bytes: &[u8],
     start0: usize,
     buffer_reaches_eof: bool,
+    utf16_cells: Option<([u8; 2], [u8; 2])>,
 ) -> Option<MmapLineScan> {
     if start0 >= bytes.len() {
         return None;
     }
 
     let slice = &bytes[start0..];
-    let end0 = if let Some(rel) = memchr::memchr2(b'\n', b'\r', slice) {
+    let end0 = if let Some((lf, cr)) = utf16_cells {
+        // Cell-aware UTF-16 scan: a raw 0x0A / 0x0D byte can be the half of
+        // a non-break cell (U+4E0A is [0x0A, 0x4E] in LE), so every memchr
+        // hit is validated as a whole cell - relative to `start0`, which is
+        // a line start and therefore cell-aligned.
+        let le = lf == [0x0A, 0x00];
+        let mut search_from = 0usize;
+        let mut found = None;
+        while let Some(rel) = memchr::memchr2(b'\n', b'\r', &slice[search_from..]) {
+            let hit = search_from + rel;
+            let cell_start = if le {
+                if hit % 2 == start0 % 2 {
+                    hit
+                } else {
+                    hit - 1
+                }
+            } else if hit % 2 == start0 % 2 {
+                search_from = hit + 1;
+                continue;
+            } else {
+                hit - 1
+            };
+            if cell_start < start0 {
+                search_from = hit + 1;
+                continue;
+            }
+            let cell = [bytes[cell_start], bytes[cell_start + 1]];
+            let is_cr = cell == cr;
+            if !(cell == lf || is_cr) {
+                search_from = hit + 1;
+                continue;
+            }
+            let after = if is_cr
+                && cell_start + 3 < bytes.len()
+                && [bytes[cell_start + 2], bytes[cell_start + 3]] == lf
+            {
+                cell_start + 4 // CRLF collapses into one break
+            } else {
+                cell_start + 2
+            };
+            found = Some(after);
+            break;
+        }
+        found.unwrap_or(bytes.len())
+    } else if let Some(rel) = memchr::memchr2(b'\n', b'\r', slice) {
         let idx = start0 + rel;
         if bytes[idx] == b'\r' && idx + 1 < bytes.len() && bytes[idx + 1] == b'\n' {
             idx + 2
@@ -250,13 +295,23 @@ fn scanned_piece_table_offset_for_position(
     let mut rel_start = 0usize;
     let mut skip_lines = position.line0().saturating_sub(piece_table.line_count());
     while skip_lines > 0 {
-        let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+        let scanned = next_piece_table_scan_line_range(
+            &bytes,
+            rel_start,
+            buffer_reaches_eof,
+            crate::document::utf16_break_cells(piece_table.engine().encoding().name()),
+        )?;
         (scanned.range.1 > rel_start && scanned.complete).then_some(())?;
         rel_start = scanned.range.1;
         skip_lines -= 1;
     }
 
-    let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+    let scanned = next_piece_table_scan_line_range(
+        &bytes,
+        rel_start,
+        buffer_reaches_eof,
+        crate::document::utf16_break_cells(piece_table.engine().encoding().name()),
+    )?;
     let offset = byte_offset_for_text_col_with_engine(
         &bytes,
         scanned.range,
@@ -692,7 +747,12 @@ impl Document {
         let mut rel_start = 0usize;
         let mut skip_lines = first_line0.saturating_sub(piece_table.line_count());
         while skip_lines > 0 {
-            let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+            let scanned = next_piece_table_scan_line_range(
+                &bytes,
+                rel_start,
+                buffer_reaches_eof,
+                crate::document::utf16_break_cells(piece_table.engine().encoding().name()),
+            )?;
             if scanned.range.1 <= rel_start {
                 return None;
             }
@@ -712,7 +772,12 @@ impl Document {
                 break;
             }
 
-            let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+            let scanned = next_piece_table_scan_line_range(
+                &bytes,
+                rel_start,
+                buffer_reaches_eof,
+                crate::document::utf16_break_cells(piece_table.engine().encoding().name()),
+            )?;
             if scanned.range.1 <= rel_start {
                 break;
             }
