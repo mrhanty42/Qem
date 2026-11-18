@@ -1278,6 +1278,22 @@ fn find_prev_regex_via_reverse_dfa(
     if start_off >= end_off {
         return None;
     }
+    // Snap a phantom bound onto true ground (mirrors the forward path):
+    // the position→byte mapping saturates at the line end, so a bound
+    // whose column exceeds its line's width pairs with a byte whose true
+    // position differs, and the anchored mapping would echo the phantom.
+    if let Some(piece_table) = doc.piece_table.as_ref() {
+        let engine = doc.encoding_engine();
+        let snapped = piece_table.position_for_byte_offset_from(
+            0,
+            TextPosition::new(0, 0),
+            start_off,
+            engine,
+        );
+        if snapped != bound_start && doc.search_byte_offset_for_position(snapped) == start_off {
+            return find_prev_regex_via_reverse_dfa(doc, query, snapped, bound_end);
+        }
+    }
     // Class B routing, mirroring `find_next_regex_in_bytes`: the reverse
     // DFA and the small-span byte fallback both run the byte-engine regex
     // over raw storage bytes, which on UTF-16 / CJK multibyte documents
