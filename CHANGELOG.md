@@ -11,6 +11,19 @@
 
 ### Fixed
 
+- The disk line index counts UTF-16 lines on whole cells. The index
+  builder located line breaks with a raw `memchr2` over `0x0A` / `0x0D`
+  bytes; in UTF-16LE a non-break character like U+4E0A (`[0x0A, 0x4E]`)
+  registered a phantom line, shifting every later line number and
+  anchoring checkpoints at mid-cell bytes for any large document whose
+  content aliased the break bytes. The builder validates every memchr
+  hit as a whole cell (UTF-16 cells start at even file offsets; CRLF
+  collapses into one break), and the sidecar header records which cell
+  width the line numbers were counted in (format version 3; sidecars
+  built for another width — or by an older build — rebuild). Raw
+  counting stays for UTF-8, single-byte, and CJK encodings, whose trail
+  ranges exclude the break bytes. The aliasing-byte fixture asserts two
+  lines instead of three; raw counting under mutation fails it.
 - The line-length scanner and the cursor position scanner recognize line
   breaks on whole UTF-16 cells. `scan_line_lengths_from` (the
   partial-index line-length source for edited documents) measured lines

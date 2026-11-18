@@ -535,7 +535,11 @@ impl Document {
                 let bytes = storage.bytes();
                 let probe = &bytes[..bytes.len().min(LINE_ENDING_PROBE_MAX_BYTES)];
                 let line_ending = detect_line_ending(probe);
-                let disk_index = DiskLineIndex::open_or_build(&path, &storage);
+                let disk_index = DiskLineIndex::open_or_build(
+                    &path,
+                    &storage,
+                    crate::document::utf16_cells_byte(encoding.name()),
+                );
                 if let Some(doc) = Self::try_recover_disk_session(
                     &path,
                     &storage,
@@ -1045,7 +1049,11 @@ impl Document {
                 detect_line_ending(probe)
             });
         phase(OpenProgressPhase::PreparingIndex);
-        let disk_index = DiskLineIndex::open_or_build(&path, &storage);
+        let index_cells = requested_encoding
+            .as_ref()
+            .map(|encoding| crate::document::utf16_cells_byte(encoding.name()))
+            .unwrap_or(0);
+        let disk_index = DiskLineIndex::open_or_build(&path, &storage, index_cells);
         if disk_index.is_some() {
             inspected_source_bytes = inspected_source_bytes.saturating_add(
                 crate::source_identity::sampled_content_fingerprint_budget(file_len),

@@ -2977,7 +2977,7 @@ fn checkpoint_viewport_fixture(path: &Path, ending: &str) -> Document {
         path: Some(path.to_path_buf()),
         storage: Some(storage.clone()),
         line_offsets: Arc::new(RwLock::new(LineOffsets::U32(vec![0]))),
-        disk_index: Some(DiskLineIndex::build_for_tests(path, &storage)),
+        disk_index: Some(DiskLineIndex::build_for_tests(path, &storage, 0)),
         indexing: Arc::new(AtomicBool::new(false)),
         indexing_started: None,
         file_len: storage.len(),
@@ -8592,7 +8592,7 @@ fn windowed_piece_table_edits_far_lines_via_disk_index() {
     assert_eq!(bytes.len(), lines * line_len);
     std::fs::write(&path, &bytes).unwrap();
     let storage = FileStorage::open(&path).unwrap();
-    let disk = crate::index::DiskLineIndex::build_for_tests(&path, &storage);
+    let disk = crate::index::DiskLineIndex::build_for_tests(&path, &storage, 0);
 
     let mut doc = Document {
         path: Some(path.clone()),
@@ -8699,7 +8699,7 @@ fn recovered_far_edit_session_reads_beyond_annotated_region() {
     }
     std::fs::write(&path, &bytes).unwrap();
     let storage = FileStorage::open(&path).unwrap();
-    let disk = crate::index::DiskLineIndex::build_for_tests(&path, &storage);
+    let disk = crate::index::DiskLineIndex::build_for_tests(&path, &storage, 0);
 
     let mut doc = Document {
         path: Some(path.clone()),

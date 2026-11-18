@@ -14,9 +14,9 @@ const INDEX_MAGIC: &[u8; 8] = b"QEMIDX1\0";
 // `.qem.lineidx` is an internal cache sidecar rather than a stable external
 // format. Qem may bump this version across releases and rebuild the cache
 // instead of preserving compatibility with older index files.
-const INDEX_VERSION: u32 = 2;
+const INDEX_VERSION: u32 = 3;
 const INDEX_PAGE_SIZE: usize = 4096;
-const INDEX_HEADER_BYTES: usize = 72;
+const INDEX_HEADER_BYTES: usize = 128;
 const INDEX_PAGE_HEADER_BYTES: usize = 16;
 const INDEX_ENTRY_BYTES: usize = 24;
 const INDEX_CACHE_PAGES: usize = 32;
@@ -103,6 +103,10 @@ struct IndexMetadata {
     source_len: u64,
     source_mtime_ns: u64,
     source_fingerprint: u64,
+    /// 0 = raw byte counting (UTF-8 / Class A / CJK), 1 = UTF-16LE cells,
+    /// 2 = UTF-16BE cells. A sidecar built for one cell width is stale for
+    /// another: line numbers differ per encoding.
+    utf16_cells: u8,
 }
 
 #[cfg(windows)]
@@ -114,12 +118,17 @@ struct FileAllocatedRangeBuffer {
 }
 
 impl DiskLineIndex {
-    pub(crate) fn open_or_build(path: &Path, storage: &FileStorage) -> Option<Self> {
+    pub(crate) fn open_or_build(
+        path: &Path,
+        storage: &FileStorage,
+        utf16_cells: u8,
+    ) -> Option<Self> {
         if storage.len() < INDEX_BUILD_MIN_FILE_BYTES {
             return None;
         }
 
-        let metadata = source_metadata(path, storage.bytes()).ok()?;
+        let mut metadata = source_metadata(path, storage.bytes()).ok()?;
+        metadata.utf16_cells = utf16_cells;
         let sidecar = sidecar_path(path);
         let state = if let Ok(ready) = ReadyDiskLineIndex::open_existing(&sidecar, metadata) {
             DiskLineIndexState::Ready(Arc::new(ready))
@@ -204,8 +213,9 @@ impl DiskLineIndex {
     }
 
     #[cfg(test)]
-    pub(crate) fn build_for_tests(path: &Path, storage: &FileStorage) -> Self {
-        let metadata = source_metadata(path, storage.bytes()).unwrap();
+    pub(crate) fn build_for_tests(path: &Path, storage: &FileStorage, utf16_cells: u8) -> Self {
+        let mut metadata = source_metadata(path, storage.bytes()).unwrap();
+        metadata.utf16_cells = utf16_cells;
         let ready = build_or_open_index(path, storage, metadata).unwrap();
         Self {
             state: Arc::new(RwLock::new(DiskLineIndexState::Ready(Arc::new(ready)))),
@@ -369,6 +379,7 @@ impl PageCache {
 
 #[derive(Clone, Copy, Debug)]
 struct FileHeader {
+    utf16_cells: u8,
     root_page: u64,
     page_count: u64,
     total_lines: u64,
@@ -379,9 +390,17 @@ struct FileHeader {
 }
 
 fn validate_header(header: FileHeader, metadata: IndexMetadata) -> io::Result<()> {
+    if header.utf16_cells > 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid qem line index cell width",
+        ));
+    }
+
     if header.source_len != metadata.source_len
         || header.source_mtime_ns != metadata.source_mtime_ns
         || header.source_fingerprint != metadata.source_fingerprint
+        || header.utf16_cells != metadata.utf16_cells
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -423,11 +442,18 @@ fn build_or_open_index(
         return Ok(ready);
     }
 
-    build_index_file(source_path, &sidecar, storage, metadata)?;
+    build_index_file(
+        metadata.utf16_cells,
+        source_path,
+        &sidecar,
+        storage,
+        metadata,
+    )?;
     ReadyDiskLineIndex::open_existing(&sidecar, metadata)
 }
 
 fn build_index_file(
+    utf16_cells: u8,
     source_path: &Path,
     path: &Path,
     storage: &FileStorage,
@@ -453,9 +479,86 @@ fn build_index_file(
             child_page: 0,
         });
 
+        let utf16_cells_opt = match utf16_cells {
+            1 => Some(([0x0Au8, 0x00], [0x0Du8, 0x00])),
+            2 => Some(([0x00u8, 0x0A], [0x00u8, 0x0D])),
+            _ => None,
+        };
         for (start, end) in ranges {
             let start = start.min(bytes.len());
             let end = end.min(bytes.len()).max(start);
+            if let Some((lf, cr)) = utf16_cells_opt {
+                // Cell-aware UTF-16 scan: a raw 0x0A / 0x0D byte can be the
+                // half of a non-break cell (U+4E0A is [0x0A, 0x4E] in LE),
+                // so every memchr hit is validated against the whole cell.
+                // UTF-16 cells start at even file offsets, so the absolute
+                // file-offset parity decides whether a hit is a cell's
+                // first or second byte.
+                let le = lf == [0x0A, 0x00];
+                let mut search_from = start;
+                while let Some(rel) = memchr::memchr2(b'\n', b'\r', &bytes[search_from..end]) {
+                    let pos = search_from + rel;
+                    let cell_start = if le {
+                        pos - (pos % 2)
+                    } else if pos % 2 == 1 {
+                        pos - 1
+                    } else {
+                        // BE lead byte of a non-break character.
+                        search_from = pos + 1;
+                        continue;
+                    };
+                    if cell_start + 1 >= bytes.len() {
+                        // Truncated tail cell.
+                        break;
+                    }
+                    let cell = [bytes[cell_start], bytes[cell_start + 1]];
+                    let is_cr = cell == cr;
+                    if !(cell == lf || is_cr) {
+                        search_from = pos + 1;
+                        continue;
+                    }
+                    if is_cr
+                        && cell_start + 3 < bytes.len()
+                        && [bytes[cell_start + 2], bytes[cell_start + 3]] == lf
+                    {
+                        // CRLF collapses into one break: skip the CR cell and
+                        // let the LF cell register the line.
+                        search_from = cell_start + 2;
+                        continue;
+                    }
+
+                    let line_start = (cell_start + 2) as u64;
+                    let line0 = total_lines;
+                    total_lines = total_lines.saturating_add(1);
+                    let advance = cell_start + 2;
+                    if line0 < next_line_checkpoint && line_start < next_byte_checkpoint {
+                        search_from = advance;
+                        continue;
+                    }
+
+                    leaf_entries.push(PageEntry {
+                        line0,
+                        byte0: line_start,
+                        child_page: 0,
+                    });
+                    next_line_checkpoint = line0.saturating_add(INDEX_CHECKPOINT_STRIDE_LINES);
+                    next_byte_checkpoint = line_start.saturating_add(INDEX_CHECKPOINT_STRIDE_BYTES);
+
+                    if leaf_entries.len() >= page_capacity {
+                        let page_id =
+                            write_page(file, PageKind::Leaf, &leaf_entries, &mut page_count)?;
+                        let first = leaf_entries[0];
+                        summaries.push(PageEntry {
+                            line0: first.line0,
+                            byte0: first.byte0,
+                            child_page: page_id,
+                        });
+                        leaf_entries.clear();
+                    }
+                    search_from = advance;
+                }
+                continue;
+            }
             for rel in memchr2_iter(b'\n', b'\r', &bytes[start..end]) {
                 let pos = start + rel;
                 if bytes[pos] == b'\r' && pos + 1 < bytes.len() && bytes[pos + 1] == b'\n' {
@@ -502,6 +605,7 @@ fn build_index_file(
 
         let root_page = build_internal_levels(file, page_capacity, &mut page_count, summaries)?;
         let header = FileHeader {
+            utf16_cells: metadata.utf16_cells,
             root_page,
             page_count,
             total_lines,
@@ -745,6 +849,7 @@ fn write_header(file: &mut File, header: FileHeader) -> io::Result<()> {
     buf[48..56].copy_from_slice(&header.source_len.to_le_bytes());
     buf[56..64].copy_from_slice(&header.source_mtime_ns.to_le_bytes());
     buf[64..72].copy_from_slice(&header.source_fingerprint.to_le_bytes());
+    buf[72] = header.utf16_cells;
     file.write_all(&buf)
 }
 
@@ -769,6 +874,7 @@ fn read_header(file: &mut File) -> io::Result<FileHeader> {
     }
 
     Ok(FileHeader {
+        utf16_cells: buf[72],
         root_page: le_u64(&buf, 16, "qem line index header")?,
         page_count: le_u64(&buf, 24, "qem line index header")?,
         total_lines: le_u64(&buf, 32, "qem line index header")?,
@@ -860,6 +966,7 @@ fn source_metadata(path: &Path, bytes: &[u8]) -> io::Result<IndexMetadata> {
         source_len,
         source_mtime_ns,
         source_fingerprint: sampled_content_fingerprint(bytes),
+        utf16_cells: 0,
     })
 }
 
@@ -867,8 +974,8 @@ fn source_metadata(path: &Path, bytes: &[u8]) -> io::Result<IndexMetadata> {
 mod tests {
     use super::{
         build_index_file, build_or_open_index, merge_contiguous_ranges, sidecar_path,
-        source_metadata, FileHeader, PageKind, ReadyDiskLineIndex, INDEX_HEADER_BYTES,
-        INDEX_PAGE_HEADER_BYTES, INDEX_PAGE_SIZE,
+        source_metadata, DiskLineIndex, FileHeader, PageKind, ReadyDiskLineIndex,
+        INDEX_HEADER_BYTES, INDEX_PAGE_HEADER_BYTES, INDEX_PAGE_SIZE,
     };
     use crate::storage::FileStorage;
     use std::fs;
@@ -886,7 +993,7 @@ mod tests {
         let storage = FileStorage::open(&path).unwrap();
         let metadata = source_metadata(&path, storage.bytes()).unwrap();
         let sidecar = sidecar_path(&path);
-        build_index_file(&path, &sidecar, &storage, metadata).unwrap();
+        build_index_file(0, &path, &sidecar, &storage, metadata).unwrap();
         let ready = ReadyDiskLineIndex::open_existing(&sidecar, metadata).unwrap();
 
         assert_eq!(ready.total_lines, 20_001);
@@ -906,6 +1013,7 @@ mod tests {
     #[test]
     fn index_header_round_trips() {
         let header = FileHeader {
+            utf16_cells: 0,
             root_page: 7,
             page_count: 9,
             total_lines: 123,
@@ -936,6 +1044,25 @@ mod tests {
     }
 
     #[test]
+    fn utf16le_index_counts_aliased_bytes_as_text_cells() {
+        // U+4E0A ([0x0A, 0x4E]) + 'A' ([0x41, 0x00]) + LF ([0x0A, 0x00]) +
+        // 'B': the raw 0x0A at byte 0 is half of a text cell, so the file
+        // is TWO lines (the second starts at byte 6). Raw byte counting
+        // answers three lines with a phantom break at byte 0.
+        let dir =
+            std::env::temp_dir().join(format!("qem-index-utf16le-alias-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let source = dir.join("alias.txt");
+        let bytes: Vec<u8> = vec![0x0A, 0x4E, 0x41, 0x00, 0x0A, 0x00, 0x42, 0x00];
+        fs::write(&source, &bytes).unwrap();
+        let storage = FileStorage::open(&source).unwrap();
+        let index = DiskLineIndex::build_for_tests(&source, &storage, 1);
+        assert_eq!(index.total_lines(), Some(2));
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn line_index_rejects_stale_content_fingerprint_even_with_matching_file_metadata() {
         let dir = std::env::temp_dir().join(format!(
             "qem-index-stale-fingerprint-{}",
@@ -949,9 +1076,10 @@ mod tests {
         let storage = FileStorage::open(&path).unwrap();
         let metadata = source_metadata(&path, storage.bytes()).unwrap();
         let sidecar = sidecar_path(&path);
-        build_index_file(&path, &sidecar, &storage, metadata).unwrap();
+        build_index_file(0, &path, &sidecar, &storage, metadata).unwrap();
 
         let stale = super::IndexMetadata {
+            utf16_cells: metadata.utf16_cells,
             source_len: metadata.source_len,
             source_mtime_ns: metadata.source_mtime_ns,
             source_fingerprint: metadata.source_fingerprint ^ 1,
@@ -976,7 +1104,7 @@ mod tests {
         let storage = FileStorage::open(&path).unwrap();
         let metadata = source_metadata(&path, storage.bytes()).unwrap();
         let sidecar = sidecar_path(&path);
-        build_index_file(&path, &sidecar, &storage, metadata).unwrap();
+        build_index_file(0, &path, &sidecar, &storage, metadata).unwrap();
 
         {
             let mut file = fs::OpenOptions::new().write(true).open(&sidecar).unwrap();
