@@ -11,6 +11,20 @@
 
 ### Fixed
 
+- Literal search over edited piece-table documents no longer copies whole
+  piece segments into the search window. A search window held the entire
+  remaining bytes of the piece it entered, and edited documents carry
+  giant original pieces (bytes past the indexed seed prefix are cut only
+  at the 64 KiB piece-tree target or not at all), so a single search step
+  on a huge document copied up to tens of GiB into heap before memmem
+  could run — measured on a 50 GiB file: a 27-minute step and a 43.3 GB
+  commit peak on a 16 GB machine, a frequent-needle find-all that
+  effectively never finished. The window now enters a segment in capped
+  4 MiB slices with the same `needle_len - 1` overlap hand-off between
+  slices the whole-segment path used across piece boundaries (cell-aligned
+  for UTF-16), forward and reverse; measured on the same file: the rare-
+  needle find-all dropped to 650 s (pure disk-read time) with a 0.24 GB
+  peak, and the reverse scan stays correct at chunk boundaries.
 - Regex and literal searches over an edited UTF-16BE piece-table document
   no longer crawl. `line_start_byte` located every line break with a raw
   `0x0A` / `0x0D` byte scan; in UTF-16BE the LF cell is `[0x00, 0x0A]`, so

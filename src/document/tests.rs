@@ -8932,3 +8932,294 @@ fn file_len_tracks_rope_backed_non_utf8_documents() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Literal-search window chunk cap (piece-table forward / reverse scans)
+// ---------------------------------------------------------------------------
+
+/// Brute-force oracle for literal search: byte offset and typed position of
+/// every non-overlapping `needle_bytes` occurrence in `content`, left to
+/// right. Lines are counted exactly as the engine walks them (LF lines; the
+/// needle must not contain a line-break byte). `col_units` is the engine
+/// cell width (1 for byte engines, 2 for UTF-16).
+fn literal_search_oracle_matches(
+    content: &[u8],
+    needle_bytes: &[u8],
+    col_units: usize,
+) -> Vec<(usize, TextPosition)> {
+    assert!(col_units == 1 || col_units == 2, "engine cell width");
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    let mut line = 0usize;
+    let mut line_start = 0usize;
+    while at + needle_bytes.len() <= content.len() {
+        if &content[at..at + needle_bytes.len()] == needle_bytes {
+            let col = (at - line_start) / col_units;
+            out.push((at, TextPosition::new(line, col)));
+            at += needle_bytes.len();
+        } else {
+            let is_lf = content[at] == b'\n'
+                && (col_units == 1 || (at + 1 < content.len() && content[at + 1] == 0));
+            if is_lf {
+                line += 1;
+                line_start = at + col_units;
+            }
+            at += col_units;
+        }
+    }
+    out
+}
+
+/// End-of-document position for the oracle content (used as the `before`
+/// anchor of reverse stepping).
+fn literal_search_oracle_end(content: &[u8], col_units: usize) -> TextPosition {
+    let last_lf = (0..content.len()).step_by(col_units).rev().find(|&at| {
+        content[at] == b'\n' && (col_units == 1 || (at + 1 < content.len() && content[at + 1] == 0))
+    });
+    match last_lf {
+        Some(at) => TextPosition::new(
+            at / col_units + 1,
+            (content.len() - at - col_units) / col_units,
+        ),
+        None => TextPosition::new(0, content.len() / col_units),
+    }
+}
+
+/// Multi-line fixture with 64-unit LF lines ("x" filler), so position walks
+/// stay cheap while the seed piece tree still cuts Original pieces at the
+/// 64 KiB piece-tree target: with the tiny window cap every piece is a
+/// multi-chunk segment, and the chunk grid inside pieces is deterministic
+/// (piece starts are multiples of 64 KiB because 64 KiB is a multiple of
+/// the line length). `needle_offsets` must be pairwise non-overlapping;
+/// needles may overwrite line breaks, the oracle re-derives the lines.
+fn write_line_fixture(
+    dir: &Path,
+    name: &str,
+    total_len: usize,
+    cell_bytes: usize,
+    needle_bytes: &[u8],
+    needle_offsets: &[usize],
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(total_len);
+    let line_len = 64 * cell_bytes;
+    let line: Vec<u8> = (0..64)
+        .flat_map(|i| {
+            let b = if i + 1 == 64 { b'\n' } else { b'x' };
+            let mut cell = vec![b; cell_bytes];
+            if cell_bytes == 2 {
+                cell[1] = 0;
+            }
+            cell
+        })
+        .collect();
+    assert_eq!(line.len(), line_len);
+    while bytes.len() < total_len {
+        let take = line_len.min(total_len - bytes.len());
+        bytes.extend_from_slice(&line[..take]);
+    }
+    for &offset in needle_offsets {
+        bytes[offset..offset + needle_bytes.len()].copy_from_slice(needle_bytes);
+    }
+    std::fs::write(dir.join(name), &bytes).unwrap();
+    bytes
+}
+
+/// Opens a fixture as a promoted piece-table document (the regex-test
+/// seeding pattern: one insert plus its exact undo force the promotion
+/// while leaving the fixture content untouched).
+fn open_promoted_piece_table_doc(path: &Path) -> Document {
+    let mut doc = Document::open(path).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while doc.is_indexing() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!doc.is_indexing(), "fixture indexing must finish");
+    assert!(
+        doc.file_len() >= PIECE_TABLE_MIN_BYTES,
+        "fixture must be large enough to promote to the piece table"
+    );
+    let _ = doc
+        .try_insert(TextPosition::new(0, 0), "X")
+        .expect("seed edit promotes the document to the piece table");
+    let _ = doc
+        .try_replace(TextRange::new(TextPosition::new(0, 0), 1), "")
+        .expect("seed edit undo restores the fixture content");
+    assert!(
+        doc.piece_table.is_some(),
+        "fixture must be piece-table backed after the seed edit"
+    );
+    doc
+}
+
+/// Dense needle run at `step`-byte spacing across a window wider than the
+/// chunk cap: whatever phase the real chunk boundaries sit on (they repeat
+/// every cap bytes inside every segment), at least one planted needle
+/// straddles an actual boundary strictly inside its span.
+fn dense_needle_offsets(window_start: usize, window_len: usize, step: usize) -> Vec<usize> {
+    (0..)
+        .map(|k| window_start + k * step)
+        .take_while(|&offset| offset + step <= window_start + window_len)
+        .collect()
+}
+
+fn assert_literal_search_matches_with_tiny_window_cap(
+    doc: &Document,
+    needle: &str,
+    expected: &[(usize, TextPosition)],
+    end_pos: TextPosition,
+) {
+    // find_all: the fixture exceeds the 8 MiB buffered-range cap, so the
+    // iterator walks the piece-table scan (find_literal_next_from_position)
+    // once per match; every match must come back at its exact position.
+    let got: Vec<TextPosition> = doc.find_all(needle).map(|m| m.start()).collect();
+    let want: Vec<TextPosition> = expected.iter().map(|&(_, pos)| pos).collect();
+    assert_eq!(
+        got, want,
+        "find_all must report every match at its exact position"
+    );
+
+    // find_next stepping must reproduce the same sequence.
+    let mut pos = TextPosition::new(0, 0);
+    for &(offset, want_pos) in expected {
+        let found = doc
+            .find_next(needle, pos)
+            .unwrap_or_else(|| panic!("find_next must find the match at byte offset {offset}"));
+        assert_eq!(found.start(), want_pos, "find_next match at byte {offset}");
+        pos = found.end();
+    }
+    assert!(
+        doc.find_next(needle, pos).is_none(),
+        "no matches past the last one"
+    );
+
+    // find_prev stepping must reproduce the same sequence in reverse.
+    let mut before = end_pos;
+    for &(offset, want_pos) in expected.iter().rev() {
+        let found = doc
+            .find_prev(needle, before)
+            .unwrap_or_else(|| panic!("find_prev must find the match at byte offset {offset}"));
+        assert_eq!(found.start(), want_pos, "find_prev match at byte {offset}");
+        before = found.start();
+    }
+    assert!(
+        doc.find_prev(needle, before).is_none(),
+        "no matches before the first one"
+    );
+}
+
+#[test]
+fn piece_table_literal_search_survives_tiny_window_chunk_cap_utf8() {
+    super::search::search_window_chunk_cap_override::set(4 * 1024);
+
+    const TOTAL: usize = 9 * 1024 * 1024; // also defeats the 8 MiB find_all buffer
+    const NEEDLE: &str = "Needle";
+    let needle_bytes = NEEDLE.as_bytes();
+
+    // Straddle chain: consecutive needles 4099 bytes apart, each planted
+    // 4093 bytes after the previous needle's end. The literal scan for
+    // needle k+1 starts exactly at needle k's end (find_all / find_next
+    // step match to match), so the chunk boundary s + cap lands strictly
+    // inside needle k+1 — the overlap carry between window chunks must
+    // surface it. Losing the carry (keep = 0) drops every chain needle
+    // whose gap holds no piece boundary (~7/8 of them) and fails the test.
+    // Dense 4 KiB+ bands and head/EOF edges add drift and short-window
+    // coverage on top.
+    let mut offsets: Vec<usize> = (0..220).map(|k| 4107 + 4099 * k).collect();
+    offsets.extend(dense_needle_offsets(
+        2 * 1024 * 1024,
+        4 * 1024 + needle_bytes.len(),
+        needle_bytes.len(),
+    ));
+    offsets.extend(dense_needle_offsets(
+        TOTAL - 20 * 1024,
+        4 * 1024,
+        needle_bytes.len(),
+    ));
+    offsets.extend([0, 8, TOTAL - 64 * 1024 - 3, TOTAL - 16, TOTAL - 6]);
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    let dir = large_fixture_dir("literal-window-cap-utf8");
+    let content = write_line_fixture(&dir, "giant-utf8.txt", TOTAL, 1, needle_bytes, &offsets);
+    let expected = literal_search_oracle_matches(&content, needle_bytes, 1);
+    assert_eq!(
+        expected.len(),
+        offsets.len(),
+        "oracle must see every planted needle"
+    );
+
+    let doc = open_promoted_piece_table_doc(&dir.join("giant-utf8.txt"));
+    assert_literal_search_matches_with_tiny_window_cap(
+        &doc,
+        NEEDLE,
+        &expected,
+        literal_search_oracle_end(&content, 1),
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn piece_table_literal_search_survives_tiny_window_chunk_cap_utf16le() {
+    super::search::search_window_chunk_cap_override::set(4 * 1024);
+
+    const TOTAL: usize = 9 * 1024 * 1024;
+    const NEEDLE: &str = "Needle";
+    // Pure-ASCII needle in UTF-16LE: ASCII bytes interleaved with NUL.
+    let needle_bytes: Vec<u8> = NEEDLE.bytes().flat_map(|b| [b, 0]).collect();
+    let step = needle_bytes.len();
+
+    // Straddle chain (even-grid variant): consecutive needles 4104 bytes
+    // apart, each planted 4092 bytes after the previous needle's end, so
+    // the chunk boundary s + cap (s = previous needle's end) lands strictly
+    // inside the next needle. All offsets stay on the 2-byte cell grid; the
+    // even-grid overlap flooring must keep the carry grid-aligned too.
+    let mut offsets: Vec<usize> = (0..220).map(|k| 4128 + 4104 * k).collect();
+    offsets.extend(dense_needle_offsets(2 * 1024 * 1024, 4 * 1024 + step, step));
+    offsets.extend(dense_needle_offsets(TOTAL - 20 * 1024, 4 * 1024, step));
+    offsets.extend([
+        0,
+        2 * step,
+        TOTAL - 64 * 1024 - step + 2,
+        TOTAL - 2 * step,
+        TOTAL - step,
+    ]);
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    let dir = large_fixture_dir("literal-window-cap-utf16");
+    let content = write_line_fixture(&dir, "giant-utf16.txt", TOTAL, 2, &needle_bytes, &offsets);
+    let expected = literal_search_oracle_matches(&content, &needle_bytes, 2);
+    assert_eq!(
+        expected.len(),
+        offsets.len(),
+        "oracle must see every planted needle"
+    );
+
+    let path = dir.join("giant-utf16.txt");
+    let mut doc = Document::open_with_encoding(&path, DocumentEncoding::utf16le()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while doc.is_indexing() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!doc.is_indexing(), "fixture indexing must finish");
+    let _ = doc
+        .try_insert(TextPosition::new(0, 0), "X")
+        .expect("seed edit promotes the document to the piece table");
+    let _ = doc
+        .try_replace(TextRange::new(TextPosition::new(0, 0), 1), "")
+        .expect("seed edit undo restores the fixture content");
+    assert!(
+        doc.piece_table.is_some(),
+        "fixture must be piece-table backed after the seed edit"
+    );
+
+    assert_literal_search_matches_with_tiny_window_cap(
+        &doc,
+        NEEDLE,
+        &expected,
+        literal_search_oracle_end(&content, 2),
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

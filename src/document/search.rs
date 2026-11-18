@@ -273,6 +273,57 @@ fn segment_search_accepts(rel: usize, overlap_len: usize, needle_len: usize) -> 
     rel.saturating_add(needle_len) > overlap_len
 }
 
+/// Upper bound on how many bytes of one piece segment a single
+/// literal-search window may hold.
+///
+/// Edited piece-table documents can carry Original pieces spanning many
+/// gigabytes (bytes past the indexed seed prefix are cut only at the 64 KiB
+/// piece-tree target or not at all). The search window used to hold the
+/// whole segment, so a single literal-search step on a huge document copied
+/// up to tens of GiB into heap before memmem could run. Real needles are
+/// small (hundreds of bytes at most) and the cross-window overlap is only
+/// `needle_len - 1` bytes, so a fixed multi-megabyte cap keeps the copy
+/// bounded while staying orders of magnitude above needle + overlap. The
+/// cap is even, so chunk boundaries keep the segment start's parity and
+/// UTF-16 windows stay on the 2-byte cell grid.
+const SEARCH_WINDOW_CHUNK_CAP: usize = 4 * 1024 * 1024;
+
+/// Test-only override of [`SEARCH_WINDOW_CHUNK_CAP`] (same pattern as
+/// `class_b_chunk_geometry_override`): pins a tiny cap so tests exercise
+/// window chunking without multi-megabyte needles or segments.
+#[cfg(test)]
+pub(crate) mod search_window_chunk_cap_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CHUNK_CAP: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Pins the literal-search window chunk cap for the current test thread.
+    pub(crate) fn set(cap: usize) {
+        assert!(
+            cap >= 2,
+            "cap must leave room for overlap bytes and a match byte"
+        );
+        CHUNK_CAP.with(|cell| cell.set(Some(cap)));
+    }
+
+    pub(crate) fn get() -> Option<usize> {
+        CHUNK_CAP.with(Cell::get)
+    }
+}
+
+/// The chunk cap the literal-search window slicing uses; routes through the
+/// test-only override when one is pinned. Kept even so chunk boundaries
+/// never change the segment start's parity (UTF-16 cell grid).
+fn search_window_chunk_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = search_window_chunk_cap_override::get() {
+        return cap & !1;
+    }
+    SEARCH_WINDOW_CHUNK_CAP
+}
+
 fn refill_search_window(window: &mut Vec<u8>, overlap: &[u8], segment: &[u8]) {
     window.clear();
     window.extend_from_slice(overlap);
@@ -1902,6 +1953,7 @@ impl PieceTable {
         // needle (`2` bytes per unit) needs at most `needle_len - 2` overlap
         // bytes to be detected across a segment boundary.
         let cell_aligned_keep = is_utf16_name(self.engine.encoding().name());
+        let chunk_cap = search_window_chunk_cap();
 
         self.pieces
             .visit_range_while(start, self.total_len, |piece, local_start, local_end| {
@@ -1913,33 +1965,48 @@ impl PieceTable {
                     return true;
                 }
 
-                let overlap_len = overlap.len();
-                refill_search_window(&mut window, &overlap, segment);
-                if let Some(rel) = find_window_match(finder, &window, overlap_len, needle_len) {
-                    let match_position = if rel == 0 {
-                        overlap_position
-                    } else {
-                        advance_position_by_bytes(overlap_position, &window[..rel], self.engine)
-                    };
-                    found = Some((match_position, overlap_start.saturating_add(rel)));
-                    return false;
-                }
+                // A piece segment can span many gigabytes, so it enters the
+                // window in `chunk_cap` slices instead of whole. Every slice
+                // reuses the whole-segment overlap bookkeeping below: the
+                // last `needle_len - 1` window bytes become the next
+                // slice's overlap and `overlap_start` / `overlap_position`
+                // advance by exactly the consumed bytes, so positions and
+                // the UTF-16 even grid carry across chunk boundaries with
+                // the same semantics as across piece boundaries.
+                let mut chunk_at = 0usize;
+                while chunk_at < segment.len() {
+                    let chunk_len = chunk_cap.min(segment.len() - chunk_at);
+                    let chunk = &segment[chunk_at..chunk_at + chunk_len];
 
-                let mut keep = needle_len.saturating_sub(1).min(window.len());
-                if cell_aligned_keep {
-                    keep &= !1;
+                    let overlap_len = overlap.len();
+                    refill_search_window(&mut window, &overlap, chunk);
+                    if let Some(rel) = find_window_match(finder, &window, overlap_len, needle_len) {
+                        let match_position = if rel == 0 {
+                            overlap_position
+                        } else {
+                            advance_position_by_bytes(overlap_position, &window[..rel], self.engine)
+                        };
+                        found = Some((match_position, overlap_start.saturating_add(rel)));
+                        return false;
+                    }
+
+                    let mut keep = needle_len.saturating_sub(1).min(window.len());
+                    if cell_aligned_keep {
+                        keep &= !1;
+                    }
+                    let consumed = window.len().saturating_sub(keep);
+                    if consumed > 0 {
+                        overlap_position = advance_position_by_bytes(
+                            overlap_position,
+                            &window[..consumed],
+                            self.engine,
+                        );
+                    }
+                    overlap.clear();
+                    overlap.extend_from_slice(&window[window.len().saturating_sub(keep)..]);
+                    overlap_start = overlap_start.saturating_add(consumed);
+                    chunk_at += chunk_len;
                 }
-                let consumed = window.len().saturating_sub(keep);
-                if consumed > 0 {
-                    overlap_position = advance_position_by_bytes(
-                        overlap_position,
-                        &window[..consumed],
-                        self.engine,
-                    );
-                }
-                overlap.clear();
-                overlap.extend_from_slice(&window[window.len().saturating_sub(keep)..]);
-                overlap_start = overlap_start.saturating_add(consumed);
                 true
             });
 
@@ -1960,6 +2027,7 @@ impl PieceTable {
         let mut window = Vec::new();
         let mut segment_end = end.min(self.total_len);
         let mut found = None;
+        let chunk_cap = search_window_chunk_cap();
 
         self.pieces.visit_range_rev_while(
             0,
@@ -1973,18 +2041,36 @@ impl PieceTable {
                     return true;
                 }
 
+                // Same chunk-cap discipline as the forward scan: the
+                // segment enters the window in `chunk_cap` slices walked
+                // right to left. Each slice's window is `slice + overlap`,
+                // matches must start inside the slice (`rel < slice.len()`),
+                // and the slice's first `needle_len - 1` bytes become the
+                // next (leftward) window's overlap — the exact whole-segment
+                // semantics applied per slice, so a match straddling a
+                // chunk boundary is still found and positions do not drift.
                 let segment_start = segment_end.saturating_sub(segment.len());
-                window.clear();
-                window.extend_from_slice(segment);
-                window.extend_from_slice(&overlap);
-                if let Some(rel) = finder.rfind_iter(&window).find(|&rel| rel < segment.len()) {
-                    found = Some(segment_start.saturating_add(rel));
-                    return false;
-                }
+                let mut chunk_end = segment.len();
+                while chunk_end > 0 {
+                    let chunk_begin = chunk_end.saturating_sub(chunk_cap);
+                    let chunk = &segment[chunk_begin..chunk_end];
+                    window.clear();
+                    window.extend_from_slice(chunk);
+                    window.extend_from_slice(&overlap);
+                    if let Some(rel) = finder.rfind_iter(&window).find(|&rel| rel < chunk.len()) {
+                        found = Some(
+                            segment_start
+                                .saturating_add(chunk_begin)
+                                .saturating_add(rel),
+                        );
+                        return false;
+                    }
 
-                let keep = needle_len.saturating_sub(1).min(window.len());
-                overlap.clear();
-                overlap.extend_from_slice(&window[..keep]);
+                    let keep = needle_len.saturating_sub(1).min(window.len());
+                    overlap.clear();
+                    overlap.extend_from_slice(&window[..keep]);
+                    chunk_end = chunk_begin;
+                }
                 segment_end = segment_start;
                 true
             },
