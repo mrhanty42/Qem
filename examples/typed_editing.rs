@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         TextPosition::new(0, 0),
         TextPosition::new(0, 12),
     ));
-    let selected = doc.read_selection(title_selection).unwrap();
+    let selected = doc.read_selection(title_selection);
     println!(
         "selection: {:?}..{:?}, exact={}, text={:?}",
         title_selection.anchor(),
@@ -41,9 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cut.edit().cursor()
     );
 
-    let sample = doc
-        .read_text(doc.text_range_between(TextPosition::new(0, 0), TextPosition::new(2, 32)))
-        .unwrap();
+    let sample =
+        doc.read_text(doc.text_range_between(TextPosition::new(0, 0), TextPosition::new(2, 32)));
     println!("sample after edits: {:?}", sample.text());
 
     let query = LiteralSearchQuery::new("qem").ok_or("empty literal query")?;
@@ -52,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "found literal match: {:?}..{:?} -> {:?}",
             found.start(),
             found.end(),
-            doc.read_text(found.range()).unwrap().text()
+            doc.read_text(found.range()).text()
         );
 
         if let Some(previous) = doc.find_prev_query(&query, found.end()) {
@@ -99,9 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_viewport(doc: &Document, label: &str) {
     println!("{label}:");
-    let viewport = doc
-        .read_viewport(ViewportRequest::new(0, 5).with_columns(0, 120))
-        .unwrap();
+    let viewport = doc.read_viewport(ViewportRequest::new(0, 5).with_columns(0, 120));
     for row in viewport.rows() {
         println!(
             "{:>8}: [{}] {}",

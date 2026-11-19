@@ -300,7 +300,7 @@ fn drive_op(doc: &Document, op: &Op) {
             let _ = doc.file_len();
         }
         Op::TextLossy => {
-            let _ = doc.text_lossy().unwrap();
+            let _ = doc.text_lossy();
         }
         Op::LineSlice {
             line0_seed,
@@ -321,7 +321,7 @@ fn drive_op(doc: &Document, op: &Op) {
             let start_col = pick_in_range(*start_col_seed, 64);
             let len_chars = (*len_chars_seed as usize) % 65;
             let range = TextRange::new(TextPosition::new(line0, start_col), len_chars);
-            let _ = doc.read_text(range).unwrap();
+            let _ = doc.read_text(range);
         }
         Op::Viewport {
             first_line0_seed,
@@ -335,7 +335,7 @@ fn drive_op(doc: &Document, op: &Op) {
             let max_cols = (*max_cols_seed as usize) % 128 + 1;
             let request =
                 ViewportRequest::new(first_line0, count).with_columns(start_col, max_cols);
-            let _ = doc.read_viewport(request).unwrap();
+            let _ = doc.read_viewport(request);
         }
         Op::FindNext {
             needle,

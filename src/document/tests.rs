@@ -218,7 +218,7 @@ fn assert_doc_matches_model(doc: &Document, expected: &str) {
         render_with_line_ending(expected, doc.line_ending())
     };
 
-    assert_eq!(doc.text_lossy().unwrap(), expected_text);
+    assert_eq!(doc.text_lossy(), expected_text);
     assert_eq!(doc.exact_line_count(), Some(expected_lines.len()));
     assert_eq!(doc.line_count(), LineCount::Exact(expected_lines.len()));
     assert!(doc.has_precise_line_lengths());
@@ -319,7 +319,7 @@ fn apply_op_to_doc_text_only(doc: &mut Document, expected: &mut String, op: &Edi
         }
     }
 
-    assert_eq!(doc.text_lossy().unwrap(), *expected);
+    assert_eq!(doc.text_lossy(), *expected);
 }
 
 fn op_text_strategy() -> impl Strategy<Value = String> {
@@ -724,7 +724,7 @@ fn literal_search_rejects_shift_jis_splice_on_piece_table() {
     // encoded insert path: the decoded "s1s2s1s2" encodes back to the
     // raw splice bytes, so the needle pair sits at non-boundary offsets
     // inside the add buffer.
-    let last_line0 = doc.text_lossy().unwrap().matches('\n').count();
+    let last_line0 = doc.text_lossy().matches('\n').count();
     let splice_text = format!("{s1}{s2}{s1}{s2}");
     let _ = doc.try_insert_text_at(last_line0, 0, &splice_text).unwrap();
 
@@ -746,7 +746,7 @@ fn literal_search_rejects_shift_jis_splice_on_piece_table() {
         "splice bytes must reach the piece-table bytes; s1={s1:?} needle={needle_text:?}"
     );
     assert!(
-        !doc.text_lossy().unwrap().contains(&needle_text),
+        !doc.text_lossy().contains(&needle_text),
         "the decoded text must not contain the spliced needle; s1={s1:?} needle={needle_text:?}"
     );
 
@@ -905,7 +905,7 @@ fn piece_table_insert_in_virtual_space_materializes_spaces() {
 
     assert!(outcome.edited);
     assert_eq!((line0, col0), (0, 7));
-    assert_eq!(piece_table.to_string_lossy_result().unwrap(), "abc   Z\n");
+    assert_eq!(piece_table.to_string_lossy(), "abc   Z\n");
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1375,7 +1375,7 @@ fn large_non_utf8_document_saves_and_reopens_beyond_the_rope_budget() {
         "the reopened document must keep the full sparse size plus the insert"
     );
     assert!(
-        reopened.text_lossy().unwrap().starts_with("Xпривет\nмир\n"),
+        reopened.text_lossy().starts_with("Xпривет\nмир\n"),
         "the reopened content must round-trip"
     );
 
@@ -1446,7 +1446,7 @@ fn small_big5_document_still_saves_without_budget_errors() {
         None,
         "a small rope-decode document saves without budget errors"
     );
-    assert!(doc.text_lossy().unwrap().contains("big5"));
+    assert!(doc.text_lossy().contains("big5"));
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1667,7 +1667,7 @@ fn insert_uses_partial_piece_table_before_full_index_finishes() {
     assert_eq!((line0, col0), (0, 1));
     assert!(doc.piece_table.is_some());
     assert!(doc.rope.is_none());
-    assert!(doc.text_lossy().unwrap().starts_with("Xabc\ndef\n"));
+    assert!(doc.text_lossy().starts_with("Xabc\ndef\n"));
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1837,7 +1837,7 @@ fn empty_document_insert_preserves_utf8_text() {
     let (line0, col0) = doc.try_insert_text_at(0, 0, sample).unwrap();
 
     assert_eq!((line0, col0), (0, 7));
-    assert_eq!(doc.text_lossy().unwrap(), sample);
+    assert_eq!(doc.text_lossy(), sample);
     assert_eq!(doc.line_len_chars(0), 7);
 }
 
@@ -1857,7 +1857,7 @@ fn piece_table_insert_at_end_does_not_create_zero_len_pieces() {
 
     assert!(outcome.edited);
     assert_eq!((line0, col0), (0, 4));
-    assert_eq!(piece_table.to_string_lossy_result().unwrap(), "abcZ");
+    assert_eq!(piece_table.to_string_lossy(), "abcZ");
     assert!(piece_table
         .pieces
         .to_vec()
@@ -1882,10 +1882,7 @@ fn piece_table_insert_after_multibyte_char_preserves_utf8_boundaries() {
 
     assert_eq!((line0, col0), (0, 3));
     assert!(doc.has_edit_buffer());
-    assert!(doc
-        .text_lossy()
-        .unwrap()
-        .starts_with("A\u{1F600}X\u{0411}\n"));
+    assert!(doc.text_lossy().starts_with("A\u{1F600}X\u{0411}\n"));
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1969,7 +1966,7 @@ fn escaped_utf8_insert_preserves_multibyte_text() {
     let (line0, col0) = doc.try_insert_text_at(0, 0, sample).unwrap();
 
     assert_eq!((line0, col0), (0, 7));
-    assert_eq!(doc.text_lossy().unwrap(), sample);
+    assert_eq!(doc.text_lossy(), sample);
     assert_eq!(doc.line_len_chars(0), 7);
 }
 
@@ -1987,10 +1984,7 @@ fn piece_table_insert_after_escaped_multibyte_char_preserves_boundaries() {
 
     assert_eq!((line0, col0), (0, 3));
     assert!(doc.has_edit_buffer());
-    assert!(doc
-        .text_lossy()
-        .unwrap()
-        .starts_with("A\u{1F600}X\u{0411}\n"));
+    assert!(doc.text_lossy().starts_with("A\u{1F600}X\u{0411}\n"));
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
@@ -2089,22 +2083,22 @@ fn piece_table_compaction_rewrites_current_state_without_new_undo_step() {
     piece_table.insert_bytes(3, b"Y").unwrap();
     piece_table.insert_bytes(5, b"Z").unwrap();
 
-    let before_text = piece_table.to_string_lossy_result().unwrap();
+    let before_text = piece_table.to_string_lossy();
     let before_stats = piece_table.fragmentation_stats_with_threshold(1);
     assert_eq!(before_stats.piece_count, 7);
 
     assert!(piece_table.compact_current_state().unwrap());
 
     let after_stats = piece_table.fragmentation_stats_with_threshold(1);
-    assert_eq!(piece_table.to_string_lossy_result().unwrap(), before_text);
+    assert_eq!(piece_table.to_string_lossy(), before_text);
     assert_eq!(after_stats.piece_count, 1);
     assert!(piece_table.full_index());
     assert_eq!(piece_table.known_byte_len, piece_table.total_len());
 
     assert!(piece_table.undo().unwrap());
-    assert_eq!(piece_table.to_string_lossy_result().unwrap(), "aXbYcdef");
+    assert_eq!(piece_table.to_string_lossy(), "aXbYcdef");
     assert!(piece_table.redo().unwrap());
-    assert_eq!(piece_table.to_string_lossy_result().unwrap(), before_text);
+    assert_eq!(piece_table.to_string_lossy(), before_text);
 }
 
 #[test]
@@ -2121,7 +2115,7 @@ fn document_compact_piece_table_preserves_recovery_and_clears_recommendation() {
     piece_table.insert_bytes(base + 3, b"Y").unwrap();
     piece_table.insert_bytes(base + 5, b"Z").unwrap();
 
-    let before_text = piece_table.to_string_lossy_result().unwrap();
+    let before_text = piece_table.to_string_lossy();
     let recommendation = piece_table.compaction_recommendation(CompactionPolicy {
         min_total_bytes: 0,
         min_piece_count: 5,
@@ -2168,7 +2162,7 @@ fn document_compact_piece_table_preserves_recovery_and_clears_recommendation() {
         })
         .unwrap();
     assert!(applied.is_some());
-    assert_eq!(doc.text_lossy().unwrap(), before_text);
+    assert_eq!(doc.text_lossy(), before_text);
     assert!(doc
         .compaction_recommendation_with_policy(CompactionPolicy {
             min_total_bytes: 0,
@@ -2183,7 +2177,7 @@ fn document_compact_piece_table_preserves_recovery_and_clears_recommendation() {
 
     doc.flush_session().unwrap();
     let recovered = Document::open(&path).unwrap();
-    assert_eq!(recovered.text_lossy().unwrap(), before_text);
+    assert_eq!(recovered.text_lossy(), before_text);
 }
 
 #[test]
@@ -2340,7 +2334,7 @@ fn prepare_save_with_forced_compaction_policy_compacts_before_snapshotting() {
     piece_table.insert_bytes(3, b"Y").unwrap();
     piece_table.insert_bytes(5, b"Z").unwrap();
 
-    let expected_text = piece_table.to_string_lossy_result().unwrap();
+    let expected_text = piece_table.to_string_lossy();
     let policy = CompactionPolicy {
         min_total_bytes: 0,
         min_piece_count: 5,
@@ -2412,7 +2406,7 @@ fn open_with_encoding_preserves_legacy_text_and_default_save_round_trips() {
         DocumentEncodingOrigin::ExplicitReinterpretation
     );
     assert!(!doc.decoding_had_errors());
-    assert_eq!(doc.text_lossy().unwrap(), source_text);
+    assert_eq!(doc.text_lossy(), source_text);
 
     let edit = doc.try_insert_text_at(0, 0, "эй, ").unwrap();
     assert_eq!(edit, (0, 4));
@@ -2464,7 +2458,7 @@ fn open_with_options_reinterpretation_decodes_legacy_bytes() {
     .unwrap();
 
     assert_eq!(doc.encoding(), encoding);
-    assert_eq!(doc.text_lossy().unwrap(), "café\n");
+    assert_eq!(doc.text_lossy(), "café\n");
 }
 
 #[test]
@@ -2488,7 +2482,7 @@ fn open_with_encoding_shift_jis_preserves_text_and_default_save_round_trips() {
         DocumentEncodingOrigin::ExplicitReinterpretation
     );
     assert!(!doc.decoding_had_errors());
-    assert_eq!(doc.text_lossy().unwrap(), source_text);
+    assert_eq!(doc.text_lossy(), source_text);
 
     let _ = doc.try_insert_text_at(0, 0, inserted_text).unwrap();
     doc.save_to(&saved).unwrap();
@@ -2516,7 +2510,7 @@ fn preserve_save_rejects_lossy_shift_jis_source() {
         DocumentEncodingOrigin::ExplicitReinterpretation
     );
     assert!(doc.decoding_had_errors());
-    assert_eq!(doc.text_lossy().unwrap(), "\u{FFFD}");
+    assert_eq!(doc.text_lossy(), "\u{FFFD}");
 
     let err = doc.save_to(&saved).unwrap_err();
     assert!(matches!(
@@ -2568,7 +2562,7 @@ fn invalid_utf8_inline_open_tracks_lossy_decode_but_preserve_save_stays_raw_safe
     assert!(doc.can_preserve_save());
     assert_eq!(doc.preserve_save_error(), None);
     assert!(doc.status().decoding_had_errors());
-    assert_eq!(doc.text_lossy().unwrap(), "fo\u{FFFD}o\n");
+    assert_eq!(doc.text_lossy(), "fo\u{FFFD}o\n");
 
     doc.save_to(&saved).unwrap();
 
@@ -2719,7 +2713,7 @@ fn open_with_options_auto_detects_utf16le_bom_and_allows_utf8_convert_save() {
     let mut doc = Document::open_with_auto_encoding_detection(path).unwrap();
     assert_eq!(doc.encoding(), DocumentEncoding::utf16le());
     assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
-    assert_eq!(doc.text_lossy().unwrap(), source_text);
+    assert_eq!(doc.text_lossy(), source_text);
 
     let _ = doc.try_insert_text_at(0, 0, "header\n").unwrap();
     doc.save_to_with_options(
@@ -2755,7 +2749,7 @@ fn open_with_auto_detection_detects_utf16be_bom() {
 
     assert_eq!(doc.encoding(), DocumentEncoding::utf16be());
     assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
-    assert_eq!(doc.text_lossy().unwrap(), source_text);
+    assert_eq!(doc.text_lossy(), source_text);
 }
 
 #[test]
@@ -2772,7 +2766,7 @@ fn open_with_auto_detection_detects_utf8_bom_and_strips_it_from_content() {
     assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
     assert!(!doc.decoding_had_errors());
     // BOM must not appear in document content.
-    assert_eq!(doc.text_lossy().unwrap(), "hello\nworld\n");
+    assert_eq!(doc.text_lossy(), "hello\nworld\n");
     assert_eq!(doc.line_len_chars(0), 5);
 }
 
@@ -2826,7 +2820,7 @@ fn open_with_auto_detection_tracks_utf8_fallback_origin() {
         doc.encoding_origin(),
         DocumentEncodingOrigin::AutoDetectFallbackUtf8
     );
-    assert_eq!(doc.text_lossy().unwrap(), "hello\nworld\n");
+    assert_eq!(doc.text_lossy(), "hello\nworld\n");
 }
 
 #[test]
@@ -2847,8 +2841,8 @@ fn open_with_auto_detection_and_fallback_reinterprets_valid_utf8_when_bom_is_mis
         doc.encoding_origin(),
         DocumentEncodingOrigin::AutoDetectFallbackOverride
     );
-    assert_eq!(doc.text_lossy().unwrap(), "caf\u{00C3}\u{00A9}\n");
-    assert_ne!(doc.text_lossy().unwrap(), "caf\u{00E9}\n");
+    assert_eq!(doc.text_lossy(), "caf\u{00C3}\u{00A9}\n");
+    assert_ne!(doc.text_lossy(), "caf\u{00E9}\n");
 }
 
 #[test]
@@ -2870,7 +2864,7 @@ fn open_with_auto_detection_and_fallback_still_prefers_detected_bom() {
 
     assert_eq!(doc.encoding(), DocumentEncoding::utf16le());
     assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
-    assert_eq!(doc.text_lossy().unwrap(), "hello\n");
+    assert_eq!(doc.text_lossy(), "hello\n");
 }
 
 #[test]
@@ -3069,9 +3063,7 @@ fn incomplete_mmap_single_row_batch_reads_match_singular_line_lookup() {
     assert_eq!(slices[0].text(), "one");
     assert!(slices[0].is_exact());
 
-    let viewport = doc
-        .read_viewport(ViewportRequest::new(1, 1).with_columns(0, 16))
-        .unwrap();
+    let viewport = doc.read_viewport(ViewportRequest::new(1, 1).with_columns(0, 16));
     assert_eq!(viewport.rows().len(), 1);
     assert_eq!(viewport.rows()[0].text(), "one");
     assert!(viewport.rows()[0].is_exact());
@@ -3095,9 +3087,7 @@ fn fully_indexed_mmap_out_of_range_line_reads_are_exact_empty() {
     assert!(slices.iter().all(|slice| slice.text().is_empty()));
     assert!(slices.iter().all(LineSlice::is_exact));
 
-    let viewport = doc
-        .read_viewport(ViewportRequest::new(99, 2).with_columns(0, 16))
-        .unwrap();
+    let viewport = doc.read_viewport(ViewportRequest::new(99, 2).with_columns(0, 16));
     assert_eq!(viewport.rows().len(), 2);
     assert!(viewport.rows().iter().all(|row| row.text().is_empty()));
     assert!(viewport.rows().iter().all(ViewportRow::is_exact));
@@ -3142,9 +3132,7 @@ fn checkpoint_viewport_fixture(path: &Path, ending: &str) -> Document {
 }
 
 fn assert_checkpoint_viewport(doc: &Document, first: usize, count: usize, prefix_delta: usize) {
-    let viewport = doc
-        .read_viewport(ViewportRequest::new(first, count).with_columns(0, 16))
-        .unwrap();
+    let viewport = doc.read_viewport(ViewportRequest::new(first, count).with_columns(0, 16));
     assert_eq!(viewport.len(), count);
     for (offset, row) in viewport.rows().iter().enumerate() {
         let line0 = first + offset;
@@ -3179,9 +3167,7 @@ fn disk_checkpoint_viewport_resolves_random_lines_and_prefix_crossing() {
     assert_checkpoint_viewport(&doc, 100_018, 2, 0);
     assert_checkpoint_viewport(&doc, 8190, 8, 0);
     assert_checkpoint_viewport(&doc, 0, 8, 0);
-    let tail = doc
-        .read_viewport(ViewportRequest::new(100_019, 4).with_columns(0, 16))
-        .unwrap();
+    let tail = doc.read_viewport(ViewportRequest::new(100_019, 4).with_columns(0, 16));
     assert!(tail.rows().iter().all(ViewportRow::is_exact));
     assert!(tail.rows()[1..].iter().all(|row| row.text().is_empty()));
     assert!(!doc.has_edit_buffer());
@@ -3276,10 +3262,7 @@ fn partial_piece_table_line_reads_follow_current_text_after_prefix_edit() {
     let cursor = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
     assert_eq!(cursor, (1, 0));
     assert!(doc.piece_table.is_some());
-    assert!(doc
-        .text_lossy()
-        .unwrap()
-        .starts_with("TOP\nzero\none\ntwo\nthree\n"));
+    assert!(doc.text_lossy().starts_with("TOP\nzero\none\ntwo\nthree\n"));
 
     let slice = doc.line_slice(3, 0, 16);
     assert_eq!(slice.text(), "two");
@@ -3289,9 +3272,7 @@ fn partial_piece_table_line_reads_follow_current_text_after_prefix_edit() {
     let texts: Vec<String> = slices.into_iter().map(LineSlice::into_text).collect();
     assert_eq!(texts, vec!["one", "two", "three"]);
 
-    let text = doc
-        .read_text(TextRange::new(TextPosition::new(3, 0), 3))
-        .unwrap();
+    let text = doc.read_text(TextRange::new(TextPosition::new(3, 0), 3));
     assert_eq!(text.text(), "two");
     assert!(text.is_exact());
 
@@ -3542,15 +3523,13 @@ fn partial_piece_table_find_next_can_start_on_scannable_incomplete_line() {
 
     let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
 
-    let visible = doc
-        .read_text(TextRange::new(TextPosition::new(2, 0), 6))
-        .unwrap();
+    let visible = doc.read_text(TextRange::new(TextPosition::new(2, 0), 6));
     assert_eq!(visible.text(), "target");
 
     let found = doc.find_next("target", TextPosition::new(2, 0)).unwrap();
     assert_eq!(found.start(), TextPosition::new(2, 0));
     assert_eq!(found.end(), TextPosition::new(2, 6));
-    let found_text = doc.read_text(found.range()).unwrap();
+    let found_text = doc.read_text(found.range());
     assert_eq!(found_text.text(), "target");
     assert!(found_text.is_exact());
 
@@ -3619,9 +3598,7 @@ fn partial_piece_table_line_slice_stays_exact_on_scannable_incomplete_prefix() {
     assert_eq!(batch[0].text(), "target");
     assert!(batch[0].is_exact());
 
-    let viewport = doc
-        .read_viewport(ViewportRequest::new(2, 1).with_columns(0, 6))
-        .unwrap();
+    let viewport = doc.read_viewport(ViewportRequest::new(2, 1).with_columns(0, 6));
     assert_eq!(viewport.rows()[0].text(), "target");
     assert!(viewport.rows()[0].is_exact());
 }
@@ -3717,15 +3694,11 @@ fn partial_piece_table_empty_typed_reads_stay_exact_on_scannable_incomplete_line
 
     let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
 
-    let slice = doc
-        .read_text(TextRange::new(TextPosition::new(2, 0), 0))
-        .unwrap();
+    let slice = doc.read_text(TextRange::new(TextPosition::new(2, 0), 0));
     assert_eq!(slice.text(), "");
     assert!(slice.is_exact());
 
-    let selection = doc
-        .read_selection(TextSelection::caret(TextPosition::new(2, 0)))
-        .unwrap();
+    let selection = doc.read_selection(TextSelection::caret(TextPosition::new(2, 0)));
     assert_eq!(selection.text(), "");
     assert!(selection.is_exact());
 }
@@ -3770,12 +3743,10 @@ fn selection_read_stays_exact_when_partial_piece_table_head_is_scannable_incompl
 
     let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
 
-    let slice = doc
-        .read_selection(TextSelection::new(
-            TextPosition::new(1, 0),
-            TextPosition::new(2, 6),
-        ))
-        .unwrap();
+    let slice = doc.read_selection(TextSelection::new(
+        TextPosition::new(1, 0),
+        TextPosition::new(2, 6),
+    ));
     assert_eq!(slice.text(), "zero\ntarget");
     assert!(slice.is_exact());
 }
@@ -3821,10 +3792,8 @@ fn typed_range_read_matches_selection_exactness_on_scannable_incomplete_partial_
     let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
 
     let selection = TextSelection::new(TextPosition::new(1, 0), TextPosition::new(2, 6));
-    let selected = doc.read_selection(selection).unwrap();
-    let ranged = doc
-        .read_text(doc.text_range_for_selection(selection))
-        .unwrap();
+    let selected = doc.read_selection(selection);
+    let ranged = doc.read_text(doc.text_range_for_selection(selection));
 
     assert_eq!(ranged.text(), selected.text());
     assert_eq!(ranged.is_exact(), selected.is_exact());
@@ -4033,9 +4002,7 @@ fn partial_piece_table_line_slices_do_not_invent_trailing_empty_line_without_new
     assert_eq!(slices[1].text(), "");
     assert!(!slices[1].is_exact());
 
-    let viewport = doc
-        .read_viewport(ViewportRequest::new(1, 2).with_columns(0, 16))
-        .unwrap();
+    let viewport = doc.read_viewport(ViewportRequest::new(1, 2).with_columns(0, 16));
     assert_eq!(viewport.rows()[0].text(), "xxxxxxxxxxxxxxxx");
     assert!(viewport.rows()[0].is_exact());
     assert_eq!(viewport.rows()[1].text(), "");
@@ -4139,15 +4106,15 @@ fn raw_rope_edit_helpers_clamp_out_of_range_line_indices() {
 
     let cursor = doc.try_insert_text_at(99, 0, ">>").unwrap();
     assert_eq!(cursor, (1, 2));
-    assert_eq!(doc.text_lossy().unwrap(), "hello\n>>world");
+    assert_eq!(doc.text_lossy(), "hello\n>>world");
 
     let cursor = doc.try_replace_range(99, 2, 3, "X").unwrap();
     assert_eq!(cursor, (1, 3));
-    assert_eq!(doc.text_lossy().unwrap(), "hello\n>>Xld");
+    assert_eq!(doc.text_lossy(), "hello\n>>Xld");
 
     let backspace = doc.try_backspace_at(99, 3).unwrap();
     assert_eq!(backspace, (true, 1, 2));
-    assert_eq!(doc.text_lossy().unwrap(), "hello\n>>ld");
+    assert_eq!(doc.text_lossy(), "hello\n>>ld");
 }
 
 #[test]
@@ -4158,7 +4125,7 @@ fn replace_range_updates_rope_backed_documents() {
     let cursor = doc.try_replace_range(0, 6, 5, "qem").unwrap();
 
     assert_eq!(cursor, (0, 9));
-    assert_eq!(doc.text_lossy().unwrap(), "hello qem");
+    assert_eq!(doc.text_lossy(), "hello qem");
 }
 
 #[test]
@@ -4172,7 +4139,7 @@ fn replace_range_updates_piece_table_backed_documents() {
     let cursor = doc.try_replace_range(0, 0, 3, "XYZ").unwrap();
 
     assert_eq!(cursor, (0, 3));
-    assert!(doc.text_lossy().unwrap().starts_with("XYZ\ndef\n"));
+    assert!(doc.text_lossy().starts_with("XYZ\ndef\n"));
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
@@ -4193,7 +4160,7 @@ fn raw_piece_table_replace_range_clamps_out_of_range_line_indices() {
     let last_line0 = repeat.saturating_mul(2);
     assert_eq!(cursor, (last_line0, 4));
     assert!(doc.has_piece_table());
-    assert!(doc.text_lossy().unwrap().ends_with("taXX"));
+    assert!(doc.text_lossy().ends_with("taXX"));
 }
 
 #[test]
@@ -4209,7 +4176,7 @@ fn empty_insert_keeps_mmap_document_clean_and_unmaterialized() {
     assert_eq!(cursor, (0, 0));
     assert!(!doc.is_dirty());
     assert!(!doc.has_edit_buffer());
-    assert!(doc.text_lossy().unwrap().starts_with("abc\ndef\n"));
+    assert!(doc.text_lossy().starts_with("abc\ndef\n"));
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
@@ -4228,7 +4195,7 @@ fn empty_replace_keeps_mmap_document_clean_and_unmaterialized() {
     assert_eq!(cursor, (0, 0));
     assert!(!doc.is_dirty());
     assert!(!doc.has_edit_buffer());
-    assert!(doc.text_lossy().unwrap().starts_with("abc\ndef\n"));
+    assert!(doc.text_lossy().starts_with("abc\ndef\n"));
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
@@ -4243,7 +4210,7 @@ fn replace_same_text_keeps_clean_rope_document_clean() {
     let cursor = doc.try_replace_range(0, 6, 5, "world").unwrap();
 
     assert_eq!(cursor, (0, 11));
-    assert_eq!(doc.text_lossy().unwrap(), "hello world");
+    assert_eq!(doc.text_lossy(), "hello world");
     assert!(!doc.is_dirty());
 }
 
@@ -4264,7 +4231,7 @@ fn replace_same_text_keeps_clean_piece_table_document_clean() {
     let cursor = doc.try_replace_range(0, 0, 3, "123").unwrap();
 
     assert_eq!(cursor, (0, 3));
-    assert!(doc.text_lossy().unwrap().starts_with("123abc\ndef\n"));
+    assert!(doc.text_lossy().starts_with("123abc\ndef\n"));
     assert!(!doc.is_dirty());
 
     let _ = std::fs::remove_file(&path);
@@ -4517,7 +4484,7 @@ fn save_to_reopens_large_piece_table_documents_clean() {
     assert!(!doc.is_dirty());
     assert!(!doc.has_edit_buffer());
     assert_eq!(doc.backing(), DocumentBacking::Mmap);
-    assert!(doc.text_lossy().unwrap().starts_with("123abc\ndef\n"));
+    assert!(doc.text_lossy().starts_with("123abc\ndef\n"));
     assert!(std::fs::read(&dst).unwrap().starts_with(b"123abc\ndef\n"));
 
     let _ = std::fs::remove_file(&src);
@@ -4559,10 +4526,7 @@ fn piece_table_save_to_rebases_future_recovery_to_saved_path() {
 
     assert!(reopened.is_dirty());
     assert!(reopened.has_piece_table());
-    assert!(reopened
-        .text_lossy()
-        .unwrap()
-        .starts_with("XYZ123abc\ndef\n"));
+    assert!(reopened.text_lossy().starts_with("XYZ123abc\ndef\n"));
 
     clear_session_sidecar(&dst);
     let _ = std::fs::remove_file(&src);
@@ -4609,7 +4573,7 @@ fn piece_table_save_as_reopen_failure_keeps_old_recovery_sidecar() {
     assert_eq!(doc.path(), Some(src.as_path()));
     assert!(doc.is_dirty());
     assert!(doc.has_piece_table());
-    assert!(doc.text_lossy().unwrap().starts_with("123abc\ndef\n"));
+    assert!(doc.text_lossy().starts_with("123abc\ndef\n"));
     assert!(
         editlog_path(&src).exists(),
         "failed save-as reopen should keep the old recoverable sidecar"
@@ -4652,7 +4616,7 @@ fn piece_table_same_path_save_reopen_failure_restores_recovery_sidecar() {
     assert_eq!(doc.path(), Some(path.as_path()));
     assert!(doc.is_dirty());
     assert!(doc.has_piece_table());
-    assert!(doc.text_lossy().unwrap().starts_with("123abc\ndef\n"));
+    assert!(doc.text_lossy().starts_with("123abc\ndef\n"));
     assert!(
         sidecar.exists(),
         "failed same-path reopen should restore recoverable sidecar"
@@ -4752,7 +4716,7 @@ fn piece_table_save_to_with_encoding_reopens_as_class_a_native_contract() {
     // windows-1251 (Class A) re-opens through the native mmap
     // path with no rope or piece-table backing.
     assert!(!doc.has_rope() && !doc.has_piece_table() && doc.encoding() == encoding);
-    assert!(doc.text_lossy().unwrap().starts_with(insert_hello));
+    assert!(doc.text_lossy().starts_with(insert_hello));
     assert!(!editlog_path(&src).exists());
     assert!(!editlog_path(&dst).exists());
 
@@ -4797,7 +4761,7 @@ fn open_recovers_piece_table_session_from_editlog() {
         recovered.encoding_origin(),
         DocumentEncodingOrigin::Utf8FastPath
     );
-    assert!(recovered.text_lossy().unwrap().starts_with("123abc\ndef\n"));
+    assert!(recovered.text_lossy().starts_with("123abc\ndef\n"));
 
     clear_session_sidecar(&path);
     let _ = std::fs::remove_file(&path);
@@ -4834,7 +4798,7 @@ fn recovered_piece_table_session_preserves_utf8_autodetect_origin() {
         DocumentEncodingOrigin::AutoDetectFallbackUtf8
     );
     assert!(!recovered.decoding_had_errors());
-    assert!(recovered.text_lossy().unwrap().starts_with("123abc\ndef\n"));
+    assert!(recovered.text_lossy().starts_with("123abc\ndef\n"));
 
     clear_session_sidecar(&path);
     let _ = std::fs::remove_file(&path);
@@ -4873,7 +4837,7 @@ fn recovered_piece_table_session_preserves_utf8_save_conversion_origin() {
         DocumentEncodingOrigin::SaveConversion
     );
     assert!(!recovered.decoding_had_errors());
-    assert!(recovered.text_lossy().unwrap().starts_with("123abc\ndef\n"));
+    assert!(recovered.text_lossy().starts_with("123abc\ndef\n"));
 
     clear_session_sidecar(&path);
     let _ = std::fs::remove_file(&path);
@@ -4905,7 +4869,7 @@ fn open_discards_corrupt_editlog_sidecar_and_falls_back_to_clean_document() {
     assert!(!reopened.has_piece_table());
     assert_eq!(reopened.backing(), DocumentBacking::Mmap);
     assert!(
-        reopened.text_lossy().unwrap().starts_with("abc\ndef\n"),
+        reopened.text_lossy().starts_with("abc\ndef\n"),
         "corrupt session should fall back to the clean source text"
     );
     assert!(
@@ -5019,7 +4983,7 @@ fn editlog_flush_failure_surfaces_error_and_falls_back_to_memory() {
     assert!(matches!(err, Err(DocumentError::Write { .. })));
 
     let _ = doc.try_insert_text_at(0, 3, "X").unwrap();
-    assert!(doc.text_lossy().unwrap().starts_with("123Xabc\ndef\n"));
+    assert!(doc.text_lossy().starts_with("123Xabc\ndef\n"));
     assert!(
         doc.flush_session().is_ok(),
         "in-memory fallback should stop retrying failed persistence"
@@ -5089,7 +5053,7 @@ fn scheduled_editlog_flush_failure_does_not_rollback_piece_table_edit() {
 
     let cursor = doc.try_insert_text_at(0, 3, "X").unwrap();
     assert_eq!(cursor, (0, 4));
-    assert!(doc.text_lossy().unwrap().starts_with("123Xabc\ndef\n"));
+    assert!(doc.text_lossy().starts_with("123Xabc\ndef\n"));
     assert!(
         doc.flush_session().is_ok(),
         "scheduled flush failure should already detach persistence and keep future flushes in-memory"
@@ -5144,10 +5108,7 @@ fn first_edit_after_persistence_failure_lands_in_resident_window() {
     assert_eq!(cursor, (0, 4));
     let mut expected_x = expected.clone();
     expected_x.insert(3, b'X');
-    assert_eq!(
-        doc.text_lossy().unwrap(),
-        String::from_utf8_lossy(&expected_x)
-    );
+    assert_eq!(doc.text_lossy(), String::from_utf8_lossy(&expected_x));
 
     // The flush is still deferred and the disk is still down: the
     // second edit lands through the resident window too.
@@ -5159,10 +5120,7 @@ fn first_edit_after_persistence_failure_lands_in_resident_window() {
     assert!(doc.is_dirty(), "landed edits must report dirty");
     let mut expected_xy = expected_x.clone();
     expected_xy.insert(4, b'Y');
-    assert_eq!(
-        doc.text_lossy().unwrap(),
-        String::from_utf8_lossy(&expected_xy)
-    );
+    assert_eq!(doc.text_lossy(), String::from_utf8_lossy(&expected_xy));
 
     // Undo stays coherent while persistence is down: undoing drops the
     // last landed edit and nothing else.
@@ -5171,10 +5129,7 @@ fn first_edit_after_persistence_failure_lands_in_resident_window() {
         piece_table.last_session_flush = Some(Instant::now());
     }
     assert!(doc.try_undo().unwrap());
-    assert_eq!(
-        doc.text_lossy().unwrap(),
-        String::from_utf8_lossy(&expected_x)
-    );
+    assert_eq!(doc.text_lossy(), String::from_utf8_lossy(&expected_x));
 
     // The forced flush reports the real disk failure once, detaches
     // persistence, and the in-memory fallback keeps accepting edits
@@ -5187,10 +5142,7 @@ fn first_edit_after_persistence_failure_lands_in_resident_window() {
         "in-memory fallback should stop retrying failed persistence"
     );
     let _ = doc.try_insert_text_at(0, 4, "Y").unwrap();
-    assert_eq!(
-        doc.text_lossy().unwrap(),
-        String::from_utf8_lossy(&expected_xy)
-    );
+    assert_eq!(doc.text_lossy(), String::from_utf8_lossy(&expected_xy));
 
     clear_session_sidecar(&path);
     let _ = std::fs::remove_file(&path);
@@ -5254,19 +5206,13 @@ fn replace_batch_partial_land_reports_dirty() {
     // insert "Q" absent)...
     let mut expected = original.clone();
     expected.drain(16_000..16_002);
-    assert_eq!(
-        doc.text_lossy().unwrap(),
-        String::from_utf8_lossy(&expected)
-    );
-    assert!(!doc.text_lossy().unwrap().contains('Q'));
+    assert_eq!(doc.text_lossy(), String::from_utf8_lossy(&expected));
+    assert!(!doc.text_lossy().contains('Q'));
 
     // ...and the deletion stays undoable: the first undo restores the
     // pre-replace content.
     assert!(doc.try_undo().unwrap());
-    assert_eq!(
-        doc.text_lossy().unwrap(),
-        String::from_utf8_lossy(&original)
-    );
+    assert_eq!(doc.text_lossy(), String::from_utf8_lossy(&original));
 
     clear_session_sidecar(&path);
     let _ = std::fs::remove_file(&path);
@@ -5302,7 +5248,7 @@ fn refused_delete_surfaces_error_and_keeps_document_clean() {
         );
     }
 
-    let expected = doc.text_lossy().unwrap();
+    let expected = doc.text_lossy();
 
     let delete_result = doc.try_delete_forward_at(0, 0);
     assert!(
@@ -5313,7 +5259,7 @@ fn refused_delete_surfaces_error_and_keeps_document_clean() {
         !doc.is_dirty(),
         "a refused delete changed nothing and must not report the document modified"
     );
-    assert_eq!(doc.text_lossy().unwrap(), expected);
+    assert_eq!(doc.text_lossy(), expected);
 
     let backspace_result = doc.try_backspace_at(0, 1);
     assert!(
@@ -5324,7 +5270,7 @@ fn refused_delete_surfaces_error_and_keeps_document_clean() {
         !doc.is_dirty(),
         "a refused backspace changed nothing and must not report the document modified"
     );
-    assert_eq!(doc.text_lossy().unwrap(), expected);
+    assert_eq!(doc.text_lossy(), expected);
 
     clear_session_sidecar(&path);
     let _ = std::fs::remove_file(&path);
@@ -5338,8 +5284,8 @@ fn save_with_failed_persistence_streams_complete_content() {
     // pipeline's forced-compaction pass rewrites the live root via
     // `replace_current_root_with_pieces`. The rewritten root must obey
     // the same resident-window contract as insert/delete: a root that
-    // references pages the window refused reads back as a typed error
-    // (the honest read walkers refuse an unreadable page) — the page lingers in
+    // references pages the window refused reads back silently truncated
+    // (`visit_range_ref` skips unreadable pages) — the page lingers in
     // the small editlog read cache at first, but as soon as later
     // refusals evict it the document reads back empty and the save
     // streamer would persist that truncation as a "successful" save.
@@ -5393,7 +5339,7 @@ fn save_with_failed_persistence_streams_complete_content() {
     // cache has been churned past its bound by refused edits (each
     // refusal still allocates candidate pages, evicting the pages the
     // old LRU cache was hiding behind).
-    assert_eq!(doc.text_lossy().unwrap(), expected_text);
+    assert_eq!(doc.text_lossy(), expected_text);
     {
         let piece_table = doc.piece_table.as_mut().expect("piece table expected");
         for _ in 0..(crate::piece_tree::EDITLOG_READ_CACHE_PAGES_FOR_TEST * 2) {
@@ -5401,7 +5347,7 @@ fn save_with_failed_persistence_streams_complete_content() {
         }
     }
     assert_eq!(
-        doc.text_lossy().unwrap(),
+        doc.text_lossy(),
         expected_text,
         "the document must read back complete after refused edits churn the page cache"
     );
@@ -5423,15 +5369,15 @@ fn save_with_failed_persistence_streams_complete_content() {
 #[test]
 fn recovered_session_reads_fail_typed_when_a_piece_page_is_unreadable() {
     // A piece page that stops passing its CRC after a successful open
-    // answers `None` to every lazy reader, and the read walkers used to
-    // silently skip the subtree: the read came back shortened behind the
-    // advertised `total_len` with no error. Open-time verification only
-    // covers the root the session reopens with, so this test hides the
-    // corruption in a root that `undo` restores: piece page 1 is the
-    // pre-edit leaf that the live (post-edit) root no longer references.
-    // After the undo, every document read (`text_lossy` / `read_text` /
-    // `read_viewport`) must surface a typed read error instead of
-    // quietly returning truncated content.
+    // answers `None` to every lazy reader, and the frozen infallible read
+    // surface (`text_lossy` / `read_text` / `read_viewport`) degrades
+    // best-effort behind the advertised `total_len`. The honest contract
+    // lives on the additive `*_result` read methods: they must surface a
+    // typed [`DocumentReadError`] instead of quietly returning truncated
+    // content. Open-time verification only covers the root the session
+    // reopens with, so this test hides the corruption in a root that
+    // `undo` restores: piece page 1 is the pre-edit leaf that the live
+    // (post-edit) root no longer references.
     let dir = std::env::temp_dir().join(format!(
         "qem-doc-unreadable-page-read-{}",
         std::process::id()
@@ -5475,7 +5421,7 @@ fn recovered_session_reads_fail_typed_when_a_piece_page_is_unreadable() {
     let mut doc = Document::open(path.clone()).unwrap();
     assert!(doc.has_piece_table());
     assert_eq!(
-        doc.text_lossy().unwrap(),
+        doc.text_lossy_result().unwrap(),
         format!("123{source_text}"),
         "reads on the healthy live root must return the full session text"
     );
@@ -5485,25 +5431,25 @@ fn recovered_session_reads_fail_typed_when_a_piece_page_is_unreadable() {
     // leaves - a read shortened behind the root's advertised total_len.
     assert!(doc.try_undo().unwrap());
 
-    let lossy = doc.text_lossy();
+    let lossy = doc.text_lossy_result();
     assert!(
-        matches!(lossy, Err(DocumentError::Read { .. })),
-        "text_lossy must surface the unreadable piece page as a typed read \
-         error instead of a silently shortened document, got {lossy:?}"
+        matches!(lossy, Err(DocumentReadError { .. })),
+        "text_lossy_result must surface the unreadable piece page as a typed \
+         read error instead of a silently shortened document, got {lossy:?}"
     );
 
-    let read = doc.read_text(TextRange::new(TextPosition::new(0, 0), 8));
+    let read = doc.read_text_result(TextRange::new(TextPosition::new(0, 0), 8));
     assert!(
-        matches!(read, Err(DocumentError::Read { .. })),
-        "read_text must surface the unreadable piece page as a typed read \
-         error instead of a silently shortened slice, got {read:?}"
+        matches!(read, Err(DocumentReadError { .. })),
+        "read_text_result must surface the unreadable piece page as a typed \
+         read error instead of a silently shortened slice, got {read:?}"
     );
 
-    let viewport = doc.read_viewport(ViewportRequest::new(0, 4));
+    let viewport = doc.read_viewport_result(ViewportRequest::new(0, 4));
     assert!(
-        matches!(viewport, Err(DocumentError::Read { .. })),
-        "read_viewport must surface the unreadable piece page as a typed \
-         read error instead of silently empty rows, got {viewport:?}"
+        matches!(viewport, Err(DocumentReadError { .. })),
+        "read_viewport_result must surface the unreadable piece page as a \
+         typed read error instead of silently empty rows, got {viewport:?}"
     );
 
     clear_session_sidecar(&path);
@@ -5567,7 +5513,7 @@ fn literal_search_reads_complete_document_across_resident_window() {
         .map(|(i, _)| i + 1)
         .expect("fixture has at least 4000 lines");
     let expected = format!("{}XYZ{}", &base[..line_start], &base[line_start..]);
-    assert_eq!(doc.text_lossy().unwrap(), expected);
+    assert_eq!(doc.text_lossy(), expected);
 
     // Position oracle: byte offsets of the oracle string map onto
     // line/col the way the search API reports them.
@@ -5682,7 +5628,7 @@ fn class_b_regex_search_reads_complete_document_across_resident_window() {
         &content[..marker_byte],
         &content[marker_byte..]
     );
-    assert_eq!(doc.text_lossy().unwrap(), expected);
+    assert_eq!(doc.text_lossy(), expected);
 
     // Tiny regex windows force the chunked scan to cross the
     // disk/resident page split many times.
@@ -5727,9 +5673,9 @@ fn recovered_piece_table_session_supports_undo_and_redo() {
 
     let mut recovered = Document::open(path.clone()).unwrap();
     assert!(recovered.try_undo().unwrap());
-    assert!(recovered.text_lossy().unwrap().starts_with("abc\ndef\n"));
+    assert!(recovered.text_lossy().starts_with("abc\ndef\n"));
     assert!(recovered.try_redo().unwrap());
-    assert!(recovered.text_lossy().unwrap().starts_with("123abc\ndef\n"));
+    assert!(recovered.text_lossy().starts_with("123abc\ndef\n"));
 
     clear_session_sidecar(&path);
     let _ = std::fs::remove_file(&path);
@@ -5908,9 +5854,7 @@ fn typed_viewport_api_returns_rows_with_metadata() {
         .try_insert(TextPosition::new(0, 0), "zero\none\ntwo\n")
         .unwrap();
 
-    let viewport = doc
-        .read_viewport(ViewportRequest::new(1, 2).with_columns(0, 16))
-        .unwrap();
+    let viewport = doc.read_viewport(ViewportRequest::new(1, 2).with_columns(0, 16));
 
     assert_eq!(viewport.total_lines(), LineCount::Exact(4));
     assert_eq!(viewport.len(), 2);
@@ -5938,7 +5882,7 @@ fn typed_edit_helpers_wrap_existing_edit_semantics() {
     let result = doc.try_backspace(TextPosition::new(1, 4)).unwrap();
     assert!(result.changed());
     assert_eq!(result.cursor(), TextPosition::new(1, 3));
-    assert_eq!(doc.text_lossy().unwrap(), "alpha\nBET");
+    assert_eq!(doc.text_lossy(), "alpha\nBET");
 }
 
 #[test]
@@ -5951,7 +5895,7 @@ fn typed_delete_forward_wraps_existing_edit_semantics() {
     let result = doc.try_delete_forward(TextPosition::new(0, 5)).unwrap();
     assert!(result.changed());
     assert_eq!(result.cursor(), TextPosition::new(0, 5));
-    assert_eq!(doc.text_lossy().unwrap(), "alphabeta");
+    assert_eq!(doc.text_lossy(), "alphabeta");
 
     let at_end = doc.try_delete_forward(TextPosition::new(0, 9)).unwrap();
     assert!(!at_end.changed());
@@ -6042,7 +5986,7 @@ fn partial_piece_table_position_helpers_follow_current_text_after_prefix_edit() 
     assert_eq!(range.start(), TextPosition::new(3, 1));
     assert_eq!(range.len_chars(), 5);
 
-    let selected = doc.read_selection(selection).unwrap();
+    let selected = doc.read_selection(selection);
     assert!(selected.is_exact());
     assert_eq!(selected.text(), "wo\nth");
 }
@@ -6093,9 +6037,7 @@ fn partial_piece_table_clamp_position_preserves_scannable_lines_beyond_estimated
         TextPosition::new(2, 1)
     );
 
-    let slice = doc
-        .read_text(TextRange::new(TextPosition::new(2, 0), 1))
-        .unwrap();
+    let slice = doc.read_text(TextRange::new(TextPosition::new(2, 0), 1));
     assert_eq!(slice.text(), "c");
     assert!(slice.is_exact());
 }
@@ -6243,9 +6185,7 @@ fn typed_columns_count_combining_marks_as_separate_scalar_values() {
         2
     );
 
-    let viewport = doc
-        .read_viewport(ViewportRequest::new(0, 1).with_columns(1, 1))
-        .unwrap();
+    let viewport = doc.read_viewport(ViewportRequest::new(0, 1).with_columns(1, 1));
     assert_eq!(viewport.rows()[0].text(), "\u{0301}");
 }
 
@@ -6265,9 +6205,7 @@ fn typed_columns_count_wide_chars_as_single_scalar_values_not_display_cells() {
         2
     );
 
-    let viewport = doc
-        .read_viewport(ViewportRequest::new(0, 1).with_columns(1, 1))
-        .unwrap();
+    let viewport = doc.read_viewport(ViewportRequest::new(0, 1).with_columns(1, 1));
     assert_eq!(viewport.rows()[0].text(), "a");
 }
 
@@ -6279,12 +6217,12 @@ fn typed_text_reads_cover_ranges_and_selections() {
         .unwrap();
 
     let range = doc.text_range_between(TextPosition::new(0, 2), TextPosition::new(1, 2));
-    let slice = doc.read_text(range).unwrap();
+    let slice = doc.read_text(range);
     assert!(slice.is_exact());
     assert_eq!(slice.text(), "pha\nbe");
 
     let selection = TextSelection::new(TextPosition::new(2, 2), TextPosition::new(1, 1));
-    let selected = doc.read_selection(selection).unwrap();
+    let selected = doc.read_selection(selection);
     assert!(selected.is_exact());
     assert_eq!(selected.text(), "eta\nga");
 }
@@ -6328,12 +6266,10 @@ fn selection_read_is_inexact_when_partial_piece_table_head_is_unresolved() {
 
     let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
 
-    let slice = doc
-        .read_selection(TextSelection::new(
-            TextPosition::new(1, 0),
-            TextPosition::new(3, 2),
-        ))
-        .unwrap();
+    let slice = doc.read_selection(TextSelection::new(
+        TextPosition::new(1, 0),
+        TextPosition::new(3, 2),
+    ));
 
     assert!(!slice.is_exact());
     assert!(slice.text().starts_with("zero\n"));
@@ -6378,7 +6314,7 @@ fn selection_read_stays_exact_on_long_exact_partial_piece_table_line() {
         TextPosition::new(1, start_col),
         TextPosition::new(1, start_col.saturating_add(10)),
     );
-    let slice = doc.read_selection(selection).unwrap();
+    let slice = doc.read_selection(selection);
 
     assert!(slice.is_exact());
     assert_eq!(slice.text(), "xxxxtarget");
@@ -6421,9 +6357,7 @@ fn empty_range_read_is_inexact_when_partial_piece_table_start_is_unresolved() {
         dirty: false,
     };
 
-    let slice = doc
-        .read_text(TextRange::new(TextPosition::new(3, 0), 0))
-        .unwrap();
+    let slice = doc.read_text(TextRange::new(TextPosition::new(3, 0), 0));
 
     assert_eq!(slice.text(), "");
     assert!(!slice.is_exact());
@@ -6459,18 +6393,14 @@ fn incomplete_mmap_nonempty_range_read_past_eof_is_empty_and_inexact() {
         dirty: false,
     };
 
-    let slice = doc
-        .read_text(TextRange::new(TextPosition::new(99, 0), 3))
-        .unwrap();
+    let slice = doc.read_text(TextRange::new(TextPosition::new(99, 0), 3));
     assert_eq!(slice.text(), "");
     assert!(slice.is_exact());
 
-    let selection = doc
-        .read_selection(TextSelection::new(
-            TextPosition::new(99, 0),
-            TextPosition::new(99, 3),
-        ))
-        .unwrap();
+    let selection = doc.read_selection(TextSelection::new(
+        TextPosition::new(99, 0),
+        TextPosition::new(99, 3),
+    ));
     assert_eq!(selection.text(), "");
     assert!(selection.is_exact());
 }
@@ -6507,18 +6437,14 @@ fn incomplete_mmap_typed_read_uses_exact_start_offset_instead_of_heuristic_line_
         dirty: false,
     };
 
-    let slice = doc
-        .read_text(TextRange::new(TextPosition::new(1, 0), 3))
-        .unwrap();
+    let slice = doc.read_text(TextRange::new(TextPosition::new(1, 0), 3));
     assert_eq!(slice.text(), "one");
     assert!(slice.is_exact());
 
-    let selection = doc
-        .read_selection(TextSelection::new(
-            TextPosition::new(1, 0),
-            TextPosition::new(1, 3),
-        ))
-        .unwrap();
+    let selection = doc.read_selection(TextSelection::new(
+        TextPosition::new(1, 0),
+        TextPosition::new(1, 3),
+    ));
     assert_eq!(selection.text(), "one");
     assert!(selection.is_exact());
 }
@@ -6531,7 +6457,7 @@ fn typed_text_reads_preserve_crlf_in_clean_mmap_documents() {
 
     let doc = Document::open(&path).unwrap();
     let selection = TextSelection::new(TextPosition::new(0, 3), TextPosition::new(1, 2));
-    let slice = doc.read_selection(selection).unwrap();
+    let slice = doc.read_selection(selection);
 
     assert!(slice.is_exact());
     assert_eq!(slice.text(), "ha\r\nbe");
@@ -6544,12 +6470,10 @@ fn typed_slices_support_standard_str_ergonomics() {
         .try_insert(TextPosition::new(0, 0), "alpha\nbeta")
         .unwrap();
 
-    let text_slice = doc
-        .read_selection(TextSelection::new(
-            TextPosition::new(0, 1),
-            TextPosition::new(1, 2),
-        ))
-        .unwrap();
+    let text_slice = doc.read_selection(TextSelection::new(
+        TextPosition::new(0, 1),
+        TextPosition::new(1, 2),
+    ));
     assert_eq!(text_slice.as_ref(), "lpha\nbe");
     assert_eq!(&*text_slice, "lpha\nbe");
     assert_eq!(text_slice.to_string(), "lpha\nbe");
@@ -6576,9 +6500,7 @@ fn zero_width_line_reads_still_preserve_exactness_for_known_lines() {
     assert!(slices.iter().all(|slice| slice.text().is_empty()));
     assert!(slices.iter().all(LineSlice::is_exact));
 
-    let viewport = doc
-        .read_viewport(ViewportRequest::new(0, 2).with_columns(0, 0))
-        .unwrap();
+    let viewport = doc.read_viewport(ViewportRequest::new(0, 2).with_columns(0, 0));
     assert_eq!(viewport.rows().len(), 2);
     assert!(viewport.rows().iter().all(|row| row.text().is_empty()));
     assert!(viewport.rows().iter().all(ViewportRow::is_exact));
@@ -6595,7 +6517,7 @@ fn literal_search_finds_next_match_in_clean_mmap_document() {
 
     assert_eq!(found.start(), TextPosition::new(1, 0));
     assert_eq!(found.end(), TextPosition::new(1, 4));
-    assert_eq!(doc.read_text(found.range()).unwrap().text(), "beta");
+    assert_eq!(doc.read_text(found.range()).text(), "beta");
 
     let query = LiteralSearchQuery::new("beta").unwrap();
     let compiled = doc
@@ -6615,7 +6537,7 @@ fn literal_search_finds_next_match_in_rope_document() {
 
     assert_eq!(found.start(), TextPosition::new(3, 0));
     assert_eq!(found.end(), TextPosition::new(3, 4));
-    assert_eq!(doc.read_text(found.range()).unwrap().text(), "beta");
+    assert_eq!(doc.read_text(found.range()).text(), "beta");
 }
 
 #[test]
@@ -6636,10 +6558,7 @@ fn literal_search_finds_next_match_across_piece_table_boundary() {
 
     assert_eq!(found.start(), TextPosition::new(0, 0));
     assert_eq!(found.end(), TextPosition::new(0, 15));
-    assert_eq!(
-        doc.read_text(found.range()).unwrap().text(),
-        "[qem]0000target"
-    );
+    assert_eq!(doc.read_text(found.range()).text(), "[qem]0000target");
 }
 
 #[test]
@@ -6660,7 +6579,7 @@ fn literal_search_finds_next_match_from_nonzero_piece_table_anchor() {
 
     assert_eq!(found.start(), TextPosition::new(2, 8));
     assert_eq!(found.end(), TextPosition::new(2, 14));
-    assert_eq!(doc.read_text(found.range()).unwrap().text(), "target");
+    assert_eq!(doc.read_text(found.range()).text(), "target");
 }
 
 #[test]
@@ -6836,7 +6755,7 @@ fn inserted_utf16le_break_cells_survive_aliasing_characters() {
     // would land inside the wrong text. The cell-aware walk puts the
     // edit exactly between Y and Z.
     doc.try_insert_text_at(0, 3, "Q").unwrap();
-    let text = doc.text_lossy().unwrap();
+    let text = doc.text_lossy();
     let head: String = text.chars().take(6).collect();
     assert_eq!(head, "\u{4E0A}\u{0A41}XQYZ", "edit must land at column 3");
 
@@ -6931,7 +6850,7 @@ fn literal_search_finds_previous_match_with_end_before_boundary() {
 
     assert_eq!(found.start(), TextPosition::new(3, 0));
     assert_eq!(found.end(), TextPosition::new(3, 4));
-    assert_eq!(doc.read_text(found.range()).unwrap().text(), "beta");
+    assert_eq!(doc.read_text(found.range()).text(), "beta");
 
     let previous = doc.find_prev("beta", TextPosition::new(3, 0)).unwrap();
     assert_eq!(previous.start(), TextPosition::new(1, 0));
@@ -7217,7 +7136,7 @@ fn typed_delete_forward_treats_crlf_as_single_text_unit() {
 
     assert!(result.changed());
     assert_eq!(result.cursor(), TextPosition::new(0, 5));
-    assert_eq!(doc.text_lossy().unwrap(), "alphabeta\n");
+    assert_eq!(doc.text_lossy(), "alphabeta\n");
 }
 
 #[test]
@@ -7234,7 +7153,7 @@ fn typed_selection_delete_and_replace_helpers_work() {
 
     let cursor = doc.try_replace_selection(selection, "Z").unwrap();
     assert_eq!(cursor, TextPosition::new(0, 5));
-    assert_eq!(doc.text_lossy().unwrap(), "alphZta");
+    assert_eq!(doc.text_lossy(), "alphZta");
 
     let caret = TextSelection::caret(TextPosition::new(0, 3));
     let delete = doc.try_delete_selection(caret).unwrap();
@@ -7284,7 +7203,7 @@ fn selection_replace_promotes_partial_piece_table_before_clamping_unresolved_hea
 
     assert_eq!(cursor, TextPosition::new(0, 3));
     assert!(!doc.has_piece_table());
-    assert_eq!(doc.text_lossy().unwrap(), "zeZ\n");
+    assert_eq!(doc.text_lossy(), "zeZ\n");
 }
 
 #[test]
@@ -7351,21 +7270,21 @@ fn typed_selection_delete_commands_handle_caret_and_range() {
     let deleted = doc.try_delete_forward_selection(range_selection).unwrap();
     assert!(deleted.changed());
     assert_eq!(deleted.cursor(), TextPosition::new(0, 3));
-    assert_eq!(doc.text_lossy().unwrap(), "alpta");
+    assert_eq!(doc.text_lossy(), "alpta");
 
     let backspace = doc
         .try_backspace_selection(TextSelection::caret(TextPosition::new(0, 2)))
         .unwrap();
     assert!(backspace.changed());
     assert_eq!(backspace.cursor(), TextPosition::new(0, 1));
-    assert_eq!(doc.text_lossy().unwrap(), "apta");
+    assert_eq!(doc.text_lossy(), "apta");
 
     let forward = doc
         .try_delete_forward_selection(TextSelection::caret(TextPosition::new(0, 1)))
         .unwrap();
     assert!(forward.changed());
     assert_eq!(forward.cursor(), TextPosition::new(0, 1));
-    assert_eq!(doc.text_lossy().unwrap(), "ata");
+    assert_eq!(doc.text_lossy(), "ata");
 }
 
 #[test]
@@ -7381,7 +7300,7 @@ fn typed_cut_selection_returns_removed_text_and_cursor() {
     assert!(cut.changed());
     assert_eq!(cut.text(), "ha\nbe");
     assert_eq!(cut.cursor(), TextPosition::new(0, 3));
-    assert_eq!(doc.text_lossy().unwrap(), "alpta");
+    assert_eq!(doc.text_lossy(), "alpta");
 
     let caret = doc
         .try_cut_selection(TextSelection::caret(TextPosition::new(0, 1)))
@@ -7888,8 +7807,8 @@ proptest! {
         };
 
         prop_assert_eq!(reopened.line_ending(), detect_line_ending(rendered.as_bytes()));
-        prop_assert_eq!(reopened.text_lossy().unwrap(), rendered);
-        prop_assert_eq!(doc.text_lossy().unwrap(), live_text);
+        prop_assert_eq!(reopened.text_lossy(), rendered);
+        prop_assert_eq!(doc.text_lossy(), live_text);
     }
 }
 
@@ -7938,17 +7857,17 @@ proptest! {
             !recovered.has_rope(),
             "recovered document should keep the piece-table session"
         );
-        assert_eq!(recovered.text_lossy().unwrap(), expected);
+        assert_eq!(recovered.text_lossy(), expected);
 
         for state in states[..states.len().saturating_sub(1)].iter().rev() {
             assert!(recovered.try_undo().unwrap());
-            assert_eq!(recovered.text_lossy().unwrap(), *state);
+            assert_eq!(recovered.text_lossy(), *state);
         }
         assert!(!recovered.try_undo().unwrap());
 
         for state in states.iter().skip(1) {
             assert!(recovered.try_redo().unwrap());
-            assert_eq!(recovered.text_lossy().unwrap(), *state);
+            assert_eq!(recovered.text_lossy(), *state);
         }
         assert!(!recovered.try_redo().unwrap());
     }
@@ -7995,7 +7914,7 @@ proptest! {
             assert!(!doc.is_dirty());
             assert!(!doc.has_edit_buffer());
             assert_eq!(doc.backing(), DocumentBacking::Mmap);
-            assert_eq!(doc.text_lossy().unwrap(), expected);
+            assert_eq!(doc.text_lossy(), expected);
             assert_eq!(std::fs::read_to_string(&saved).unwrap(), expected);
             assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
             assert!(
@@ -8009,7 +7928,7 @@ proptest! {
         }
 
         let reopened = Document::open(saved.clone()).unwrap();
-        assert_eq!(reopened.text_lossy().unwrap(), expected);
+        assert_eq!(reopened.text_lossy(), expected);
         assert!(!reopened.is_dirty());
         assert!(!reopened.has_edit_buffer());
         assert!(
@@ -8368,9 +8287,7 @@ fn piece_table_undo_redo_restores_known_length_on_full_index() {
         // The trailing newline means the exact count includes one virtual
         // empty line after `TAIL`; the marker sits one above it.
         .saturating_sub(2);
-    let viewport = doc
-        .read_viewport(ViewportRequest::new(marker_line0, 1))
-        .unwrap();
+    let viewport = doc.read_viewport(ViewportRequest::new(marker_line0, 1));
     let row = viewport.rows().first().expect("marker line row");
     assert_eq!(
         row.text(),
@@ -8380,9 +8297,7 @@ fn piece_table_undo_redo_restores_known_length_on_full_index() {
 
     // The line/col → byte mapping clamps its backward scan at the known
     // region boundary; a stale boundary must not truncate the tail.
-    let tail = doc
-        .read_text(TextRange::new(TextPosition::new(marker_line0, 0), 4))
-        .unwrap();
+    let tail = doc.read_text(TextRange::new(TextPosition::new(marker_line0, 0), 4));
     assert_eq!(
         tail.text(),
         "TAIL",
@@ -8463,7 +8378,7 @@ fn non_utf8_piece_table_line_reads_decode_through_engine() {
     // Columns are bytes for Class A: 5 + 6 + 4 = 15 text units.
     assert_eq!(doc.line_len_chars(0), 15);
 
-    let slice = doc.read_viewport(ViewportRequest::new(0, 1)).unwrap();
+    let slice = doc.read_viewport(ViewportRequest::new(0, 1));
     assert_eq!(
         slice.rows().first().map(|r| r.text().to_owned()).as_deref(),
         Some("[qem]\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}!!!!")
@@ -8473,7 +8388,7 @@ fn non_utf8_piece_table_line_reads_decode_through_engine() {
     // columns are bytes, so the cursor and the rendered line are exact.
     let cursor = doc.try_insert(TextPosition::new(0, 5), "|").unwrap();
     assert_eq!(cursor, TextPosition::new(0, 6));
-    let slice = doc.read_viewport(ViewportRequest::new(0, 1)).unwrap();
+    let slice = doc.read_viewport(ViewportRequest::new(0, 1));
     assert_eq!(
         slice.rows().first().map(|r| r.text().to_owned()).as_deref(),
         Some("[qem]|\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}!!!!")
@@ -8544,18 +8459,18 @@ fn small_rope_document_undo_redo_round_trip() {
     let cursor = doc.try_insert(TextPosition::new(0, 0), "X").unwrap();
     assert_eq!(cursor, TextPosition::new(0, 1));
     assert!(doc.rope.is_some());
-    assert_eq!(doc.text_lossy().unwrap(), "Xalpha\nbeta\n");
+    assert_eq!(doc.text_lossy(), "Xalpha\nbeta\n");
 
     let undo = doc.try_undo_with_cursor().unwrap();
     assert!(undo.changed());
     assert_eq!(undo.cursor(), Some(TextPosition::new(0, 0)));
-    assert_eq!(doc.text_lossy().unwrap(), "alpha\nbeta\n");
+    assert_eq!(doc.text_lossy(), "alpha\nbeta\n");
     assert!(doc.is_dirty(), "undo keeps the document dirty");
 
     let redo = doc.try_redo_with_cursor().unwrap();
     assert!(redo.changed());
     assert_eq!(redo.cursor(), Some(TextPosition::new(0, 1)));
-    assert_eq!(doc.text_lossy().unwrap(), "Xalpha\nbeta\n");
+    assert_eq!(doc.text_lossy(), "Xalpha\nbeta\n");
 
     assert!(
         doc.try_undo().unwrap(),
@@ -8577,17 +8492,17 @@ fn untitled_document_undo_redo_round_trip() {
 
     doc.try_insert_text_at(0, 0, "hello").unwrap();
     doc.try_backspace_at(0, 5).unwrap();
-    assert_eq!(doc.text_lossy().unwrap(), "hell");
+    assert_eq!(doc.text_lossy(), "hell");
 
     let undo = doc.try_undo_with_cursor().unwrap();
     assert!(undo.changed());
     assert_eq!(undo.cursor(), Some(TextPosition::new(0, 5)));
-    assert_eq!(doc.text_lossy().unwrap(), "hello");
+    assert_eq!(doc.text_lossy(), "hello");
 
     let redo = doc.try_redo_with_cursor().unwrap();
     assert!(redo.changed());
     assert_eq!(redo.cursor(), Some(TextPosition::new(0, 4)));
-    assert_eq!(doc.text_lossy().unwrap(), "hell");
+    assert_eq!(doc.text_lossy(), "hell");
 }
 
 #[test]
@@ -8595,9 +8510,9 @@ fn fresh_edit_after_undo_drops_redo() {
     let mut doc = Document::new();
     doc.try_insert_text_at(0, 0, "ab").unwrap();
     assert!(doc.try_undo().unwrap());
-    assert_eq!(doc.text_lossy().unwrap(), "");
+    assert_eq!(doc.text_lossy(), "");
     doc.try_insert_text_at(0, 0, "c").unwrap();
-    assert_eq!(doc.text_lossy().unwrap(), "c");
+    assert_eq!(doc.text_lossy(), "c");
     assert!(
         !doc.try_redo().unwrap(),
         "redo stack must drop after a new edit"
@@ -8614,17 +8529,17 @@ fn composite_replace_range_undoes_in_one_step() {
     let mut doc = Document::open(&path).unwrap();
     let cursor = doc.try_replace_range(0, 0, 5, "omega").unwrap();
     assert_eq!(cursor, (0, 5));
-    assert_eq!(doc.text_lossy().unwrap(), "omega\nbeta\n");
+    assert_eq!(doc.text_lossy(), "omega\nbeta\n");
 
     let undo = doc.try_undo_with_cursor().unwrap();
     assert!(undo.changed());
-    assert_eq!(doc.text_lossy().unwrap(), "alpha\nbeta\n");
+    assert_eq!(doc.text_lossy(), "alpha\nbeta\n");
     assert_eq!(undo.cursor(), Some(TextPosition::new(0, 5)));
 
     let redo = doc.try_redo_with_cursor().unwrap();
     assert!(redo.changed());
     assert_eq!(redo.cursor(), Some(TextPosition::new(0, 5)));
-    assert_eq!(doc.text_lossy().unwrap(), "omega\nbeta\n");
+    assert_eq!(doc.text_lossy(), "omega\nbeta\n");
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
@@ -8636,18 +8551,18 @@ fn backspace_delete_forward_undo_round_trip() {
     doc.try_insert_text_at(0, 0, "abc\n").unwrap();
 
     doc.try_delete_forward_at(0, 0).unwrap();
-    assert_eq!(doc.text_lossy().unwrap(), "bc\n");
+    assert_eq!(doc.text_lossy(), "bc\n");
     doc.try_backspace_at(0, 1).unwrap();
-    assert_eq!(doc.text_lossy().unwrap(), "c\n");
+    assert_eq!(doc.text_lossy(), "c\n");
 
     assert!(doc.try_undo().unwrap());
-    assert_eq!(doc.text_lossy().unwrap(), "bc\n");
+    assert_eq!(doc.text_lossy(), "bc\n");
     assert!(doc.try_undo().unwrap());
-    assert_eq!(doc.text_lossy().unwrap(), "abc\n");
+    assert_eq!(doc.text_lossy(), "abc\n");
     assert!(doc.try_redo().unwrap());
-    assert_eq!(doc.text_lossy().unwrap(), "bc\n");
+    assert_eq!(doc.text_lossy(), "bc\n");
     assert!(doc.try_redo().unwrap());
-    assert_eq!(doc.text_lossy().unwrap(), "c\n");
+    assert_eq!(doc.text_lossy(), "c\n");
 }
 
 #[test]
@@ -8666,7 +8581,7 @@ fn rope_undo_survives_save_and_marks_dirty() {
 
     let undo = doc.try_undo_with_cursor().unwrap();
     assert!(undo.changed());
-    assert_eq!(doc.text_lossy().unwrap(), "alpha\nbeta\n");
+    assert_eq!(doc.text_lossy(), "alpha\nbeta\n");
     assert!(
         doc.is_dirty(),
         "undo after save re-marks the document dirty"
@@ -8711,11 +8626,11 @@ fn piece_table_promotion_rope_history_covers_post_promotion_edits() {
 
     // Post-promotion edits are undoable through rope history.
     doc.try_insert_text_at(0, 0, "Y").unwrap();
-    assert!(doc.text_lossy().unwrap().starts_with("YXabc\n"));
+    assert!(doc.text_lossy().starts_with("YXabc\n"));
     let undo = doc.try_undo_with_cursor().unwrap();
     assert!(undo.changed());
     assert_eq!(undo.cursor(), Some(TextPosition::new(0, 0)));
-    assert!(doc.text_lossy().unwrap().starts_with("Xabc\n"));
+    assert!(doc.text_lossy().starts_with("Xabc\n"));
 
     // Pre-promotion piece-tree history is intentionally not carried over.
     assert!(!doc.try_undo().unwrap());
@@ -9174,7 +9089,7 @@ fn class_b_native_open_counts_trailing_empty_line_like_utf8() {
     std::fs::write(&trailing, utf16le_encode("AB\n")).unwrap();
     let doc = Document::open_with_encoding(&trailing, DocumentEncoding::utf16le()).unwrap();
     wait_indexed(&doc);
-    assert_eq!(doc.text_lossy().unwrap(), "AB\n");
+    assert_eq!(doc.text_lossy(), "AB\n");
     assert_eq!(
         doc.display_line_count(),
         2,
@@ -9255,7 +9170,7 @@ fn utf16le_piece_table_split_stays_cell_aligned() {
     // Inserting at (0, 2) splits the original piece at byte offset 4.
     doc.try_insert_text_at(0, 2, "X").unwrap();
 
-    assert_eq!(doc.text_lossy().unwrap(), "A\u{C241}X\u{C280}\u{0180}B");
+    assert_eq!(doc.text_lossy(), "A\u{C241}X\u{C280}\u{0180}B");
     let piece_table = doc
         .piece_table
         .as_ref()
@@ -9350,7 +9265,7 @@ fn file_len_tracks_rope_backed_non_utf8_documents() {
     );
     doc.try_insert_text_at(0, 0, "XY").unwrap();
     assert_eq!(doc.file_len(), 7);
-    assert_eq!(doc.text_lossy().unwrap(), "XYA你好");
+    assert_eq!(doc.text_lossy(), "XYA你好");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

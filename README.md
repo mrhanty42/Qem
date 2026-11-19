@@ -15,12 +15,6 @@ mutations), so a frontend only has to render.
 > testing, and documentation. Technical decisions, review, and project
 > direction remain human-owned.
 
-## Status
-
-The public API described here is frozen as of 1.0.0 and follows the
-documented semver policy from that release onward. Remaining work items and
-post-1.0 candidates live in the [roadmap](ROADMAP.md).
-
 ## Features
 
 - Opens files of any size without materializing the whole document.
@@ -59,7 +53,7 @@ Native-route documents save and reopen at any size.
 
 ```toml
 [dependencies]
-qem = "1.0.0"
+qem = "1.0.1"
 ```
 
 The default features include the editor/session layer and automatic
@@ -67,7 +61,7 @@ temporary-directory selection. For the lower-level document engine only:
 
 ```toml
 [dependencies]
-qem = { version = "1.0.0", default-features = false }
+qem = { version = "1.0.1", default-features = false }
 ```
 
 ### Feature flags
@@ -94,12 +88,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new("huge.log");
     let mut document = Document::open(path)?;
 
-    // Reads fail typed when the backing cannot materialize the requested
-    // rows (for example a session sidecar page that no longer passes its
-    // checksum) instead of silently returning shortened content.
     let viewport = document.read_viewport(
         ViewportRequest::new(100_000, 30).with_columns(0, 160),
-    )?;
+    );
 
     for row in viewport.rows() {
         println!("{:>8}  {}", row.line_number(), row.text());
@@ -134,10 +125,10 @@ Clean large files stay on the mmap-oriented path while Qem indexes lines in
 the background. During indexing, `display_line_count()` is suitable for
 scrollbar sizing and `indexing_state()` reports progress. Reads should
 remain bounded through `read_viewport`, `read_text`, and `read_selection`.
-These reads return `Result`: when the piece-tree backing cannot materialize
-the requested bytes (a session sidecar page that no longer passes its
-checksum), they fail as a typed `DocumentError::Read` instead of silently
-returning content shortened behind the advertised document length.
+The additive `read_text_result`, `read_selection_result`,
+`read_viewport_result`, and `text_lossy_result` methods return a typed
+`DocumentReadError` when the backing cannot materialize the requested bytes
+(for example, a session sidecar page that no longer passes its checksum).
 
 Edits are accepted only when Qem can perform them within its safety limits.
 Frontends can query `edit_capability_at`, `edit_capability_for_range`, or

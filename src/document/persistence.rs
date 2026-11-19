@@ -451,8 +451,10 @@ impl Document {
 
     /// Honest save render: materializing the save content through an
     /// unreadable piece page fails the save typed instead of persisting a
-    /// silently shortened document.
-    fn rendered_text_for_save(&self) -> Result<String, DocumentError> {
+    /// silently shortened document. The typed read failure surfaces as the
+    /// write error of the save target (`DocumentError::Write`): the save
+    /// cannot honestly produce its bytes when the source page is unreadable.
+    fn rendered_text_for_save(&self, path: &Path) -> Result<String, DocumentError> {
         if let Some(rope) = &self.rope {
             return Ok(rope_text_with_line_endings(rope, self.line_ending));
         }
@@ -467,13 +469,19 @@ impl Document {
             if !self.encoding.is_utf8() {
                 let bytes = piece_table
                     .read_range_result(0, piece_table.total_len())
-                    .map_err(|source| piece_table.read_error(source))?;
+                    .map_err(|err| DocumentError::Write {
+                        path: path.to_path_buf(),
+                        source: err,
+                    })?;
                 let (decoded, _) = self.encoding.as_encoding().decode_with_bom_removal(&bytes);
                 return Ok(decoded.into_owned());
             }
             return piece_table
                 .to_string_lossy_result()
-                .map_err(|source| piece_table.read_error(source));
+                .map_err(|err| DocumentError::Write {
+                    path: path.to_path_buf(),
+                    source: err,
+                });
         }
         // Mmap-only Class A documents: decode through `encoding_rs` so that a
         // subsequent re-encode round-trips the original bytes.
@@ -492,7 +500,7 @@ impl Document {
         path: &Path,
         encoding: DocumentEncoding,
     ) -> Result<Vec<u8>, DocumentError> {
-        let rendered = self.rendered_text_for_save()?;
+        let rendered = self.rendered_text_for_save(path)?;
         encode_text_with_encoding(&rendered, encoding)
             .map_err(|reason| save_encoding_error(path, "save", encoding, reason))
     }
@@ -773,8 +781,12 @@ impl Document {
         let snapshot = if !explicit_conversion && encoding.is_utf8() && self.encoding.is_utf8() {
             if let Some(piece_table) = self.piece_table.as_ref() {
                 SaveSnapshot::PieceTable(
-                    PieceTableSnapshot::from_piece_table(piece_table)
-                        .map_err(|source| piece_table.read_error(source))?,
+                    PieceTableSnapshot::from_piece_table(piece_table).map_err(|err| {
+                        DocumentError::Write {
+                            path: path.to_path_buf(),
+                            source: err,
+                        }
+                    })?,
                 )
             } else if let Some(rope) = self.rope.as_ref() {
                 SaveSnapshot::Rope {
@@ -802,8 +814,12 @@ impl Document {
                 // `piece_table.to_string_lossy()` interprets raw legacy
                 // bytes as UTF-8.
                 SaveSnapshot::PieceTable(
-                    PieceTableSnapshot::from_piece_table(piece_table)
-                        .map_err(|source| piece_table.read_error(source))?,
+                    PieceTableSnapshot::from_piece_table(piece_table).map_err(|err| {
+                        DocumentError::Write {
+                            path: path.to_path_buf(),
+                            source: err,
+                        }
+                    })?,
                 )
             } else if let Some(storage) = self.storage.as_ref() {
                 // Class A / Class B native preserve-save: the document

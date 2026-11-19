@@ -189,9 +189,8 @@ impl DocumentSession {
     /// [`Document::text_lossy`]. This is an advanced convenience helper rather
     /// than the recommended UI path. Prefer `read_viewport(...)` or
     /// `read_text(...)` when a frontend only needs a visible window or a
-    /// bounded selection. Fails typed when the backing cannot materialize
-    /// the document bytes (see [`Document::text_lossy`]).
-    pub fn text(&self) -> Result<String, DocumentError> {
+    /// bounded selection.
+    pub fn text(&self) -> String {
         self.core.document().text_lossy()
     }
 
@@ -365,18 +364,12 @@ impl DocumentSession {
     }
 
     /// Reads a typed text range from the current document.
-    ///
-    /// Fails typed when the backing cannot materialize the requested bytes
-    /// (see [`Document::read_text`]).
-    pub fn read_text(&self, range: TextRange) -> Result<TextSlice, DocumentError> {
+    pub fn read_text(&self, range: TextRange) -> TextSlice {
         self.core.document().read_text(range)
     }
 
     /// Reads the current selection as a typed text slice.
-    ///
-    /// Fails typed when the backing cannot materialize the selected bytes
-    /// (see [`Document::read_selection`]).
-    pub fn read_selection(&self, selection: TextSelection) -> Result<TextSlice, DocumentError> {
+    pub fn read_selection(&self, selection: TextSelection) -> TextSlice {
         self.core.document().read_selection(selection)
     }
 
@@ -1163,10 +1156,7 @@ impl DocumentSession {
     }
 
     /// Reads a visible viewport directly from the current document.
-    ///
-    /// Fails typed when the backing cannot materialize the requested rows
-    /// (see [`Document::read_viewport`]).
-    pub fn read_viewport(&self, request: ViewportRequest) -> Result<Viewport, DocumentError> {
+    pub fn read_viewport(&self, request: ViewportRequest) -> Viewport {
         self.core.read_viewport(request)
     }
 }

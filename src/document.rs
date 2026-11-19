@@ -47,9 +47,10 @@ pub use search::{LiteralSearchIter, LiteralSearchQuery};
 pub use types::{
     ByteProgress, CutResult, DocumentBacking, DocumentEncoding, DocumentEncodingErrorKind,
     DocumentEncodingOrigin, DocumentError, DocumentMaintenanceStatus, DocumentOpenOptions,
-    DocumentSaveOptions, DocumentStatus, EditCapability, EditResult, LineCount, LineSlice,
-    MaintenanceAction, OpenEncodingPolicy, SaveEncodingPolicy, SearchMatch, TextPosition,
-    TextRange, TextSelection, TextSlice, UndoResult, Viewport, ViewportRequest, ViewportRow,
+    DocumentReadError, DocumentSaveOptions, DocumentStatus, EditCapability, EditResult, LineCount,
+    LineSlice, MaintenanceAction, OpenEncodingPolicy, SaveEncodingPolicy, SearchMatch,
+    TextPosition, TextRange, TextSelection, TextSlice, UndoResult, Viewport, ViewportRequest,
+    ViewportRow,
 };
 
 /// Hidden re-exports used by integration tests under `tests/encoding_engine/`.

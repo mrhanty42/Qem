@@ -673,13 +673,48 @@ impl Document {
     /// frontend path. Prefer viewport or typed range reads for large-file
     /// frontends that only need a visible window or a bounded selection.
     ///
-    /// Returns [`DocumentError::Read`] when the backing cannot materialize
-    /// the document bytes (for a piece-table backing: a piece page that no
-    /// longer loads from the session sidecar). A full-text materialization
-    /// must never come back silently shortened behind `total_len` — the
-    /// owner rule for every document read is "no silent truncation", so
-    /// this deliberately returns an error rather than a lossy-short text.
-    pub fn text_lossy(&self) -> Result<String, DocumentError> {
+    /// Degrades best-effort when the backing cannot materialize the document
+    /// bytes (see `text_lossy_result` for the typed error path).
+    pub fn text_lossy(&self) -> String {
+        if let Some(rope) = &self.rope {
+            return rope.to_string();
+        }
+        if let Some(piece_table) = &self.piece_table {
+            // A non-UTF-8 piece-tree holds raw target-encoding
+            // bytes from the encoded edit path. Decode
+            // them through `encoding_rs` instead of `from_utf8_lossy`
+            // so the returned `String` reflects the document's logical
+            // text rather than mojibake of the legacy bytes.
+            if !self.encoding.is_utf8() {
+                let bytes = piece_table.read_range(0, piece_table.total_len());
+                let (decoded, _) = self.encoding.as_encoding().decode_with_bom_removal(&bytes);
+                return decoded.into_owned();
+            }
+            return piece_table.to_string_lossy();
+        }
+        // Class A native open path: documents whose encoding is not UTF-8 are
+        // mmap-only with `rope: None` / `piece_table: None`, so the raw mmap
+        // bytes must be decoded through `encoding_rs` before they can be
+        // exposed as a Rust `String`. UTF-8 documents keep the
+        // existing `String::from_utf8_lossy` path so the byte sequence is
+        // preserved verbatim under valid UTF-8 input.
+        if !self.encoding.is_utf8() {
+            let (decoded, _) = self
+                .encoding
+                .as_encoding()
+                .decode_with_bom_removal(self.mmap_bytes());
+            return decoded.into_owned();
+        }
+        String::from_utf8_lossy(self.mmap_bytes()).to_string()
+    }
+
+    /// Honest full-text read: returns [`DocumentReadError`] when the backing
+    /// cannot materialize the document bytes (for a piece-table backing: a
+    /// piece page that no longer loads from the session sidecar). A
+    /// full-text materialization must never come back silently shortened
+    /// behind `total_len`; the frozen [`Document::text_lossy`] surface
+    /// degrades best-effort instead.
+    pub fn text_lossy_result(&self) -> Result<String, DocumentReadError> {
         if let Some(rope) = &self.rope {
             return Ok(rope.to_string());
         }

@@ -238,7 +238,7 @@ impl PieceTable {
         let pieces = self
             .pieces
             .to_vec_result()
-            .map_err(|source| DocumentError::Read {
+            .map_err(|source| DocumentError::Write {
                 path: session_sidecar_path(None, self.original.path()),
                 source,
             })?;
@@ -346,7 +346,7 @@ impl PieceTable {
             },
         );
         if let Err(source) = span_walk_complete {
-            return Err(DocumentError::Read {
+            return Err(DocumentError::Write {
                 path: session_sidecar_path(None, self.original.path()),
                 source,
             });
@@ -362,7 +362,7 @@ impl PieceTable {
         let mut all = self
             .pieces
             .to_vec_result()
-            .map_err(|source| DocumentError::Read {
+            .map_err(|source| DocumentError::Write {
                 path: session_sidecar_path(None, self.original.path()),
                 source,
             })?;
@@ -1008,9 +1008,18 @@ impl PieceTable {
         state.position()
     }
 
+    /// Legacy silent full-document materialization for the frozen
+    /// infallible [`Document::text_lossy`] read: a piece page that no
+    /// longer loads degrades to the readable prefix instead of failing.
+    /// See [`PieceTable::to_string_lossy_result`] for the honest typed
+    /// read used by `text_lossy_result` and the save path.
+    pub(crate) fn to_string_lossy(&self) -> String {
+        String::from_utf8_lossy(&self.read_range(0, self.total_len)).to_string()
+    }
+
     /// Honest full-document byte materialization for text reads. Fails
     /// typed when any piece page does not load; the caller surfaces
-    /// [`DocumentError::Read`] instead of a silently shortened document.
+    /// [`DocumentReadError`] instead of a silently shortened document.
     pub(crate) fn to_string_lossy_result(&self) -> io::Result<String> {
         let bytes = self.read_range_result(0, self.total_len)?;
         Ok(String::from_utf8_lossy(&bytes).to_string())
@@ -1090,17 +1099,18 @@ impl PieceTable {
     }
 
     /// Wraps a piece-tree read failure into the typed
-    /// [`DocumentError::Read`], naming the sidecar the unreadable page
-    /// lives in.
-    pub(super) fn read_error(&self, source: io::Error) -> DocumentError {
-        DocumentError::Read {
+    /// [`DocumentReadError`], naming the sidecar the unreadable page
+    /// lives in. Returned by the additive `*_result` read methods; the
+    /// frozen infallible read surface degrades best-effort instead.
+    pub(super) fn read_error(&self, source: io::Error) -> super::types::DocumentReadError {
+        super::types::DocumentReadError {
             path: session_sidecar_path(None, self.original.path()),
             source,
         }
     }
 
     /// Honest byte read: fails typed (as an `io::Error` the document layer
-    /// wraps into [`DocumentError::Read`]) when a piece page overlapping
+    /// wraps into [`DocumentReadError`]) when a piece page overlapping
     /// `[start, end)` does not load, instead of silently returning the
     /// readable prefix.
     pub(super) fn read_range_result(&self, start: usize, end: usize) -> io::Result<Vec<u8>> {

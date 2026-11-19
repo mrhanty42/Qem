@@ -750,10 +750,7 @@ impl SessionCore {
         }
     }
 
-    pub(super) fn read_viewport(
-        &self,
-        request: ViewportRequest,
-    ) -> Result<Viewport, DocumentError> {
+    pub(super) fn read_viewport(&self, request: ViewportRequest) -> Viewport {
         self.doc.read_viewport(request)
     }
 
@@ -837,8 +834,7 @@ fn background_issue_from_error(kind: BackgroundIssueKind, err: &DocumentError) -
     let (path, message) = match err {
         DocumentError::Open { path, source }
         | DocumentError::Map { path, source }
-        | DocumentError::Write { path, source }
-        | DocumentError::Read { path, source } => (path.clone(), source.to_string()),
+        | DocumentError::Write { path, source } => (path.clone(), source.to_string()),
         DocumentError::Encoding { path, reason, .. } => (path.clone(), reason.to_string()),
         DocumentError::EditUnsupported { path, reason } => {
             (path.clone().unwrap_or_default(), (*reason).to_string())

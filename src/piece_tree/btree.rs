@@ -324,7 +324,8 @@ impl PieceTree {
     /// Read walkers must never answer `None` quietly here: a skipped
     /// subtree would shorten the read behind the root's advertised
     /// `total_len`, so every read-time page miss becomes this error and
-    /// honest callers surface it all the way to `DocumentError::Read`.
+    /// honest callers surface it all the way to the additive `*_result`
+    /// read methods.
     pub(super) fn unreadable_page_error(page_id: u64) -> io::Error {
         io::Error::new(
             io::ErrorKind::InvalidData,

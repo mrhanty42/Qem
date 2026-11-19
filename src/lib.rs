@@ -8,13 +8,6 @@
 //!
 //! `Qem` is the project name, not an expanded acronym.
 //!
-//! # Stability
-//!
-//! As of 1.0.0 the public API documented here is frozen: post-1.0 releases
-//! follow semantic versioning, and breaking changes to the documented
-//! surface require a major version. The sidecar on-disk formats and the
-//! internal storage layout remain implementation details.
-//!
 //! # Picking the Right Layer
 //!
 //! - Use [`Document`] when your application already owns tab state, session
@@ -157,7 +150,7 @@
 //!         );
 //!     }
 //!
-//!     let viewport = session.read_viewport(ViewportRequest::new(0, 40).with_columns(0, 160))?;
+//!     let viewport = session.read_viewport(ViewportRequest::new(0, 40).with_columns(0, 160));
 //!     println!("scroll rows: {}", status.display_line_count());
 //!     println!("visible rows this frame: {}", viewport.len());
 //!
@@ -324,12 +317,12 @@ pub mod storage;
 pub use document::{
     ByteProgress, CompactionPolicy, CompactionRecommendation, CompactionUrgency, CutResult,
     Document, DocumentBacking, DocumentEncoding, DocumentEncodingErrorKind, DocumentEncodingOrigin,
-    DocumentError, DocumentMaintenanceStatus, DocumentOpenOptions, DocumentSaveOptions,
-    DocumentStatus, EditCapability, EditResult, FragmentationStats, IdleCompactionOutcome,
-    LineCount, LineEnding, LineSlice, LiteralSearchIter, LiteralSearchQuery, MaintenanceAction,
-    OpenEncodingPolicy, RegexCompileError, RegexSearchIter, RegexSearchQuery, SaveEncodingPolicy,
-    SearchMatch, TextPosition, TextRange, TextSelection, TextSlice, UndoResult, Viewport,
-    ViewportRequest, ViewportRow,
+    DocumentError, DocumentMaintenanceStatus, DocumentOpenOptions, DocumentReadError,
+    DocumentSaveOptions, DocumentStatus, EditCapability, EditResult, FragmentationStats,
+    IdleCompactionOutcome, LineCount, LineEnding, LineSlice, LiteralSearchIter, LiteralSearchQuery,
+    MaintenanceAction, OpenEncodingPolicy, RegexCompileError, RegexSearchIter, RegexSearchQuery,
+    SaveEncodingPolicy, SearchMatch, TextPosition, TextRange, TextSelection, TextSlice, UndoResult,
+    Viewport, ViewportRequest, ViewportRow,
 };
 #[cfg(feature = "editor")]
 pub use editor::{

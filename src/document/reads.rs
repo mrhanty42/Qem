@@ -267,6 +267,63 @@ fn next_piece_table_scan_line_range(
     })
 }
 
+fn scanned_piece_table_offset_for_position(
+    doc: &Document,
+    piece_table: &PieceTable,
+    position: TextPosition,
+) -> Option<(usize, bool)> {
+    if piece_table.full_index() || position.line0() < piece_table.line_count() {
+        let actual_col0 = position
+            .col0()
+            .min(piece_table.line_len_chars(position.line0()));
+        return Some((
+            piece_table.byte_offset_for_col(position.line0(), actual_col0),
+            true,
+        ));
+    }
+
+    let scan_start = piece_table.known_byte_len.min(piece_table.total_len());
+    let scan_end = scan_start
+        .saturating_add(PARTIAL_PIECE_TABLE_SCAN_BYTES)
+        .min(piece_table.total_len());
+    if scan_start >= scan_end {
+        return None;
+    }
+
+    let bytes = piece_table.read_range(scan_start, scan_end);
+    let buffer_reaches_eof = scan_end == piece_table.total_len();
+    let mut rel_start = 0usize;
+    let mut skip_lines = position.line0().saturating_sub(piece_table.line_count());
+    while skip_lines > 0 {
+        let scanned = next_piece_table_scan_line_range(
+            &bytes,
+            rel_start,
+            buffer_reaches_eof,
+            crate::document::utf16_break_cells(piece_table.engine().encoding().name()),
+        )?;
+        (scanned.range.1 > rel_start && scanned.complete).then_some(())?;
+        rel_start = scanned.range.1;
+        skip_lines -= 1;
+    }
+
+    let scanned = next_piece_table_scan_line_range(
+        &bytes,
+        rel_start,
+        buffer_reaches_eof,
+        crate::document::utf16_break_cells(piece_table.engine().encoding().name()),
+    )?;
+    let offset = byte_offset_for_text_col_with_engine(
+        &bytes,
+        scanned.range,
+        position.col0(),
+        piece_table.engine(),
+    );
+    Some((
+        scan_start.saturating_add(offset),
+        doc.piece_table_position_is_representable(piece_table, position),
+    ))
+}
+
 fn scanned_piece_table_offset_for_position_result(
     doc: &Document,
     piece_table: &PieceTable,
@@ -577,7 +634,7 @@ impl Document {
         line_count: usize,
         start_col: usize,
         max_cols: usize,
-    ) -> Result<Vec<LineSlice>, DocumentError> {
+    ) -> Result<Vec<LineSlice>, DocumentReadError> {
         let requested_end = first_line0.saturating_add(line_count);
         if piece_table.full_index() || requested_end <= piece_table.line_count() {
             return piece_table
@@ -745,7 +802,7 @@ impl Document {
         line_count: usize,
         start_col: usize,
         max_cols: usize,
-    ) -> Result<Option<Vec<LineSlice>>, DocumentError> {
+    ) -> Result<Option<Vec<LineSlice>>, DocumentReadError> {
         if line_count == 0 || first_line0 < piece_table.line_count() {
             return Ok(Some(Vec::new()));
         }
@@ -1077,7 +1134,36 @@ impl Document {
         piece_table: &PieceTable,
         start: TextPosition,
         len_chars: usize,
-    ) -> Result<TextSlice, DocumentError> {
+    ) -> TextSlice {
+        let Some((start_offset, exact_start)) =
+            scanned_piece_table_offset_for_position(self, piece_table, start)
+        else {
+            return TextSlice::new(String::new(), false);
+        };
+        // Engine-aware cell walking and decoding: the naive UTF-8 variants
+        // corrupted every non-UTF-8 piece-table read (U+FFFD garbage).
+        let engine = self.encoding_engine();
+        let end_offset =
+            piece_table.advance_offset_by_text_units_with_engine(start_offset, len_chars, engine);
+        let end =
+            piece_table.position_for_byte_offset_from(start_offset, start, end_offset, engine);
+        let exact_end = self.read_position_is_exact(end);
+        let bytes = piece_table.read_range(start_offset, end_offset);
+        TextSlice::new(
+            decode_window_for_engine(engine, &bytes),
+            exact_start && exact_end,
+        )
+    }
+
+    /// Honest typed read from the piece-table backing: fails with a
+    /// [`DocumentReadError`] when the requested span crosses an unreadable
+    /// piece page instead of silently returning a shortened slice.
+    fn read_text_from_piece_table_backing_result(
+        &self,
+        piece_table: &PieceTable,
+        start: TextPosition,
+        len_chars: usize,
+    ) -> Result<TextSlice, DocumentReadError> {
         let (start_offset, exact_start) =
             match scanned_piece_table_offset_for_position_result(self, piece_table, start)
                 .map_err(|source| piece_table.read_error(source))?
@@ -1179,7 +1265,7 @@ impl Document {
     ///
     /// Legacy best-effort wrapper: on a piece-table backing whose sidecar
     /// page no longer loads this degrades to inexact default rows instead
-    /// of failing. Use [`Document::read_viewport`] (or
+    /// of failing. Use [`Document::read_viewport_result`] (or
     /// [`Document::line_slices_result`]) for the honest typed read.
     pub fn line_slices(
         &self,
@@ -1201,7 +1287,7 @@ impl Document {
         line_count: usize,
         start_col: usize,
         max_cols: usize,
-    ) -> Result<Vec<LineSlice>, DocumentError> {
+    ) -> Result<Vec<LineSlice>, DocumentReadError> {
         if line_count == 0 {
             return Ok(Vec::new());
         }
@@ -1239,11 +1325,39 @@ impl Document {
     /// line yet, Qem may fall back to a heuristic start range and mark the
     /// returned slice as inexact.
     ///
-    /// Returns [`DocumentError::Read`] when the backing cannot materialize
-    /// the requested bytes (for a piece-table backing: a piece page that
-    /// no longer loads from the session sidecar). A read must never come
-    /// back silently shortened behind the advertised `total_len`.
-    pub fn read_text(&self, range: TextRange) -> Result<TextSlice, DocumentError> {
+    /// Degrades best-effort when the backing cannot materialize the requested
+    /// bytes (see `read_text_result` for the typed error path).
+    pub fn read_text(&self, range: TextRange) -> TextSlice {
+        let start = self.clamp_position(range.start());
+        if range.is_empty() {
+            if self.rope.is_some() || self.piece_table.is_some() {
+                return TextSlice::new(String::new(), self.read_position_is_exact(start));
+            }
+
+            let file_len = self.file_len.min(self.mmap_bytes().len());
+            let start_offset = self.mmap_byte_offset_for_position(start).min(file_len);
+            let exact = self.mmap_position_for_byte_offset(start_offset) == start;
+            return TextSlice::new(String::new(), exact);
+        }
+
+        if let Some(rope) = &self.rope {
+            return Self::read_text_from_rope_backing(rope, start, range.len_chars());
+        }
+
+        if let Some(piece_table) = &self.piece_table {
+            return self.read_text_from_piece_table_backing(piece_table, start, range.len_chars());
+        }
+
+        self.read_text_from_mmap_backing(start, range.len_chars())
+    }
+
+    /// Honest typed range read: returns [`DocumentReadError`] when the
+    /// backing cannot materialize the requested bytes (for a piece-table
+    /// backing: a piece page that no longer loads from the session
+    /// sidecar). A read must never come back silently shortened behind the
+    /// advertised `total_len`; the frozen [`Document::read_text`] surface
+    /// degrades best-effort instead.
+    pub fn read_text_result(&self, range: TextRange) -> Result<TextSlice, DocumentReadError> {
         let start = self.clamp_position(range.start());
         if range.is_empty() {
             if self.rope.is_some() || self.piece_table.is_some() {
@@ -1268,7 +1382,11 @@ impl Document {
         }
 
         if let Some(piece_table) = &self.piece_table {
-            return self.read_text_from_piece_table_backing(piece_table, start, range.len_chars());
+            return self.read_text_from_piece_table_backing_result(
+                piece_table,
+                start,
+                range.len_chars(),
+            );
         }
 
         Ok(self.read_text_from_mmap_backing(start, range.len_chars()))
@@ -1276,9 +1394,9 @@ impl Document {
 
     /// Reads the current selection as a typed text slice.
     ///
-    /// Returns [`DocumentError::Read`] when the backing cannot materialize
-    /// the selected bytes (see [`Document::read_text`]).
-    pub fn read_selection(&self, selection: TextSelection) -> Result<TextSlice, DocumentError> {
+    /// Degrades best-effort when the backing cannot materialize the requested
+    /// bytes (see `read_selection_result` for the typed error path).
+    pub fn read_selection(&self, selection: TextSelection) -> TextSlice {
         let selection = self.clamp_selection(selection);
         let piece_table_endpoints_exact = self
             .piece_table
@@ -1288,7 +1406,31 @@ impl Document {
                     && self.read_position_is_exact(selection.head())
             })
             .unwrap_or(true);
-        let slice = self.read_text(self.text_range_for_selection(selection))?;
+        let slice = self.read_text(self.text_range_for_selection(selection));
+        if !piece_table_endpoints_exact || self.selection_requires_piece_table_promotion(selection)
+        {
+            return TextSlice::new(slice.into_text(), false);
+        }
+        slice
+    }
+
+    /// Honest typed selection read: returns [`DocumentReadError`] when the
+    /// backing cannot materialize the selected bytes (see
+    /// [`Document::read_text_result`]).
+    pub fn read_selection_result(
+        &self,
+        selection: TextSelection,
+    ) -> Result<TextSlice, DocumentReadError> {
+        let selection = self.clamp_selection(selection);
+        let piece_table_endpoints_exact = self
+            .piece_table
+            .as_ref()
+            .map(|_| {
+                self.read_position_is_exact(selection.anchor())
+                    && self.read_position_is_exact(selection.head())
+            })
+            .unwrap_or(true);
+        let slice = self.read_text_result(self.text_range_for_selection(selection))?;
         if !piece_table_endpoints_exact || self.selection_requires_piece_table_promotion(selection)
         {
             return Ok(TextSlice::new(slice.into_text(), false));
@@ -1301,9 +1443,31 @@ impl Document {
     /// This is the intended frontend-facing API for scrollable viewers and
     /// editors that want to own their own cursor and scrollbar rendering.
     ///
-    /// Returns [`DocumentError::Read`] when the backing cannot materialize
-    /// the requested rows (see [`Document::read_text`]).
-    pub fn read_viewport(&self, request: ViewportRequest) -> Result<Viewport, DocumentError> {
+    /// Degrades best-effort when the backing cannot materialize the requested
+    /// rows (see `read_viewport_result` for the typed error path).
+    pub fn read_viewport(&self, request: ViewportRequest) -> Viewport {
+        let rows = self
+            .line_slices(
+                request.first_line0(),
+                request.line_count(),
+                request.start_col(),
+                request.max_cols(),
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(offset, slice)| ViewportRow::new(request.first_line0() + offset, slice))
+            .collect();
+        Viewport::new(request, self.line_count(), rows)
+    }
+
+    /// Honest typed viewport read: returns [`DocumentReadError`] when the
+    /// backing cannot materialize the requested rows (see
+    /// [`Document::read_text_result`]). The frozen [`Document::read_viewport`]
+    /// surface degrades best-effort instead.
+    pub fn read_viewport_result(
+        &self,
+        request: ViewportRequest,
+    ) -> Result<Viewport, DocumentReadError> {
         let rows = self
             .line_slices_result(
                 request.first_line0(),

@@ -571,7 +571,7 @@ fn check_viewport_and_line_bounds(
     // upper bound keeps the assertion meaningful even when an edit
     // sequence grows the document past the seed's line count.
     let request = ViewportRequest::new(0, total_lines.saturating_add(2));
-    let viewport = doc.read_viewport(request).unwrap();
+    let viewport = doc.read_viewport(request);
 
     for row in viewport.rows() {
         let line0 = row.line0();

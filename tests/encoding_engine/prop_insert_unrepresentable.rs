@@ -189,7 +189,7 @@ proptest! {
         );
         prop_assert!(!doc.is_dirty(), "freshly opened document must be clean");
 
-        let text_before = doc.text_lossy().unwrap();
+        let text_before = doc.text_lossy();
 
         let result = doc.try_insert(position, &payload);
 
@@ -254,7 +254,7 @@ proptest! {
              unrepresentable",
         );
 
-        let text_after = doc.text_lossy().unwrap();
+        let text_after = doc.text_lossy();
         prop_assert_eq!(
             &text_after,
             &text_before,

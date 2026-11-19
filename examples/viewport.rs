@@ -38,9 +38,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
-    let viewport = doc
-        .read_viewport(ViewportRequest::new(start_line0, line_count).with_columns(0, 160))
-        .unwrap();
+    let viewport =
+        doc.read_viewport(ViewportRequest::new(start_line0, line_count).with_columns(0, 160));
     for row in viewport.rows() {
         println!(
             "{:>8}: [{}] {}",

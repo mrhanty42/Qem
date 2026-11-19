@@ -123,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let viewport_line = options.viewport_anchor.resolve_line(display_line_count);
     let viewport_request = ViewportRequest::new(viewport_line, 120).with_columns(0, 160);
     let viewport_started = Instant::now();
-    let viewport = doc.read_viewport(viewport_request).unwrap();
+    let viewport = doc.read_viewport(viewport_request);
     let viewport_ms = millis(viewport_started.elapsed());
 
     let maintenance = doc.maintenance_status();

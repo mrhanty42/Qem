@@ -8,8 +8,8 @@ use eframe::egui::{
     RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, Vec2,
 };
 use qem::{
-    BackgroundActivity, DocumentEncoding, DocumentSession, LineCount, LiteralSearchQuery,
-    SearchMatch, TextPosition, TextSelection, Viewport, ViewportRequest,
+    BackgroundActivity, DocumentEncoding, DocumentSession, LiteralSearchQuery, SearchMatch,
+    TextPosition, TextSelection, ViewportRequest,
 };
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -1331,19 +1331,11 @@ impl EditorApp {
                     .active_selection()
                     .or_else(|| self.match_selection());
                 if let Some(selection) = selection {
-                    // Demo-level degradation: a typed read failure (an
-                    // unreadable session page) copies nothing and surfaces
-                    // through stderr instead of silently streaming a
-                    // shortened selection.
                     let text = self
                         .active_tab()
                         .session
                         .read_selection(selection)
-                        .map(|slice| slice.to_string())
-                        .unwrap_or_else(|err| {
-                            eprintln!("selection read failed: {err}");
-                            String::new()
-                        });
+                        .to_string();
                     ctx.copy_text(text);
                     self.active_tab_mut().notice = Notice::info("Copied selection");
                 } else {
@@ -1651,19 +1643,10 @@ impl EditorApp {
                         let first_line = tab.first_line;
                         let text_width = (local_viewport.width() - gutter_width - 14.0).max(64.0);
                         let visible_cols = (text_width / char_width) as usize;
-                        // Demo-level degradation: a typed read failure (an
-                        // unreadable session page) renders an empty viewport
-                        // for the frame and surfaces through stderr instead
-                        // of silently streaming shortened rows.
-                        let viewport_request = ViewportRequest::new(first_line, tab.visible_rows)
-                            .with_columns(0, visible_cols);
-                        let viewport =
-                            tab.session
-                                .read_viewport(viewport_request)
-                                .unwrap_or_else(|err| {
-                                    eprintln!("viewport read failed: {err}");
-                                    Viewport::new(viewport_request, LineCount::Exact(0), Vec::new())
-                                });
+                        let viewport = tab.session.read_viewport(
+                            ViewportRequest::new(first_line, tab.visible_rows)
+                                .with_columns(0, visible_cols),
+                        );
                         let rows = viewport.rows();
                         if let Some(target) = tab.pending_goto {
                             if rows

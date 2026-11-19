@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Additive typed-read surface next to the frozen infallible reads: the new
+  `read_text_result`, `read_selection_result`, `read_viewport_result`, and
+  `text_lossy_result` document methods return the new public
+  `DocumentReadError` when the backing cannot materialize the requested
+  bytes (for a piece-table backing: a session sidecar page that no longer
+  loads), instead of degrading best-effort the way the frozen 1.0.0
+  surface (`text_lossy`, `read_text`, `read_selection`, `read_viewport`)
+  documents. The frozen signatures are unchanged, so this is additive.
+- An internal honest read contour behind those methods: piece-tree read
+  walkers and piece-table byte materialization fail typed on an unreadable
+  page, and the save path maps such a failure to the save target's
+  `DocumentError::Write` rather than persisting a silently shortened
+  document.
+
+### Fixed
+
+- UTF-16 documents counted a stored CRLF as two text units in the
+  piece-table advance walk: the walker recognized the CR and LF bytes but
+  not the whole two-byte CR and LF cells, so the collapse into one unit
+  broke everywhere the pair spans cell boundaries — including the deferred
+  tail at the bounded-read chunk edge and a CRLF that ends the document on
+  the CR half. The walk now carries the pending CRLF context as whole
+  cells, matching the canonical one-unit-per-CRLF contract; regression
+  tests cover the cell collapse across a chunk edge and at EOF.
+
 ## 1.0.1 (2026-11-19)
 
 - Documentation-only release: the crate page re-renders with the
