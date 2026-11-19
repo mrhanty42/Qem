@@ -1,334 +1,208 @@
 # Qem Roadmap
 
-This roadmap is a release plan, not a wish list.
+This document is the release plan, not a wish list. It states what has been
+shipped, what is being built now, what remains before the `1.0.0` API
+freeze, and which limitations are knowingly accepted. Per-version change
+details live in [`CHANGELOG.md`](CHANGELOG.md); performance methodology and
+recorded numbers live in [`BENCHMARKS.md`](BENCHMARKS.md).
 
-The path is: ship a fast and complete search/encoding contract, then replace
-the rope dependency with our own structure, then freeze the public API at
-`1.0.0` after a small round of clean-up.
+## Release status
 
-## Planning Rules
+| Release | State | Theme |
+| --- | --- | --- |
+| 0.8.0 | shipped | native per-encoding byte-movement engine, typed regex search, UTF-8 BOM auto-detect |
+| 0.9.0 | shipped 2026-11-08 | ropey dependency replaced by the Qem-native edit buffer, rope-path undo/redo history, far-edit support, performance baselines |
+| 1.0.0 | in progress | cell-exact line model for multi-byte encodings, hardening of the persistence and search paths, public API freeze |
+
+## Planning rules
 
 - Integration beats expansion. Examples and real frontend workflows decide
   which API changes are justified.
-- Keep GUI dependencies out of `qem` core. Frontend demos can live in a
-  separate demo crate or workspace member if they need `egui` or another UI
-  stack.
-- Prefer typed public surface over private-detail escape hatches and glue code.
-- Treat performance as a measured contract on real files, not just synthetic
+- GUI dependencies stay out of the `qem` core. Frontend demos live in a
+  separate workspace member when they need `egui` or another UI stack.
+- Prefer a typed public surface over private-detail escape hatches and glue
+  code.
+- Performance is a measured contract on real files, not only synthetic
   microbenchmarks.
-- Treat sidecars and internal storage layout as implementation details unless
+- Sidecars and internal storage layout are implementation details unless
   they are explicitly promoted into the public contract.
-- Every release ships with the regression tests it needs. "Truth after error"
-  coverage (failed save, failed open, discarded stale worker, deferred close,
-  set_path / document_mut while busy) is added incrementally as the surfaces
-  it covers stabilize, not bundled into a single later release.
+- Every release ships with the regression tests it needs. "Truth after
+  error" coverage — failed saves, failed opens, discarded stale workers,
+  deferred closes, mutations through busy handles — is added incrementally
+  as each surface stabilizes, not bundled into one later release.
 
-## Current Release Line
+## Completed work in the 1.0 track
 
-Current target: `1.0.0` (0.9.0 shipped 2026-11-08)
+The following landed on `master` after the 0.9.0 release (2026-11-08)
+through 2026-11-19. Each item carries its own regression test, and every
+fix was verified by temporarily reverting it and watching that test fail.
 
-## 0.8.0
+- **Encoding-aware literal search.** The search needle is encoded into the
+  document's encoding before the byte search: UTF-16 needles are looked up
+  on the 2-byte cell grid with odd-offset collision candidates rejected,
+  single-byte needles go through the encoding encoder, needles that cannot
+  be represented in the document's encoding answer a typed dead query
+  instead of a silent miss. Reverse search validates candidates the same
+  way. A randomized property suite drives eight encodings end to end.
+- **Character-boundary proof for CJK candidates.** Shift_JIS, GB18030, and
+  EUC-KR byte grids are not self-synchronizing, so a plain byte search can
+  splice the halves of neighboring characters into a false match. Literal
+  and regex candidates are walked from the nearest known character
+  boundary; non-boundary hits are rejected.
+- **Open-time readability verification.** A session sidecar whose piece
+  pages fail their CRC is rejected as a typed error, and recovery drops the
+  sidecar and rebuilds from the source file instead of opening a document
+  whose content reads could silently shorten.
+- **Coherence around refused persistence.** Inserts and deletes refused by
+  the failed-persistence resident window surface typed errors without
+  corrupting the document; a half-landed replace batch reports the document
+  as modified; a no-op backspace no longer marks a clean rope document
+  dirty.
+- **The cell-exact line model for UTF-16 piece tables.** The line model
+  used to scan raw `0x0A` / `0x0D` bytes, which is byte-exact for UTF-8
+  and the single-byte encodings but wrong for UTF-16, where a `0x0A` byte
+  can be the low or high half of a non-line-ending code unit. Every walker
+  now classifies whole encoding cells: line-start resolution, the
+  line-break counter behind inserts, splits, trims, rebases, persistence
+  snapshots, and compaction, the column-to-byte and byte-to-column mappers,
+  the viewport line segment, the text-unit counter, the scanned line
+  ranges, the line-length scanner, and the cursor position scanner. CJK
+  trail bytes can never alias a break byte (the Shift_JIS, GB18030, and
+  EUC-KR trail ranges exclude `0x0A` / `0x0D`), so the raw scans are exact
+  there by construction.
+- **Phantom-origin snapping in search.** The position-to-byte mapping
+  saturates at the end of a line for columns past the line's width, which
+  let a phantom origin echo itself through the anchored position mapping
+  and stall the search iterators. Forward and reverse search now snap
+  their origins onto the true position of the saturated byte, and the
+  zero-width nudge walks the byte model instead of trusting drifted line
+  metadata.
+- **Bounded search windows.** A literal-search window used to hold the
+  entire remaining bytes of the piece segment it entered, which on edited
+  giant documents copied tens of gibibytes into heap per search step (a
+  measured 27-minute step and a 43.3 GB commit peak on a 16 GB machine
+  against a 50 GiB fixture). Windows now enter a segment in capped slices
+  with the same overlap hand-off; the measured find-all on the 50 GiB
+  edited fixture dropped to pure disk-read time with a 0.24 GB peak.
+- **The disk line index counts UTF-16 lines on whole cells** (sidecar
+  format version 3). The index builder previously registered a phantom
+  line for every aliased break byte, shifting all later line numbers and
+  anchoring checkpoints at mid-cell offsets. The builder validates every
+  hit as a whole cell, and the sidecar header records which cell width the
+  line numbers were counted in: a sidecar built for another width — or by
+  an older build — is stale and rebuilds.
+- **The trailing line break is classified as a whole cell**, so the
+  reverse-search window on a document ending in a UTF-16 line break no
+  longer includes the break.
+- **`qem::index` is no longer part of the public API.** Every item inside
+  was already crate-private; closing the empty re-export keeps the disk
+  line index an internal detail the freeze does not have to promise
+  compatibility for.
+- **Verification on real hardware.** The full fix stack was re-verified on
+  a 50 GiB edited fixture: session recovery with the rebuilt index, then a
+  rare-needle find-all answered in pure disk-read time with the correct
+  single match.
 
-`0.8.0` is the search and encoding release. Encoding handling is **native**
-instead of a transcode-to-UTF-8 pipeline: every encoding moves through its
-own byte movement engine.
+## Remaining before the 1.0.0 freeze
 
-### Focus
-
-#### Regex search
-
-- Typed `RegexSearchQuery` / `RegexCompileError` / `RegexSearchIter` mirroring
-  the literal-search surface.
-- `find_next_regex`, `find_prev_regex`, `find_all_regex` plus reusable
-  `_query`, bounded `_in_range`, and `_between` variants.
-- `DocumentSession` and `EditorTab` expose the same regex surface.
-- Mmap zero-copy regex path (no 8 MiB cap, finds matches at 64 MiB+
-  offsets), piece-table chunked streaming with 1 MiB overlap, rope chunked
-  streaming via `Rope::chunks()` over the byte engine — no `String`
-  materialization on the rope hot path.
-- Reverse regex via reverse-DFA built from `regex_automata::dfa::dense`,
-  routed across all three backings (rope, mmap slice, piece-tree chunked
-  walker) and bounded by a typed size-limit error rather than panic on
-  pathological patterns.
-- Dense-vs-sparse ratio is gated by a deterministic perf test.
-
-#### UTF-8 BOM auto-detect
-
-- `auto_detect_open_encoding` recognizes the UTF-8 BOM. Files opened with
-  the auto-detect policy and a leading `EF BB BF` go through the rope
-  decode path (which strips the BOM via `decode_with_bom_removal`).
-- Default `Document::open()` does not strip BOM; only the explicit
-  auto-detect path does.
-
-#### Encoding-aware byte movement engine
-
-The "transcode every non-UTF-8 file into a UTF-8 rope" approach is treated
-as a workaround, not a target. `0.8.0` introduces a dedicated byte-movement
-engine per encoding so every encoding can run natively over its own bytes:
-
-- `Utf8Engine` for UTF-8 (the default).
-- `SingleByteEngine` for ASCII supersets: `windows-1250`..`-1258`,
-  `windows-874`, `ISO-8859-2`..`-16`, `KOI8-R`, `KOI8-U`, `IBM866`,
-  `macintosh`, `x-mac-cyrillic`. Step is always one byte; line scanning
-  reuses memchr; CRLF collapses identically to UTF-8.
-- `Utf16Engine<Endian>` for UTF-16 LE / BE. Newline finder looks for
-  2-byte aligned `0x0A 0x00` / `0x0D 0x00`. Char step is 2 bytes (4 for
-  surrogate pairs). Edit boundaries align on 2 bytes.
-- `MultiByteEngine` for `Shift_JIS`, `GB18030`, `EUC-KR`. Each kind has
-  its own leading-byte detector and a false-positive-aware newline finder
-  for `0x0A` / `0x0D` (some trailing bytes can be these values).
-
-Engines are cached per encoding via `OnceLock<Mutex<HashMap>>`, so the
-dispatch cost is one pointer compare on the hot path.
-
-Non-UTF-8 documents never build a UTF-8 rope. Open dispatches to the
-mmap fast path with the appropriate engine. Viewport reads decode only
-the requested window via `encoding_rs`. Edit goes through the piece tree
-directly: incoming `&str` is encoded to the target encoding via
-`encoding_rs`; non-representable code points return a typed error
-without mutating state.
-
-#### Encoding-aware alignment
-
-`Document::align_byte_offset` lands every byte offset on a character
-boundary of the document's current encoding before it reaches the edit /
-regex paths:
-
-- UTF-8 walks back to the nearest UTF-8 char boundary.
-- Class A is a no-op clamp.
-- UTF-16 rounds to a 2-byte cell.
-- Class B (CJK multibyte) walks forward from the nearest line anchor via
-  the engine's `step` and picks the closest reachable boundary.
-
-This is the surface that fixes the historic piece-boundary truncation
-bug where reverse search across an internal piece break could land on
-the trail byte of a multi-byte character and corrupt downstream byte
-offsets.
-
-#### Search performance
-
-- Literal and regex search are the fastest path on mmap, piece-table, and
-  rope backings.
-- Real numbers on 1 GiB / 10 GiB / 50 GiB files, recorded next to the
-  existing perf baseline.
-
-### Non-Goals
-
-- Removing ropey. That is `0.9.0`.
-- Refactoring `piece_tree`, splitting history/persistence, or eliminating
-  every `unwrap` / `expect`. That is `1.0.0`.
-- LSP, syntax highlighting, grapheme clustering, display-cell width.
-
-### Exit Criteria
-
-`0.8.0` is ready when:
-
-- The encoding-engine work is shipped end to end (open, viewport, search,
-  edit, save) for UTF-8, every Class A encoding, UTF-16 LE / BE, and the
-  three Class B CJK encodings.
-- Regex and literal search share one typed surface and one set of
-  guarantees on every backing.
-- Reverse regex is reverse-DFA based and bounded by a typed size limit.
-- Search performance numbers on real huge files are recorded next to the
-  existing perf baseline.
-- The encoding contract is widened with new tests instead of new prose.
-- `cargo test --all-features --workspace` is green on all CI targets.
-
-## 0.9.0
-
-`0.9.0` is the rope replacement release, expanded to also ship rope-path
-undo/redo history: the piece tree already keeps snapshot history, but the
-rope edit buffer (small UTF-8 files and untitled documents) silently had
-none.
-
-### Focus
-
-- Add undo/redo history to the rope edit buffer with guarded
-  `try_undo` / `try_redo` session entry points and caret reporting. The
-  in-memory history layer records inverted range edits and is deliberately
-  buffer-agnostic, so it carries over to the Qem-native edited buffer when
-  `ropey` is removed.
-- Replace the `ropey` dependency with a Qem-native edited-buffer structure.
-  The new structure must:
-  - support large-file editing with predictable memory.
-  - keep `O(log N)` line / column lookup.
-  - integrate cleanly with the existing piece tree so a single backing can
-    own both unedited mmap-anchored pieces and edited add-buffer pieces.
-- Keep the public contract behavior-stable. The replacement is internal:
-  open / save / edit / viewport behavior must not change for users of the
-  library.
-- Add property-based tests comparing the new structure against a reference
-  implementation across randomized edit sequences.
-
-### Non-Goals
-
-- New API surface that was deferred to the rope-replacement work
-  specifically for that work.
-- Domain expansion beyond text.
-
-### Exit Criteria
-
-`0.9.0` is ready when:
-
-- `ropey` is removed from `Cargo.toml`.
-- The new edited-buffer structure passes property-based parity tests
-  against a reference oracle.
-- Undo/redo round-trip tests pass for rope-backed documents: small files,
-  untitled documents, composite replaces, and post-promotion edits.
-- All existing scenario tests stay green without behavior change.
-- Real-file perf numbers on edited buffers stay within the established
-  baseline (no regression).
-
-## 1.0.0
-
-`1.0.0` is the small-cleanup + freeze release.
-
-### Focus
-
-- **Carry-over design items from the 1.0-track audit (post-0.9.0):**
-  make literal search encoding-aware for Class A (encode the needle
-  through the document's engine before `memmem`) or return a typed
-  `Unsupported` instead of a silent miss - and the same applies
-  verbatim to UTF-16 / CJK documents, where a multi-char needle cannot
-  appear in the interleaved storage bytes at all (wave-7 audit: the
-  literal dispatcher forks by backing only, never by encoding); store
-  the document encoding in the `.qem.editlog` header (format v3) and
-  route `open_with_encoding` through session recovery; unify the
-  reverse-regex overlap semantics between the large-span DFA path and
-  the small-span forward path (pinned reproduction in
-  `regex_tests.rs`) - and note that the Class B decode-scan mapping
-  stays approximate for *genuinely corrupt* bytes: a U+FFFD decoded
-  from ill-formed data mid-window re-encodes to an 8-byte numeric
-  character reference in Shift_JIS / EUC-KR, drifting the mapping for
-  matches after it (window starts are re-aligned since the wave-7
-  fix; the in-window corruption case remains) - and that the leading-
-  byte window probe itself is one-sided: a window opening on a trail
-  byte that splices into a valid pair with the next byte (Shift_JIS /
-  EUC-KR / GB18030 trail ranges overlap their lead ranges), or a
-  GB18030 four-byte sequence opening on a digit byte, decodes clean
-  and is accepted mid-sequence - byte-exact mapping, but occurrences
-  absorbed into spliced pairs are missed (wave-8 audit; a full fix
-  needs absolute phase tracking instead of probing); make the
-  non-Windows snapshot backing cheaper than a full file copy; snapshot
-  `save_async` state through `Arc` instead of cloning the edit buffer
-  on the UI thread.
-- **Engine-aware line model for multi-byte-cell piece tables (1.0) —
-  cell-exact for UTF-16 as of 2026-11-19; remaining items below:** the
-  piece-table line model used to scan raw `0x0A` / `0x0D` bytes —
-  byte-exact for UTF-8 and Class A, wrong for UTF-16 (a `0x0A` byte can
-  be the low or high half of a non-line-ending code unit) and CJK (a
-  trail byte can coincide with a line-ending byte). The UTF-16 half of
-  the item is closed end to end: `local_offset_after_break`,
-  `count_line_breaks_in_bytes` (all six counting sites),
-  `byte_offset_for_col_with_engine`, `line_visible_segment`,
-  `count_text_units_in_bytes`, `byte_offset_for_text_col_with_engine`,
-  all three `next_piece_table_scan_line_range` copies,
-  `scan_line_lengths_from`, `scan_cursor_position_bytes`, and the
-  regex/literal search walks classify whole cells, with the aliasing
-  fixtures (`inserted_utf16le_break_cells_survive_aliasing_characters`,
-  the UTF-16BE greedy run, the scan unit tests) pinning each. CJK trail
-  bytes never alias a break byte (Shift_JIS 0x40-0xFC, GB18030
-  0x30-0xFE, EUC-KR 0xA1-0xFE exclude 0x0A / 0x0D), so the raw scans are
-  exact there by construction. Still raw by design:
-  `advance_offset_by_text_units_with_engine`'s 64 KiB bounded-read
-  context keeps a single CRLF-context byte (UTF-16 CRLF spans two
-  cells; a split exactly between them is the residual edge), and the
-  open-time mmap estimates (`estimated_mmap_line_byte_range`, the
-  lifecycle seed scans) stay approximate for pre-edit viewports per the
-  documented estimate contract.
-- **Bounded piece-tree session history (audit 2026-11-06):** the
-  in-memory edit history and its sidecar rewrite are unbounded - every
-  flush re-serializes all history entries and appends fresh history
-  pages, so long editing sessions on huge files pay O(edits²) sidecar
-  writes and monotonically growing flush latency until save/reopen
-  (the rope path caps at 500 entries). A cap or window needs an owner
-  decision because it changes the user-visible undo depth.
-- **Reads must fail typed on unreadable pages (audit 2026-11-06):**
-  the wave-8 fix makes structural edits refuse to reference a page the
-  resident window dropped, but the `page()`-loading read walkers still
-  silently skip a page that fails to load (any CRC mismatch or IO hiccup
-  on a lazily read page): `visit_range_ref` family, `collect_pieces`,
-  `collect_fragmentation_stats`, and `find_line_start_ref` - reads
-  shorten behind `total_len` instead of surfacing a typed error. A
-  genuine fix converts the read walkers to a Result contour through
-  `PieceTable::read_range` callers - a wide mechanical diff, deferred so
-  it does not churn the hot read path unreviewed. Until then, the
-  silent-skip hole exists only for genuinely corrupted pages (edits
-  through them already fail typed since the wave-7 `unreadable page`
-  fix).
-- **Checksums for `.qem.lineidx` pages (audit 2026-11-06):** index
-  pages validate kind/count/child invariants but carry no CRC, so a
-  flipped byte inside a checkpoint value parses fine and yields
-  silently wrong line starts; the editlog pages already CRC-verify.
-  Fix belongs with the next sidecar format bump.
-- **Empty public module `qem::index` (audit 2026-11-06):** the module
-  re-exports nothing (all items are `pub(crate)`), but a `pub mod` is
-  a semver commitment - make it private before the 1.0 freeze.
-- **Small refactors for clarity**, not a rewrite. Split overgrown modules
-  into focused units (history, persistence, fragmentation, core data
-  structure for `piece_tree`; named lifecycle helpers around inspection,
-  indexing, sidecar recovery, and final state construction). Reduce
-  duplication between `DocumentSession` and `EditorTab` through
-  composition without breaking the public surface.
+- **Bounded session history.** The piece-tree edit history and its sidecar
+  rewrite are unbounded: every flush re-serializes all history entries and
+  appends fresh history pages, so long editing sessions on huge files pay
+  quadratic sidecar writes and monotonically growing flush latency until
+  the next save and reopen. A cap or sliding window changes the
+  user-visible undo depth, so it needs an explicit product decision before
+  implementation.
+- **Typed reads on unreadable pages.** Structural edits already refuse to
+  reference a page that the resident window dropped, but the read walkers
+  still silently skip a lazily read page that fails its CRC, shortening
+  reads behind the documented length instead of surfacing a typed error.
+  The fix converts the read-walker family to a `Result` contour; it is
+  deferred so the hot read path is not churned unreviewed.
+- **Checksums for `.qem.lineidx` pages.** Index pages validate their
+  structural invariants but carry no CRC, so a flipped byte inside a
+  checkpoint value parses cleanly and yields silently wrong line starts.
+  The fix belongs with the next sidecar format bump.
+- **Engine-aware bounded-read context.** The text-unit advance walk reads
+  the document in bounded windows and carries a single CRLF-context byte
+  across window edges; for UTF-16 the CRLF pair spans two cells, so the
+  context must widen to the encoding's maximum cell width.
+- **Cheaper snapshot backing off Windows.** Non-Windows snapshot saves
+  still copy the whole source file; a cheaper backing needs design work.
+  Snapshot `save_async` should also share the edit buffer through `Arc`
+  instead of cloning it on the caller thread.
+- **Focused refactors, not a rewrite.** Split the overgrown modules into
+  focused units (history, persistence, fragmentation, and the core
+  piece-tree structure; named lifecycle helpers around inspection,
+  indexing, sidecar recovery, and final state construction), and reduce the
+  duplication between `DocumentSession` and `EditorTab` through composition
+  without breaking the public surface.
 - **Drop non-critical `unsafe` blocks** where a safe equivalent exists at
-  the same performance tier. Keep `unsafe` only on hot paths where it is
-  load-bearing for the documented performance contract, and document why
-  in-place at each remaining site.
-- **Reduce `unwrap` / `expect` on recoverable paths**. Replace remaining
-  patterns like `unwrap_or([0; 8])` with explicit `?`-driven error
-  propagation backed by typed errors.
-- **Sidecar recovery is typed.** `.qem.lineidx` and `.qem.editlog` failure
-  modes resolve through typed outcomes (`Rebuild`, `Discard`,
-  `ReopenClean`) instead of best-effort heuristics. Version mismatch,
-  corrupt sidecar, and stale identity are explicit.
-- **Backing transitions surface as events.** `mmap → piece_table → rope-
-  replacement` promotions are observable through typed status so frontends
-  can react instead of guessing.
-- **Regression benches in CI.** Open, first viewport, first edit on huge
+  the same performance tier, and document in place why each remaining
+  `unsafe` site is load-bearing.
+- **Remove `unwrap` and `expect` from recoverable paths**, replacing the
+  remaining default-value patterns with typed error propagation.
+- **Backing transitions surface as events.** The `mmap → piece_table`
+  promotion is observable through typed status so frontends can react
+  instead of guessing.
+- **Regression benchmarks in CI.** Open, first viewport, first edit on huge
   files, edited save, literal search, and regex search each get a short
-  regression bench tied to the perf baseline.
-- **Public API freeze.** Stable surface vs internal implementation details
-  is labeled in rustdoc; semver discipline is documented.
+  regression bench tied to the recorded baselines.
+- **Public API freeze.** Label the stable surface against internal
+  implementation details in rustdoc, and write down the semver policy for
+  the post-1.0 line.
 
-### Must Be Stable
+## Known limitations accepted for 1.0
 
-- typed API surface
-- open / save lifecycle
-- background job semantics
-- huge-file support contract
-- error model
-- line and column semantics
-- edit capability semantics
-- search surface (literal and regex)
-- encoding contract
+These are deliberate, documented trade-offs rather than bugs. Each is
+visible in the public documentation.
 
-### May Stay Unstable
+- Search mapping stays approximate for **genuinely corrupt bytes**: a
+  U+FFFD decoded from ill-formed data mid-window re-encodes to a numeric
+  character reference in Shift_JIS / EUC-KR, drifting the mapping for
+  matches after it inside the same window.
+- The leading-byte window probe is one-sided for CJK: a window opening on
+  a trail byte that happens to splice into a valid pair with the next byte
+  decodes clean and is accepted mid-sequence, so occurrences absorbed into
+  spliced pairs are missed. A full fix needs absolute character-phase
+  tracking instead of probing; it is planned for the post-1.0 line.
+- Pre-edit viewport estimates on the mmap path stay approximate until the
+  exact line mapping reaches the requested line; this is the documented
+  estimate contract.
+- UTF-16 and CJK edit sessions are not recoverable through the
+  byte-indexed session path yet; such sidecars fall back to a fresh open,
+  and the session history cap (see above) is pending the same product
+  decision.
 
-- sidecar on-disk format
-- low-level cache / layout choices
-- internal storage details
+## Stability contract
 
-### Exit Criteria
+Must be stable at 1.0.0:
 
-`1.0.0` is ready when:
+- the typed API surface;
+- the open and save lifecycle;
+- background job semantics;
+- the huge-file support contract;
+- the error model;
+- line and column semantics;
+- edit capability semantics;
+- the search surface, literal and regex;
+- the encoding contract.
 
-- the small refactors leave the public surface unchanged but the
-  internals are smaller and easier to reason about.
-- non-critical `unsafe` blocks are gone; remaining `unsafe` is documented
-  in-place.
-- `unwrap` / `expect` no longer appears on hot or recoverable paths.
-- the public contract is frozen and labeled as stable in rustdoc.
-- semver rules for the post-`1.0` line are written down.
-- downstream applications can build products on top of Qem without
+May stay unstable:
+
+- the sidecar on-disk formats;
+- low-level cache and layout choices;
+- internal storage details.
+
+## Exit criteria for 1.0.0
+
+- The remaining items above are either implemented or explicitly moved to
+  the post-1.0 line by decision.
+- The focused refactors leave the public surface unchanged while the
+  internals become smaller and easier to reason about.
+- Non-critical `unsafe` blocks are gone, and each remaining site documents
+  why it exists.
+- `unwrap` and `expect` no longer appear on hot or recoverable paths.
+- The public contract is frozen and labeled as stable in rustdoc.
+- The semver rules for the post-1.0 line are written down.
+- Downstream applications can build products on top of Qem without
   expecting recurring redesign of the basic contract.
-
-## Short Version
-
-- `0.8.0` (shipped): regex + fast search + encoding-aware native byte
-  engine + UTF-8 BOM
-- `0.9.0` (in progress): rope-path undo/redo, budget-bounded edit window,
-  far-edit support, and the Qem-native edited buffer replacing `ropey`
-- `1.0.0`: small cleanup (module splits, drop non-critical `unsafe`,
-  remove `unwrap` / `expect` on recoverable paths, sidecar typed
-  outcomes, backing transition events, regression benches in CI) +
-  public API freeze

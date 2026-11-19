@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## Unreleased
+
+### Changed
+
+- The README is restructured: a feature overview, a supported-encoding
+  table with the route each encoding takes, the installation and feature
+  flags, the quick start, the position and encoding contract, the
+  large-file behavior, the editor demo, the examples, the quality checks,
+  and the benchmark guidance.
+- The roadmap is rewritten as a release plan with explicit states: shipped
+  releases, the completed 1.0-track work with what each item fixed, the
+  remaining pre-freeze items in full sentences, and the limitations
+  accepted for 1.0.
+- The recorded performance baselines moved from the repository root to
+  `benches/baselines/`; the baseline documents' internal command paths are
+  updated.
+
+
 ### Changed
 
 - The `qem::index` module is no longer part of the public API. Every item
