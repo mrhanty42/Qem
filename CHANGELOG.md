@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 (2026-11-19)
+
+This release freezes the public API. Everything listed below shipped on top of
+0.9.0 since its release on 2026-11-08; the remaining roadmap items moved to
+the post-1.0 line by decision.
 
 ### Changed
 

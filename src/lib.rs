@@ -8,6 +8,13 @@
 //!
 //! `Qem` is the project name, not an expanded acronym.
 //!
+//! # Stability
+//!
+//! As of 1.0.0 the public API documented here is frozen: post-1.0 releases
+//! follow semantic versioning, and breaking changes to the documented
+//! surface require a major version. The sidecar on-disk formats and the
+//! internal storage layout remain implementation details.
+//!
 //! # Picking the Right Layer
 //!
 //! - Use [`Document`] when your application already owns tab state, session

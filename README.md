@@ -15,6 +15,12 @@ mutations), so a frontend only has to render.
 > testing, and documentation. Technical decisions, review, and project
 > direction remain human-owned.
 
+## Status
+
+Qem is at 1.0.0: the public API described here is frozen and follows the
+documented semver policy from this release onward. Remaining work items and
+post-1.0 candidates live in the [roadmap](ROADMAP.md).
+
 ## Features
 
 - Opens files of any size without materializing the whole document.
@@ -53,7 +59,7 @@ Native-route documents save and reopen at any size.
 
 ```toml
 [dependencies]
-qem = "0.9.0"
+qem = "1.0.0"
 ```
 
 The default features include the editor/session layer and automatic
@@ -61,7 +67,7 @@ temporary-directory selection. For the lower-level document engine only:
 
 ```toml
 [dependencies]
-qem = { version = "0.9.0", default-features = false }
+qem = { version = "1.0.0", default-features = false }
 ```
 
 ### Feature flags
