@@ -27,8 +27,8 @@ recorded numbers live in [`BENCHMARKS.md`](BENCHMARKS.md).
 - Sidecars and internal storage layout are implementation details unless
   they are explicitly promoted into the public contract.
 - Every release ships with the regression tests it needs. "Truth after
-  error" coverage — failed saves, failed opens, discarded stale workers,
-  deferred closes, mutations through busy handles — is added incrementally
+  error" coverage (failed saves, failed opens, discarded stale workers,
+  deferred closes, mutations through busy handles) is added incrementally
   as each surface stabilizes, not bundled into one later release.
 
 ## Completed work in the 1.0 track
@@ -38,12 +38,13 @@ through 2026-11-19. Each item carries its own regression test, and every
 fix was verified by temporarily reverting it and watching that test fail.
 
 - **Encoding-aware literal search.** The search needle is encoded into the
-  document's encoding before the byte search: UTF-16 needles are looked up
-  on the 2-byte cell grid with odd-offset collision candidates rejected,
-  single-byte needles go through the encoding encoder, needles that cannot
-  be represented in the document's encoding answer a typed dead query
-  instead of a silent miss. Reverse search validates candidates the same
-  way. A randomized property suite drives eight encodings end to end.
+  document's encoding before the byte search. UTF-16 needles are looked up
+  on the 2-byte cell grid, and odd-offset collision candidates are
+  rejected. Single-byte needles go through the encoding encoder. A needle
+  that cannot be represented in the document's encoding answers a typed
+  dead query instead of a silent miss. Reverse search validates candidates
+  the same way. A randomized property suite drives eight encodings end to
+  end.
 - **Character-boundary proof for CJK candidates.** Shift_JIS, GB18030, and
   EUC-KR byte grids are not self-synchronizing, so a plain byte search can
   splice the halves of neighboring characters into a false match. Literal
@@ -54,7 +55,7 @@ fix was verified by temporarily reverting it and watching that test fail.
   sidecar and rebuilds from the source file instead of opening a document
   whose content reads could silently shorten.
 - **Coherence around refused persistence.** Inserts and deletes refused by
-  the failed-persistence resident window surface typed errors without
+  the failed-persistence resident window produce typed errors without
   corrupting the document; a half-landed replace batch reports the document
   as modified; a no-op backspace no longer marks a clean rope document
   dirty.
@@ -62,24 +63,24 @@ fix was verified by temporarily reverting it and watching that test fail.
   used to scan raw `0x0A` / `0x0D` bytes, which is byte-exact for UTF-8
   and the single-byte encodings but wrong for UTF-16, where a `0x0A` byte
   can be the low or high half of a non-line-ending code unit. Every walker
-  now classifies whole encoding cells: line-start resolution, the
+  now classifies whole encoding cells: line-start resolution; the
   line-break counter behind inserts, splits, trims, rebases, persistence
-  snapshots, and compaction, the column-to-byte and byte-to-column mappers,
-  the viewport line segment, the text-unit counter, the scanned line
-  ranges, the line-length scanner, and the cursor position scanner. CJK
+  snapshots, and compaction; the column-to-byte and byte-to-column mappers;
+  the viewport line segment; the text-unit counter; the scanned line
+  ranges; the line-length scanner; and the cursor position scanner. CJK
   trail bytes can never alias a break byte (the Shift_JIS, GB18030, and
   EUC-KR trail ranges exclude `0x0A` / `0x0D`), so the raw scans are exact
   there by construction.
 - **Phantom-origin snapping in search.** The position-to-byte mapping
-  saturates at the end of a line for columns past the line's width, which
-  let a phantom origin echo itself through the anchored position mapping
+  saturates at the end of a line for columns past the line's width; a
+  phantom origin could echo itself through the anchored position mapping
   and stall the search iterators. Forward and reverse search now snap
   their origins onto the true position of the saturated byte, and the
   zero-width nudge walks the byte model instead of trusting drifted line
   metadata.
 - **Bounded search windows.** A literal-search window used to hold the
   entire remaining bytes of the piece segment it entered, which on edited
-  giant documents copied tens of gibibytes into heap per search step (a
+  giant documents copied tens of gibibytes onto the heap per search step (a
   measured 27-minute step and a 43.3 GB commit peak on a 16 GB machine
   against a 50 GiB fixture). Windows now enter a segment in capped slices
   with the same overlap hand-off; the measured find-all on the 50 GiB
@@ -89,15 +90,15 @@ fix was verified by temporarily reverting it and watching that test fail.
   line for every aliased break byte, shifting all later line numbers and
   anchoring checkpoints at mid-cell offsets. The builder validates every
   hit as a whole cell, and the sidecar header records which cell width the
-  line numbers were counted in: a sidecar built for another width — or by
-  an older build — is stale and rebuilds.
+  line numbers were counted in: a sidecar built for another width, or by
+  an older build, is stale and rebuilds.
 - **The trailing line break is classified as a whole cell**, so the
   reverse-search window on a document ending in a UTF-16 line break no
   longer includes the break.
 - **`qem::index` is no longer part of the public API.** Every item inside
   was already crate-private; closing the empty re-export keeps the disk
-  line index an internal detail the freeze does not have to promise
-  compatibility for.
+  line index internal, so the freeze does not have to promise compatibility
+  for it.
 - **Verification on real hardware.** The full fix stack was re-verified on
   a 50 GiB edited fixture: session recovery with the rebuilt index, then a
   rare-needle find-all answered in pure disk-read time with the correct
@@ -154,8 +155,8 @@ fix was verified by temporarily reverting it and watching that test fail.
 
 ## Known limitations accepted for 1.0
 
-These are deliberate, documented trade-offs rather than bugs. Each is
-visible in the public documentation.
+These are documented trade-offs, not bugs. Each is visible in the public
+documentation.
 
 - Search mapping stays approximate for **genuinely corrupt bytes**: a
   U+FFFD decoded from ill-formed data mid-window re-encodes to a numeric

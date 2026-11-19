@@ -7,8 +7,8 @@ It combines memory-mapped reads with an incremental line index so a
 multi-gigabyte file opens in milliseconds and the first viewport is ready
 before indexing finishes. When edits arrive, Qem promotes the document to a
 piece-table backing and keeps every guarantee. A separate editor-session
-layer wraps the whole lifecycle — background jobs, status polling, guarded
-mutations — so a frontend only has to render.
+layer wraps the whole lifecycle (background jobs, status polling, guarded
+mutations), so a frontend only has to render.
 
 > **Project note:** Qem is designed, directed, and maintained by a human. AI
 > tools have been used as development assistants for parts of implementation,
@@ -18,23 +18,23 @@ mutations — so a frontend only has to render.
 ## Features
 
 - Opens files of any size without materializing the whole document.
-- Builds the line index incrementally in the background; viewports read
-  during indexing.
+- Builds the line index incrementally in the background; viewport reads
+  work during indexing.
 - Bounded viewport reads for virtualized editor rendering.
 - Rope backing for small files and untitled documents; piece-table backing
   when edits demand it; both transition automatically.
 - Typed insert, replace, delete, selection, undo, and redo operations with
   caret reporting.
-- Encoding-aware literal and regex search — forward, reverse, and bounded —
+- Encoding-aware literal and regex search (forward, reverse, and bounded)
   on every backing.
 - Streaming atomic saves for edited documents at any size.
 - Persistent edit sessions in `.qem.editlog` sidecars, including the
   document encoding.
 - Typed errors everywhere: no panics on hostile input, no silent data loss.
 
-Qem deliberately does **not** provide a text widget or GUI toolkit
-integration. It counts text units, not grapheme clusters or terminal display
-cells; visual layout remains a frontend concern.
+Qem does **not** provide a text widget or GUI toolkit integration. It counts
+text units, not grapheme clusters or terminal display cells; visual layout
+remains a frontend concern.
 
 ## Supported encodings
 
@@ -111,7 +111,7 @@ status polling without imposing a rendering model.
 `TextPosition::col0`, `TextRange::len_chars()`, viewport columns, and edit
 ranges use document text units. For UTF-8, one Unicode scalar value is one
 unit. Combining marks, grapheme clusters, wide characters, tab expansion,
-and visual columns are intentionally left to the frontend. Stored CRLF
+and visual columns are left to the frontend. Stored CRLF
 counts as one unit between lines.
 
 Use `Document::open_with_options(...)` or `Document::open_with_encoding(...)`
@@ -152,7 +152,7 @@ jump, page, column, indexing, and backing controls:
 cargo run -p qem-egui-demo --bin large_file -- "C:\path\to\huge.log"
 ```
 
-The GUI dependencies belong only to the demo crate; the `qem` library itself
+The GUI dependencies live only in the demo crate; the `qem` library itself
 stays UI-agnostic.
 
 ## Examples
@@ -199,8 +199,8 @@ command, commit, toolchain, OS, hardware, storage, and cache conditions.
 
 The current priorities are correctness across supported encodings and
 backings, a smaller stable public surface, and clearer frontend integration
-guidance. The release plan — completed work, remaining items, and the
-stability contract — lives in [`ROADMAP.md`](ROADMAP.md).
+guidance. The release plan in [`ROADMAP.md`](ROADMAP.md) tracks completed
+work, remaining items, and the stability contract.
 
 ## License
 
