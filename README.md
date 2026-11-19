@@ -17,8 +17,8 @@ mutations), so a frontend only has to render.
 
 ## Status
 
-Qem is at 1.0.0: the public API described here is frozen and follows the
-documented semver policy from this release onward. Remaining work items and
+The public API described here is frozen as of 1.0.0 and follows the
+documented semver policy from that release onward. Remaining work items and
 post-1.0 candidates live in the [roadmap](ROADMAP.md).
 
 ## Features

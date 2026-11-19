@@ -1,8 +1,8 @@
 # Qem Roadmap
 
 This document is the release plan, not a wish list. It states what has been
-shipped, what is being built now, what remains before the `1.0.0` API
-freeze, and which limitations are knowingly accepted. Per-version change
+shipped, what the 1.0.0 freeze delivered, what moves along the post-1.0
+line, and which limitations are knowingly accepted. Per-version change
 details live in [`CHANGELOG.md`](CHANGELOG.md); performance methodology and
 recorded numbers live in [`BENCHMARKS.md`](BENCHMARKS.md).
 
@@ -13,6 +13,7 @@ recorded numbers live in [`BENCHMARKS.md`](BENCHMARKS.md).
 | 0.8.0 | shipped | native per-encoding byte-movement engine, typed regex search, UTF-8 BOM auto-detect |
 | 0.9.0 | shipped 2026-11-08 | ropey dependency replaced by the Qem-native edit buffer, rope-path undo/redo history, far-edit support, performance baselines |
 | 1.0.0 | shipped 2026-11-19 | cell-exact line model for multi-byte encodings, hardening of the persistence and search paths, public API freeze |
+| 1.0.1 | shipped 2026-11-19 | documentation corrections for the release page |
 
 ## Planning rules
 
@@ -157,6 +158,13 @@ fix was verified by temporarily reverting it and watching that test fail.
 
 These are documented trade-offs, not bugs. Each is visible in the public
 documentation.
+
+- Reverse regex over large spans returns the **rightmost** match by start
+  offset, which for self-overlapping patterns (e.g. `aa`) may overlap the
+  previous match, while the small-span forward fallback returns the last
+  non-overlapping match. The two agree for patterns that cannot
+  self-overlap; the inconsistency is pinned by an ignored test in
+  `regex_tests.rs`.
 
 - Search mapping stays approximate for **genuinely corrupt bytes**: a
   U+FFFD decoded from ill-formed data mid-window re-encodes to a numeric

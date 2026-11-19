@@ -1464,7 +1464,7 @@ fn find_prev_regex_reverse_dfa_visits_bounded_matches_regardless_of_density() {
 }
 
 #[test]
-#[ignore = "known reverse-regex inconsistency (1.0 design item): the large-span             reverse-DFA path returns the rightmost match even when it overlaps             the previous one, while the small-span forward path returns the             last non-overlapping match"]
+#[ignore = "known reverse-regex inconsistency (documented in ROADMAP): the large-span             reverse-DFA path returns the rightmost match even when it overlaps             the previous one, while the small-span forward path returns the             last non-overlapping match"]
 fn find_prev_regex_overlap_semantics_differ_between_span_paths() {
     // Repro from the second audit: for a self-overlapping pattern (`aa`)
     // the >1 MiB DFA path and the greedy forward iteration disagree about

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1 (2026-11-19)
+
+- Documentation-only release: the crate page re-renders with the
+  restructured README (the 1.0.0 publication bundled the pre-release
+  framing), the roadmap gained the reverse-regex rightmost-match
+  limitation in its known-limitations list, and two code comments no
+  longer point at reshaped roadmap entries. No code changes.
+
 ## 1.0.0 (2026-11-19)
 
 This release freezes the public API. Everything listed below shipped on top of

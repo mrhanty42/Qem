@@ -1240,7 +1240,7 @@ fn finalize_byte_match(
 /// to return a `Result`, which is out of scope here; for now the
 /// documented behaviour is "pathological pattern returns no match".
 ///
-/// **Known inconsistency (1.0 design item):** the large-span reverse-DFA
+/// **Known inconsistency (documented in ROADMAP):** the large-span reverse-DFA
 /// path returns the *rightmost* match by start offset, which for
 /// self-overlapping patterns (e.g. `aa`) may overlap the previous match,
 /// while the small-span forward fallback returns the last non-overlapping

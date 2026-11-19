@@ -1911,8 +1911,7 @@ impl PieceTable {
                 while i < seg_end {
                     let step = self.engine.step(src, i, seg_end);
                     if step == 0 || i.saturating_add(step) > seg_end {
-                        // Known limitation (the piece-table line-model item
-                        // in ROADMAP): a piece boundary can split an encoded
+                        // Known limitation: a piece boundary can split an encoded
                         // cell (e.g. the halves of a UTF-16 unit), and this
                         // guard stops the walk there instead of spinning on
                         // a zero step or decoding a partial cell. For Class
