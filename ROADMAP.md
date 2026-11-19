@@ -12,7 +12,7 @@ recorded numbers live in [`BENCHMARKS.md`](BENCHMARKS.md).
 | --- | --- | --- |
 | 0.8.0 | shipped | native per-encoding byte-movement engine, typed regex search, UTF-8 BOM auto-detect |
 | 0.9.0 | shipped 2026-11-08 | ropey dependency replaced by the Qem-native edit buffer, rope-path undo/redo history, far-edit support, performance baselines |
-| 1.0.0 | in progress | cell-exact line model for multi-byte encodings, hardening of the persistence and search paths, public API freeze |
+| 1.0.0 | shipped 2026-11-19 | cell-exact line model for multi-byte encodings, hardening of the persistence and search paths, public API freeze |
 
 ## Planning rules
 
