@@ -201,12 +201,11 @@ baseline numbers are documented in [`BENCHMARKS.md`](BENCHMARKS.md) and
 [`benches/baselines/`](benches/baselines). Results should include the exact
 command, commit, toolchain, OS, hardware, storage, and cache conditions.
 
-## Road to 1.0
+## Project status
 
-The current priorities are correctness across supported encodings and
-backings, a smaller stable public surface, and clearer frontend integration
-guidance. The release plan in [`ROADMAP.md`](ROADMAP.md) tracks completed
-work, remaining items, and the stability contract.
+Qem 1.0.0 shipped on 2026-11-19: the public API is frozen and follows the
+documented semver policy. The release plan in [`ROADMAP.md`](ROADMAP.md)
+tracks completed work, the post-1.0 line, and the stability contract.
 
 ## License
 

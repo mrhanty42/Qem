@@ -104,7 +104,7 @@ fix was verified by temporarily reverting it and watching that test fail.
   rare-needle find-all answered in pure disk-read time with the correct
   single match.
 
-## Remaining before the 1.0.0 freeze
+## Post-1.0 work
 
 - **Bounded session history.** The piece-tree edit history and its sidecar
   rewrite are unbounded: every flush re-serializes all history entries and
@@ -153,7 +153,7 @@ fix was verified by temporarily reverting it and watching that test fail.
   implementation details in rustdoc, and write down the semver policy for
   the post-1.0 line.
 
-## Known limitations accepted for 1.0
+## Known limitations
 
 These are documented trade-offs, not bugs. Each is visible in the public
 documentation.
@@ -195,12 +195,12 @@ May stay unstable:
 - low-level cache and layout choices;
 - internal storage details.
 
-## Exit criteria for 1.0.0
+## 1.0.0 freeze criteria — met at release (2026-11-19)
 
-- The remaining items above are either implemented or explicitly moved to
-  the post-1.0 line by decision.
-- The focused refactors leave the public surface unchanged while the
-  internals become smaller and easier to reason about.
+- The remaining items were either implemented or explicitly moved to the
+  post-1.0 line by decision.
+- The focused refactors left the public surface unchanged while the
+  internals became smaller and easier to reason about.
 - Non-critical `unsafe` blocks are gone, and each remaining site documents
   why it exists.
 - `unwrap` and `expect` no longer appear on hot or recoverable paths.
@@ -208,3 +208,10 @@ May stay unstable:
 - The semver rules for the post-1.0 line are written down.
 - Downstream applications can build products on top of Qem without
   expecting recurring redesign of the basic contract.
+
+## After 1.0
+
+The post-1.0 line starts with the items above plus the decisions parked
+during the 1.0 cycle: the session history cap (it changes the user-visible
+undo depth), the crates.io publication policy for patch releases, and the
+absolute character-phase tracking for CJK search candidates.
