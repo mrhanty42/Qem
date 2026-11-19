@@ -126,10 +126,10 @@ fix was verified by temporarily reverting it and watching that test fail.
   the document in bounded windows and carries a single CRLF-context byte
   across window edges; for UTF-16 the CRLF pair spans two cells, so the
   context must widen to the encoding's maximum cell width.
-- **Cheaper snapshot backing off Windows.** Non-Windows snapshot saves
-  still copy the whole source file; a cheaper backing needs design work.
-  Snapshot `save_async` should also share the edit buffer through `Arc`
-  instead of cloning it on the caller thread.
+- **Cheaper snapshot backing off Windows.** Non-Windows snapshot backing
+  still copies the whole source file at open; a cheaper backing needs
+  design work. Snapshot `save_async` should also share the edit buffer
+  through `Arc` instead of cloning it on the caller thread.
 - **Focused refactors, not a rewrite.** Split the overgrown modules into
   focused units (history, persistence, fragmentation, and the core
   piece-tree structure; named lifecycle helpers around inspection,
@@ -142,8 +142,9 @@ fix was verified by temporarily reverting it and watching that test fail.
 - **Remove `unwrap` and `expect` from recoverable paths**, replacing the
   remaining default-value patterns with typed error propagation.
 - **Backing transitions surface as events.** The `mmap → piece_table`
-  promotion is observable through typed status so frontends can react
-  instead of guessing.
+  promotion is observable today only through typed status polling;
+  surfacing transitions as typed events lets frontends react instead of
+  guessing.
 - **Regression benchmarks in CI.** Open, first viewport, first edit on huge
   files, edited save, literal search, and regex search each get a short
   regression bench tied to the recorded baselines.

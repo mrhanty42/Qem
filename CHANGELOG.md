@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-## Unreleased
-
 ### Changed
 
 - The README is restructured: a feature overview, a supported-encoding

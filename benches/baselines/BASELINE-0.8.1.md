@@ -9,7 +9,7 @@ Rust: 1.97.1 (8bab26f4f 2026-07-14)
 - OS: Windows 10 Home, build 19045
 - CPU: Intel Core i7-3770 @ 3.40GHz, 8 logical cores (Ivy Bridge)
 - RAM: 16 GB
-- Disk D:: HDD (~76 MB/s sequential write — measured during file generation)
+- Disk D: HDD (~76 MB/s sequential write — measured during file generation)
 - Benchmark file lives on D:, repository on C:
 
 ## File
@@ -37,10 +37,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\collect_perf_matrix.ps1 `
   -MeasureSave `
   -Release `
   -MatrixLabel post-0.9.0-50gb `
-  -OutputJsonl benchesaselines\perf-50gb-post-0.9.0.jsonl
+  -OutputJsonl benches\baselines\perf-50gb-post-0.9.0.jsonl
 powershell -ExecutionPolicy Bypass -File .\scripts\summarize_perf_matrix.ps1 `
-  -InputJsonl benchesaselines\perf-50gb-post-0.9.0.jsonl `
-  -OutputMarkdown benchesaselines\perf-50gb-post-0.9.0-summary.md
+  -InputJsonl benches\baselines\perf-50gb-post-0.9.0.jsonl `
+  -OutputMarkdown benches\baselines\perf-50gb-post-0.9.0-summary.md
 ```
 
 Procedure notes:
