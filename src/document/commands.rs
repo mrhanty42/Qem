@@ -1271,7 +1271,7 @@ impl Document {
 
         let range = self.text_range_for_selection(selection);
         self.prepare_edit_at(range.start().line0())?;
-        let text = self.read_text(range).into_text();
+        let text = self.read_text(range)?.into_text();
         let edit = self.try_delete_selection(selection)?;
         Ok(CutResult::new(text, edit))
     }

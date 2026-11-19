@@ -14,10 +14,12 @@ impl PieceTree {
     /// pages, so it must satisfy the same residency contract as
     /// `insert` / `delete_range`: while persistence is down the new root
     /// may only reference pages the resident window actually holds. A
-    /// root referencing a refused page reads back silently truncated
-    /// (`visit_range_ref` skips unreadable pages) and would stream that
-    /// truncation into every save. On refusal the previous root stays in
-    /// place and the error is reported to the caller.
+    /// root referencing a refused page reads back as a typed read error
+    /// (the read walkers fail on an unreadable page instead of silently
+    /// truncating behind `total_len`), and a save that materialized such
+    /// a root would fail typed rather than persist the loss. On refusal
+    /// the previous root stays in place and the error is reported to the
+    /// caller.
     pub(crate) fn replace_current_root_with_pieces(
         &mut self,
         pieces: Vec<Piece>,

@@ -269,13 +269,13 @@ proptest! {
  // (per `state.rs::text_lossy`), so the comparison is in
  // canonical UTF-8 regardless of the document's storage
  // encoding.
-        let text_before_save = doc.text_lossy();
+        let text_before_save = doc.text_lossy().unwrap();
 
         doc.save_to(&saved_path).expect("save_to must succeed for representable edits");
 
         let reopened = Document::open_with_encoding(&saved_path, encoding)
             .expect("reopen saved file with the same encoding must succeed");
-        let text_after_reopen = reopened.text_lossy();
+        let text_after_reopen = reopened.text_lossy().unwrap();
 
         prop_assert_eq!(
             &text_after_reopen,

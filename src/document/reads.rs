@@ -267,19 +267,24 @@ fn next_piece_table_scan_line_range(
     })
 }
 
-fn scanned_piece_table_offset_for_position(
+fn scanned_piece_table_offset_for_position_result(
     doc: &Document,
     piece_table: &PieceTable,
     position: TextPosition,
-) -> Option<(usize, bool)> {
+) -> io::Result<Option<(usize, bool)>> {
     if piece_table.full_index() || position.line0() < piece_table.line_count() {
-        let actual_col0 = position
-            .col0()
-            .min(piece_table.line_len_chars(position.line0()));
-        return Some((
-            piece_table.byte_offset_for_col(position.line0(), actual_col0),
+        let actual_col0 = position.col0().min(
+            piece_table
+                .line_len_chars_with_engine_result(position.line0(), piece_table.engine())?,
+        );
+        return Ok(Some((
+            piece_table.byte_offset_for_col_with_engine_result(
+                position.line0(),
+                actual_col0,
+                piece_table.engine(),
+            )?,
             true,
-        ));
+        )));
     }
 
     let scan_start = piece_table.known_byte_len.min(piece_table.total_len());
@@ -287,41 +292,47 @@ fn scanned_piece_table_offset_for_position(
         .saturating_add(PARTIAL_PIECE_TABLE_SCAN_BYTES)
         .min(piece_table.total_len());
     if scan_start >= scan_end {
-        return None;
+        return Ok(None);
     }
 
-    let bytes = piece_table.read_range(scan_start, scan_end);
+    let bytes = piece_table.read_range_result(scan_start, scan_end)?;
     let buffer_reaches_eof = scan_end == piece_table.total_len();
     let mut rel_start = 0usize;
     let mut skip_lines = position.line0().saturating_sub(piece_table.line_count());
     while skip_lines > 0 {
-        let scanned = next_piece_table_scan_line_range(
+        let Some(scanned) = next_piece_table_scan_line_range(
             &bytes,
             rel_start,
             buffer_reaches_eof,
             crate::document::utf16_break_cells(piece_table.engine().encoding().name()),
-        )?;
-        (scanned.range.1 > rel_start && scanned.complete).then_some(())?;
+        ) else {
+            return Ok(None);
+        };
+        if !(scanned.range.1 > rel_start && scanned.complete) {
+            return Ok(None);
+        }
         rel_start = scanned.range.1;
         skip_lines -= 1;
     }
 
-    let scanned = next_piece_table_scan_line_range(
+    let Some(scanned) = next_piece_table_scan_line_range(
         &bytes,
         rel_start,
         buffer_reaches_eof,
         crate::document::utf16_break_cells(piece_table.engine().encoding().name()),
-    )?;
+    ) else {
+        return Ok(None);
+    };
     let offset = byte_offset_for_text_col_with_engine(
         &bytes,
         scanned.range,
         position.col0(),
         piece_table.engine(),
     );
-    Some((
+    Ok(Some((
         scan_start.saturating_add(offset),
         doc.piece_table_position_is_representable(piece_table, position),
-    ))
+    )))
 }
 
 pub(super) fn trailing_mmap_line_ranges(
@@ -557,17 +568,21 @@ impl Document {
             .collect()
     }
 
-    fn line_slices_from_piece_table_backing(
+    /// Honest line-slice batch from the piece-table backing: fails typed
+    /// when any requested line crosses an unreadable piece page.
+    fn line_slices_from_piece_table_backing_result(
         &self,
         piece_table: &PieceTable,
         first_line0: usize,
         line_count: usize,
         start_col: usize,
         max_cols: usize,
-    ) -> Vec<LineSlice> {
+    ) -> Result<Vec<LineSlice>, DocumentError> {
         let requested_end = first_line0.saturating_add(line_count);
         if piece_table.full_index() || requested_end <= piece_table.line_count() {
-            return piece_table.line_slices_exact(first_line0, line_count, start_col, max_cols);
+            return piece_table
+                .line_slices_exact_result(first_line0, line_count, start_col, max_cols)
+                .map_err(|source| piece_table.read_error(source));
         }
 
         let exact_available = piece_table
@@ -575,7 +590,9 @@ impl Document {
             .saturating_sub(first_line0)
             .min(line_count);
         let mut slices = if exact_available > 0 {
-            piece_table.line_slices_exact(first_line0, exact_available, start_col, max_cols)
+            piece_table
+                .line_slices_exact_result(first_line0, exact_available, start_col, max_cols)
+                .map_err(|source| piece_table.read_error(source))?
         } else {
             Vec::new()
         };
@@ -583,19 +600,19 @@ impl Document {
         let remaining = line_count.saturating_sub(slices.len());
         if remaining > 0 {
             let scan_start_line0 = first_line0.saturating_add(slices.len());
-            if let Some(mut scanned) = self.line_slices_from_partial_piece_table_backing(
+            if let Some(mut scanned) = self.line_slices_from_partial_piece_table_backing_result(
                 piece_table,
                 scan_start_line0,
                 remaining,
                 start_col,
                 max_cols,
-            ) {
+            )? {
                 slices.append(&mut scanned);
             }
         }
 
         slices.resize(line_count, LineSlice::default());
-        slices
+        Ok(slices)
     }
 
     fn checkpoint_piece_table_line_slices(
@@ -614,22 +631,29 @@ impl Document {
         // Never apply an original-file checkpoint to edited tail text. Verify
         // that the entire unindexed tail is a contiguous original range first;
         // this also works with recovered sessions without assuming edit history.
-        let untouched = piece_table.pieces.visit_range_while(
-            boundary,
-            piece_table.total_len(),
-            |piece, local_start, local_end| {
-                if piece.src != PieceSource::Original {
-                    return false;
-                }
-                let start = piece.start.saturating_add(local_start);
-                if expected.is_some_and(|offset| offset != start) {
-                    return false;
-                }
-                original_start.get_or_insert(start);
-                expected = Some(piece.start.saturating_add(local_end));
-                true
-            },
-        );
+        // Degrade to None (checkpoint skipped, honest scan fallback runs
+        // instead) when the verification walk hits an unreadable piece
+        // page: the checkpoint path must never trust a range it could not
+        // fully walk.
+        let untouched = piece_table
+            .pieces
+            .visit_range_while_result(
+                boundary,
+                piece_table.total_len(),
+                |piece, local_start, local_end| {
+                    if piece.src != PieceSource::Original {
+                        return false;
+                    }
+                    let start = piece.start.saturating_add(local_start);
+                    if expected.is_some_and(|offset| offset != start) {
+                        return false;
+                    }
+                    original_start.get_or_insert(start);
+                    expected = Some(piece.start.saturating_add(local_end));
+                    true
+                },
+            )
+            .unwrap_or(false);
         if !untouched {
             return None;
         }
@@ -661,9 +685,18 @@ impl Document {
         // depend on which known_line_count convention constructed the table
         // (the line_lengths prefix and the checkpoint window differ by one).
         let mut doc_breaks_before_boundary = 0usize;
-        piece_table.pieces.visit_range(0, boundary, |piece, _, _| {
-            doc_breaks_before_boundary += piece.line_breaks;
-        });
+        // Same degradation as the untouched check: a silently undercounted
+        // break total would map the requested line onto the wrong original
+        // line and present wrong slices as exact.
+        if piece_table
+            .pieces
+            .visit_range_result(0, boundary, |piece, _, _| {
+                doc_breaks_before_boundary += piece.line_breaks;
+            })
+            .is_err()
+        {
+            return None;
+        }
         let target =
             original_line0.checked_add(first_line0.checked_sub(doc_breaks_before_boundary)?)?;
         let checkpoint = disk_index.checkpoint_for_line(target)?;
@@ -701,16 +734,20 @@ impl Document {
         Some(slices)
     }
 
-    fn line_slices_from_partial_piece_table_backing(
+    /// Honest partial-window line slices: fails typed when the scan window
+    /// crosses an unreadable piece page. `Ok(None)` keeps the legacy
+    /// "cannot resolve this row" answer (the caller pads with inexact
+    /// defaults).
+    fn line_slices_from_partial_piece_table_backing_result(
         &self,
         piece_table: &PieceTable,
         first_line0: usize,
         line_count: usize,
         start_col: usize,
         max_cols: usize,
-    ) -> Option<Vec<LineSlice>> {
+    ) -> Result<Option<Vec<LineSlice>>, DocumentError> {
         if line_count == 0 || first_line0 < piece_table.line_count() {
-            return Some(Vec::new());
+            return Ok(Some(Vec::new()));
         }
         let engine = self.encoding_engine();
         if let Some(slices) = self.checkpoint_piece_table_line_slices(
@@ -720,7 +757,7 @@ impl Document {
             start_col,
             max_cols,
         ) {
-            return Some(slices);
+            return Ok(Some(slices));
         }
 
         let scan_start = piece_table.known_byte_len.min(piece_table.total_len());
@@ -728,38 +765,40 @@ impl Document {
             .saturating_add(PARTIAL_PIECE_TABLE_SCAN_BYTES)
             .min(piece_table.total_len());
         if scan_start >= scan_end {
-            return Some(Vec::new());
+            return Ok(Some(Vec::new()));
         }
 
-        let bytes = piece_table.read_range(scan_start, scan_end);
+        let bytes = piece_table
+            .read_range_result(scan_start, scan_end)
+            .map_err(|source| piece_table.read_error(source))?;
         let buffer_reaches_eof = scan_end == piece_table.total_len();
         // Recovery metadata may end in the middle of an original line. In
         // that case the first scanned row (and every following row in this
         // window) has an uncertain logical line number; never advertise it as
         // exact even when the bounded scan itself reaches a newline.
-        let boundary_is_line_start = scan_start == 0
-            || matches!(
-                piece_table
-                    .read_range(scan_start.saturating_sub(1), scan_start)
-                    .last(),
-                Some(b'\n' | b'\r')
-            );
+        let boundary_byte = piece_table
+            .read_range_result(scan_start.saturating_sub(1), scan_start)
+            .map_err(|source| piece_table.read_error(source))?;
+        let boundary_is_line_start =
+            scan_start == 0 || matches!(boundary_byte.last(), Some(b'\n' | b'\r'));
         let mut rel_start = 0usize;
         let mut skip_lines = first_line0.saturating_sub(piece_table.line_count());
         while skip_lines > 0 {
-            let scanned = next_piece_table_scan_line_range(
+            let Some(scanned) = next_piece_table_scan_line_range(
                 &bytes,
                 rel_start,
                 buffer_reaches_eof,
                 crate::document::utf16_break_cells(piece_table.engine().encoding().name()),
-            )?;
+            ) else {
+                return Ok(None);
+            };
             if scanned.range.1 <= rel_start {
-                return None;
+                return Ok(None);
             }
             rel_start = scanned.range.1;
             skip_lines -= 1;
             if !scanned.complete {
-                return None;
+                return Ok(None);
             }
         }
 
@@ -772,12 +811,14 @@ impl Document {
                 break;
             }
 
-            let scanned = next_piece_table_scan_line_range(
+            let Some(scanned) = next_piece_table_scan_line_range(
                 &bytes,
                 rel_start,
                 buffer_reaches_eof,
                 crate::document::utf16_break_cells(piece_table.engine().encoding().name()),
-            )?;
+            ) else {
+                break;
+            };
             if scanned.range.1 <= rel_start {
                 break;
             }
@@ -802,7 +843,28 @@ impl Document {
             }
         }
 
-        Some(slices)
+        Ok(Some(slices))
+    }
+
+    /// Legacy silent partial-window slices; on a read failure degrades to
+    /// "cannot resolve" (`None`) exactly like an unresolvable scan.
+    fn line_slices_from_partial_piece_table_backing(
+        &self,
+        piece_table: &PieceTable,
+        first_line0: usize,
+        line_count: usize,
+        start_col: usize,
+        max_cols: usize,
+    ) -> Option<Vec<LineSlice>> {
+        self.line_slices_from_partial_piece_table_backing_result(
+            piece_table,
+            first_line0,
+            line_count,
+            start_col,
+            max_cols,
+        )
+        .ok()
+        .flatten()
     }
 
     fn tail_estimated_mmap_line_slices(
@@ -1015,25 +1077,44 @@ impl Document {
         piece_table: &PieceTable,
         start: TextPosition,
         len_chars: usize,
-    ) -> TextSlice {
-        let Some((start_offset, exact_start)) =
-            scanned_piece_table_offset_for_position(self, piece_table, start)
-        else {
-            return TextSlice::new(String::new(), false);
-        };
+    ) -> Result<TextSlice, DocumentError> {
+        let (start_offset, exact_start) =
+            match scanned_piece_table_offset_for_position_result(self, piece_table, start)
+                .map_err(|source| piece_table.read_error(source))?
+            {
+                Some(resolved) => resolved,
+                None => return Ok(TextSlice::new(String::new(), false)),
+            };
         // Engine-aware cell walking and decoding: the naive UTF-8 variants
         // corrupted every non-UTF-8 piece-table read (U+FFFD garbage).
         let engine = self.encoding_engine();
+        // Bounded readability pre-check: the text-unit advance runs through
+        // the silent byte-movement helpers, so an unreadable piece page
+        // inside the requested span would silently stop the walk early and
+        // return a shortened slice. Every text unit is at most 4 bytes wide
+        // (UTF-16 supplementary pair, GB18030 four-byte sequence) and a
+        // stored CRLF collapses into one unit, so `4 * len_chars + 4`
+        // bounds every byte the requested range can possibly cover. Any
+        // page miss inside that span surfaces as a typed read error here.
+        let verify_end = start_offset
+            .saturating_add(len_chars.saturating_mul(4))
+            .saturating_add(4);
+        piece_table
+            .pieces
+            .verify_range_readable(start_offset, verify_end)
+            .map_err(|source| piece_table.read_error(source))?;
         let end_offset =
             piece_table.advance_offset_by_text_units_with_engine(start_offset, len_chars, engine);
         let end =
             piece_table.position_for_byte_offset_from(start_offset, start, end_offset, engine);
         let exact_end = self.read_position_is_exact(end);
-        let bytes = piece_table.read_range(start_offset, end_offset);
-        TextSlice::new(
+        let bytes = piece_table
+            .read_range_result(start_offset, end_offset)
+            .map_err(|source| piece_table.read_error(source))?;
+        Ok(TextSlice::new(
             decode_window_for_engine(engine, &bytes),
             exact_start && exact_end,
-        )
+        ))
     }
 
     fn read_text_from_mmap_backing(&self, start: TextPosition, len_chars: usize) -> TextSlice {
@@ -1095,6 +1176,11 @@ impl Document {
     /// This is useful for large-file UI rendering: for mmap-backed documents it
     /// tries to reuse a single byte scan instead of performing many independent
     /// lookups.
+    ///
+    /// Legacy best-effort wrapper: on a piece-table backing whose sidecar
+    /// page no longer loads this degrades to inexact default rows instead
+    /// of failing. Use [`Document::read_viewport`] (or
+    /// [`Document::line_slices_result`]) for the honest typed read.
     pub fn line_slices(
         &self,
         first_line0: usize,
@@ -1102,22 +1188,36 @@ impl Document {
         start_col: usize,
         max_cols: usize,
     ) -> Vec<LineSlice> {
+        self.line_slices_result(first_line0, line_count, start_col, max_cols)
+            .unwrap_or_else(|_| vec![LineSlice::default(); line_count])
+    }
+
+    /// Honest batched line read: fails typed when the requested rows cross
+    /// an unreadable piece page instead of silently returning degraded
+    /// rows. See [`Document::line_slices`] for the legacy wrapper.
+    pub fn line_slices_result(
+        &self,
+        first_line0: usize,
+        line_count: usize,
+        start_col: usize,
+        max_cols: usize,
+    ) -> Result<Vec<LineSlice>, DocumentError> {
         if line_count == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         if let Some(rope) = &self.rope {
-            return Self::line_slices_from_rope_backing(
+            return Ok(Self::line_slices_from_rope_backing(
                 rope,
                 first_line0,
                 line_count,
                 start_col,
                 max_cols,
-            );
+            ));
         }
 
         if let Some(piece_table) = &self.piece_table {
-            return self.line_slices_from_piece_table_backing(
+            return self.line_slices_from_piece_table_backing_result(
                 piece_table,
                 first_line0,
                 line_count,
@@ -1126,7 +1226,7 @@ impl Document {
             );
         }
 
-        self.line_slices_from_mmap_backing(first_line0, line_count, start_col, max_cols)
+        Ok(self.line_slices_from_mmap_backing(first_line0, line_count, start_col, max_cols))
     }
 
     /// Reads a typed text range with lossy UTF-8 decoding.
@@ -1138,32 +1238,47 @@ impl Document {
     /// When a clean mmap-backed document has not indexed the requested start
     /// line yet, Qem may fall back to a heuristic start range and mark the
     /// returned slice as inexact.
-    pub fn read_text(&self, range: TextRange) -> TextSlice {
+    ///
+    /// Returns [`DocumentError::Read`] when the backing cannot materialize
+    /// the requested bytes (for a piece-table backing: a piece page that
+    /// no longer loads from the session sidecar). A read must never come
+    /// back silently shortened behind the advertised `total_len`.
+    pub fn read_text(&self, range: TextRange) -> Result<TextSlice, DocumentError> {
         let start = self.clamp_position(range.start());
         if range.is_empty() {
             if self.rope.is_some() || self.piece_table.is_some() {
-                return TextSlice::new(String::new(), self.read_position_is_exact(start));
+                return Ok(TextSlice::new(
+                    String::new(),
+                    self.read_position_is_exact(start),
+                ));
             }
 
             let file_len = self.file_len.min(self.mmap_bytes().len());
             let start_offset = self.mmap_byte_offset_for_position(start).min(file_len);
             let exact = self.mmap_position_for_byte_offset(start_offset) == start;
-            return TextSlice::new(String::new(), exact);
+            return Ok(TextSlice::new(String::new(), exact));
         }
 
         if let Some(rope) = &self.rope {
-            return Self::read_text_from_rope_backing(rope, start, range.len_chars());
+            return Ok(Self::read_text_from_rope_backing(
+                rope,
+                start,
+                range.len_chars(),
+            ));
         }
 
         if let Some(piece_table) = &self.piece_table {
             return self.read_text_from_piece_table_backing(piece_table, start, range.len_chars());
         }
 
-        self.read_text_from_mmap_backing(start, range.len_chars())
+        Ok(self.read_text_from_mmap_backing(start, range.len_chars()))
     }
 
     /// Reads the current selection as a typed text slice.
-    pub fn read_selection(&self, selection: TextSelection) -> TextSlice {
+    ///
+    /// Returns [`DocumentError::Read`] when the backing cannot materialize
+    /// the selected bytes (see [`Document::read_text`]).
+    pub fn read_selection(&self, selection: TextSelection) -> Result<TextSlice, DocumentError> {
         let selection = self.clamp_selection(selection);
         let piece_table_endpoints_exact = self
             .piece_table
@@ -1173,30 +1288,33 @@ impl Document {
                     && self.read_position_is_exact(selection.head())
             })
             .unwrap_or(true);
-        let slice = self.read_text(self.text_range_for_selection(selection));
+        let slice = self.read_text(self.text_range_for_selection(selection))?;
         if !piece_table_endpoints_exact || self.selection_requires_piece_table_promotion(selection)
         {
-            return TextSlice::new(slice.into_text(), false);
+            return Ok(TextSlice::new(slice.into_text(), false));
         }
-        slice
+        Ok(slice)
     }
 
     /// Reads a viewport using a typed request/response model.
     ///
     /// This is the intended frontend-facing API for scrollable viewers and
     /// editors that want to own their own cursor and scrollbar rendering.
-    pub fn read_viewport(&self, request: ViewportRequest) -> Viewport {
+    ///
+    /// Returns [`DocumentError::Read`] when the backing cannot materialize
+    /// the requested rows (see [`Document::read_text`]).
+    pub fn read_viewport(&self, request: ViewportRequest) -> Result<Viewport, DocumentError> {
         let rows = self
-            .line_slices(
+            .line_slices_result(
                 request.first_line0(),
                 request.line_count(),
                 request.start_col(),
                 request.max_cols(),
-            )
+            )?
             .into_iter()
             .enumerate()
             .map(|(offset, slice)| ViewportRow::new(request.first_line0() + offset, slice))
             .collect();
-        Viewport::new(request, self.line_count(), rows)
+        Ok(Viewport::new(request, self.line_count(), rows))
     }
 }

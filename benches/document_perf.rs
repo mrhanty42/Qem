@@ -277,7 +277,8 @@ fn bench_scroll(c: &mut Criterion) {
                 doc.read_viewport(
                     ViewportRequest::new(black_box(middle_line), VIEWPORT_LINES)
                         .with_columns(0, VIEWPORT_COLS),
-                ),
+                )
+                .unwrap(),
             )
         });
     });
@@ -287,7 +288,8 @@ fn bench_scroll(c: &mut Criterion) {
                 doc.read_viewport(
                     ViewportRequest::new(black_box(tail_line), VIEWPORT_LINES)
                         .with_columns(0, VIEWPORT_COLS),
-                ),
+                )
+                .unwrap(),
             )
         });
     });
@@ -309,26 +311,26 @@ fn bench_session_layer_reads(c: &mut Criterion) {
     let mut viewport_group = c.benchmark_group("session_layer_viewport_reads");
     viewport_group.throughput(Throughput::Elements(VIEWPORT_LINES as u64));
     viewport_group.bench_function(BenchmarkId::new("document", fixture.label), |b| {
-        b.iter(|| black_box(doc.read_viewport(request)))
+        b.iter(|| black_box(doc.read_viewport(request).unwrap()))
     });
     viewport_group.bench_function(BenchmarkId::new("session", fixture.label), |b| {
-        b.iter(|| black_box(session.read_viewport(request)))
+        b.iter(|| black_box(session.read_viewport(request).unwrap()))
     });
     viewport_group.bench_function(BenchmarkId::new("tab", fixture.label), |b| {
-        b.iter(|| black_box(tab.read_viewport(request)))
+        b.iter(|| black_box(tab.read_viewport(request).unwrap()))
     });
     viewport_group.finish();
 
     let mut text_group = c.benchmark_group("session_layer_text_reads");
     text_group.throughput(Throughput::Elements(range.len_chars() as u64));
     text_group.bench_function(BenchmarkId::new("document", fixture.label), |b| {
-        b.iter(|| black_box(doc.read_text(range)))
+        b.iter(|| black_box(doc.read_text(range).unwrap()))
     });
     text_group.bench_function(BenchmarkId::new("session", fixture.label), |b| {
-        b.iter(|| black_box(session.read_text(range)))
+        b.iter(|| black_box(session.read_text(range).unwrap()))
     });
     text_group.bench_function(BenchmarkId::new("tab", fixture.label), |b| {
-        b.iter(|| black_box(tab.read_text(range)))
+        b.iter(|| black_box(tab.read_text(range).unwrap()))
     });
     text_group.finish();
 
@@ -469,14 +471,14 @@ fn bench_typed_reads(c: &mut Criterion) {
     let mut group = c.benchmark_group("typed_text_reads");
     group.throughput(Throughput::Elements(range.len_chars() as u64));
     group.bench_function(BenchmarkId::new("mmap_read_text", fixture.label), |b| {
-        b.iter(|| black_box(mmap_doc.read_text(range)))
+        b.iter(|| black_box(mmap_doc.read_text(range).unwrap()))
     });
     group.bench_function(BenchmarkId::new("edited_read_text", fixture.label), |b| {
-        b.iter(|| black_box(edited_case.doc.read_text(range)))
+        b.iter(|| black_box(edited_case.doc.read_text(range).unwrap()))
     });
     group.bench_function(
         BenchmarkId::new("mmap_read_selection", fixture.label),
-        |b| b.iter(|| black_box(mmap_doc.read_selection(selection))),
+        |b| b.iter(|| black_box(mmap_doc.read_selection(selection).unwrap())),
     );
     group.finish();
 }
@@ -1097,11 +1099,11 @@ fn bench_text_materialization(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(6));
     group.bench_function(
         BenchmarkId::new("small_text_lossy", small_fixture.label),
-        |b| b.iter(|| black_box(small_doc.text_lossy())),
+        |b| b.iter(|| black_box(small_doc.text_lossy().unwrap())),
     );
     group.bench_function(
         BenchmarkId::new("edited_text_lossy", large_fixture.label),
-        |b| b.iter(|| black_box(edited_case.doc.text_lossy())),
+        |b| b.iter(|| black_box(edited_case.doc.text_lossy().unwrap())),
     );
     group.finish();
 }
@@ -1248,10 +1250,12 @@ fn bench_edited_scroll(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("prefix", fixture.label), |b| {
         b.iter(|| {
             black_box(
-                case.doc.read_viewport(
-                    ViewportRequest::new(black_box(1024), VIEWPORT_LINES)
-                        .with_columns(0, VIEWPORT_COLS),
-                ),
+                case.doc
+                    .read_viewport(
+                        ViewportRequest::new(black_box(1024), VIEWPORT_LINES)
+                            .with_columns(0, VIEWPORT_COLS),
+                    )
+                    .unwrap(),
             )
         });
     });

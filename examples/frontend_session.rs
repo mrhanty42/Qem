@@ -15,7 +15,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     session.open_file_async(input.clone())?;
     wait_for_load(&mut session, Duration::from_secs(5))?;
 
-    let viewport = session.read_viewport(ViewportRequest::new(0, 20).with_columns(0, 160));
+    let viewport = session
+        .read_viewport(ViewportRequest::new(0, 20).with_columns(0, 160))
+        .unwrap();
     let status = session.status();
 
     println!("opened: {}", input.display());

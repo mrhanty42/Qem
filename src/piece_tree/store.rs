@@ -115,7 +115,7 @@ impl PageStore {
     /// readable for the rest of the session. While persistence is down
     /// new pages live only in the bounded resident window, so a page the
     /// window refused must fail the edit instead of being referenced by
-    /// a root that reads would silently skip.
+    /// a root that reads would fail typed on.
     pub(super) fn verify_pages_resident_since(&self, first_new_page: u64) -> io::Result<()> {
         match self {
             Self::InMemory(_) => Ok(()),

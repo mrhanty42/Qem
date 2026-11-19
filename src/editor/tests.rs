@@ -80,7 +80,7 @@ fn session_open_file_with_encoding_exposes_decoded_text() {
         DocumentEncodingOrigin::ExplicitReinterpretation
     );
     assert!(!session.decoding_had_errors());
-    assert_eq!(session.text(), "привет\n");
+    assert_eq!(session.text().unwrap(), "привет\n");
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
@@ -155,7 +155,7 @@ fn session_open_file_with_encoding_gb18030_round_trips_default_save() {
         DocumentEncodingOrigin::ExplicitReinterpretation
     );
     assert!(!session.decoding_had_errors());
-    assert_eq!(session.text(), source_text);
+    assert_eq!(session.text().unwrap(), source_text);
 
     let _ = session
         .try_insert(TextPosition::new(0, 0), inserted_text)
@@ -199,7 +199,7 @@ fn session_open_file_with_auto_detection_handles_utf16le_bom() {
         session.encoding_origin(),
         DocumentEncodingOrigin::AutoDetected
     );
-    assert_eq!(session.text(), "hello\n");
+    assert_eq!(session.text().unwrap(), "hello\n");
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
@@ -226,7 +226,7 @@ fn session_open_file_with_auto_detection_and_fallback_reinterprets_when_needed()
         session.encoding_origin(),
         DocumentEncodingOrigin::AutoDetectFallbackOverride
     );
-    assert_eq!(session.text(), "caf\u{00C3}\u{00A9}\n");
+    assert_eq!(session.text().unwrap(), "caf\u{00C3}\u{00A9}\n");
 
     let status = session.status();
     assert_eq!(status.encoding(), encoding);
@@ -292,7 +292,7 @@ fn session_preserve_save_rejects_lossy_shift_jis_source() {
         .unwrap();
 
     assert!(session.decoding_had_errors());
-    assert_eq!(session.text(), "\u{FFFD}");
+    assert_eq!(session.text().unwrap(), "\u{FFFD}");
     assert!(session.status().decoding_had_errors());
     assert!(!session.can_preserve_save());
     assert_eq!(
@@ -652,7 +652,7 @@ fn tab_open_file_async_with_auto_detection_and_fallback_prefers_detected_bom() {
 
     assert_eq!(tab.encoding(), DocumentEncoding::utf16le());
     assert_eq!(tab.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
-    assert_eq!(tab.text(), "hello\n");
+    assert_eq!(tab.text().unwrap(), "hello\n");
 
     let status = tab.status();
     assert_eq!(status.encoding(), DocumentEncoding::utf16le());
@@ -708,7 +708,7 @@ fn tab_open_file_async_with_auto_detection_handles_utf16be_bom() {
 
     assert_eq!(tab.encoding(), DocumentEncoding::utf16be());
     assert_eq!(tab.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
-    assert_eq!(tab.text(), "hello\n");
+    assert_eq!(tab.text().unwrap(), "hello\n");
     // Mmap-only UTF-16 tabs stream their bytes through the
     // Class A native preserve branch and therefore allow preserve-save.
     assert!(tab.can_preserve_save());
@@ -1180,7 +1180,7 @@ fn editor_tab_rejects_edits_while_async_save_is_in_progress() {
             reason,
         } if blocked_path == &path && reason == "cannot edit while background save is in progress"
     ));
-    assert!(tab.text().starts_with("123abc\ndef\n"));
+    assert!(tab.text().unwrap().starts_with("123abc\ndef\n"));
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1194,7 +1194,7 @@ fn editor_tab_rejects_edits_while_async_save_is_in_progress() {
 
     assert!(!tab.is_busy());
     assert!(!tab.is_dirty());
-    assert!(tab.text().starts_with("123abc\ndef\n"));
+    assert!(tab.text().unwrap().starts_with("123abc\ndef\n"));
     assert!(fs::read(&path).unwrap().starts_with(b"123abc\ndef\n"));
 
     let _ = fs::remove_file(&path);
@@ -1404,7 +1404,7 @@ fn editor_tab_close_file_while_async_save_defers_until_completion() {
     assert!(tab.close_pending());
     assert_eq!(tab.current_path(), Some(path.as_path()));
     assert_eq!(tab.cursor(), cursor);
-    assert!(tab.text().starts_with("123abc\ndef\n"));
+    assert!(tab.text().unwrap().starts_with("123abc\ndef\n"));
     assert_eq!(tab.generation(), generation);
     let status = tab.status();
     assert!(status.close_pending());
@@ -1425,7 +1425,7 @@ fn editor_tab_close_file_while_async_save_defers_until_completion() {
     assert!(!tab.is_busy());
     assert!(!tab.close_pending());
     assert_eq!(tab.current_path(), None);
-    assert_eq!(tab.text(), "");
+    assert_eq!(tab.text().unwrap(), "");
     assert!(!tab.is_dirty());
     assert_eq!(tab.cursor(), CursorPosition::default());
     assert_eq!(tab.generation(), generation.wrapping_add(1));
@@ -1454,7 +1454,7 @@ fn editor_tab_close_file_while_async_save_failure_keeps_dirty_document_open() {
     let _ = tab.try_insert(TextPosition::new(0, 0), "123").unwrap();
     let generation = tab.generation();
     let cursor = tab.cursor();
-    let text = tab.text();
+    let text = tab.text().unwrap();
 
     assert!(tab.save_as_async(output.clone()).unwrap());
     tab.close_file();
@@ -1464,7 +1464,7 @@ fn editor_tab_close_file_while_async_save_failure_keeps_dirty_document_open() {
     assert!(tab.close_pending());
     assert_eq!(tab.current_path(), Some(path.as_path()));
     assert_eq!(tab.cursor(), cursor);
-    assert_eq!(tab.text(), text);
+    assert_eq!(tab.text().unwrap(), text);
     assert!(tab.status().close_pending());
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1487,7 +1487,7 @@ fn editor_tab_close_file_while_async_save_failure_keeps_dirty_document_open() {
     assert!(tab.is_dirty());
     assert_eq!(tab.current_path(), Some(path.as_path()));
     assert_eq!(tab.cursor(), cursor);
-    assert_eq!(tab.text(), text);
+    assert_eq!(tab.text().unwrap(), text);
     assert_eq!(tab.generation(), generation);
     assert!(tab.save_state().is_none());
     assert!(!tab.status().close_pending());
@@ -1495,7 +1495,7 @@ fn editor_tab_close_file_while_async_save_failure_keeps_dirty_document_open() {
 
     tab.close_file();
     assert_eq!(tab.current_path(), None);
-    assert_eq!(tab.text(), "");
+    assert_eq!(tab.text().unwrap(), "");
     assert!(!tab.is_dirty());
     assert_eq!(tab.cursor(), CursorPosition::default());
     assert_eq!(tab.generation(), generation.wrapping_add(1));
@@ -1557,7 +1557,7 @@ fn editor_tab_document_mut_while_close_is_deferred_cancels_pending_close() {
     assert!(!tab.close_pending());
     assert_eq!(tab.current_path(), Some(path.as_path()));
     assert!(tab.is_dirty());
-    assert!(tab.text().starts_with("Z123abc\ndef\n"));
+    assert!(tab.text().unwrap().starts_with("Z123abc\ndef\n"));
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(&output);
@@ -1607,7 +1607,7 @@ fn editor_tab_document_mut_during_async_save_discards_stale_save_result() {
     assert!(!tab.is_busy());
     assert!(tab.is_dirty());
     assert_eq!(tab.current_path(), Some(path.as_path()));
-    assert!(tab.text().starts_with("Z123abc\ndef\n"));
+    assert!(tab.text().unwrap().starts_with("Z123abc\ndef\n"));
     assert!(fs::read(&output).unwrap().starts_with(b"123abc\ndef\n"));
     assert_eq!(fs::read(&path).unwrap(), original);
     let issue = tab
@@ -1685,7 +1685,7 @@ fn same_path_async_save_discard_keeps_recovery_usable_after_manual_flush() {
         "same-path discard recovery should restore the piece-table session"
     );
     assert!(
-        reopened.text_lossy().starts_with("Z123abc\ndef\n"),
+        reopened.text_lossy().unwrap().starts_with("Z123abc\ndef\n"),
         "reopened recovery should keep the post-discard edit"
     );
     assert!(
@@ -1693,7 +1693,7 @@ fn same_path_async_save_discard_keeps_recovery_usable_after_manual_flush() {
         "same-path discard recovery should preserve undo history"
     );
     assert!(
-        reopened.text_lossy().starts_with("123abc\ndef\n"),
+        reopened.text_lossy().unwrap().starts_with("123abc\ndef\n"),
         "undo after recovered discard should reach the pre-discard edit state"
     );
     assert!(
@@ -1701,7 +1701,7 @@ fn same_path_async_save_discard_keeps_recovery_usable_after_manual_flush() {
         "same-path discard recovery should preserve redo history"
     );
     assert!(
-        reopened.text_lossy().starts_with("Z123abc\ndef\n"),
+        reopened.text_lossy().unwrap().starts_with("Z123abc\ndef\n"),
         "redo after recovered discard should restore the latest state"
     );
 
@@ -1755,11 +1755,11 @@ fn same_path_async_save_discard_rebases_reordered_add_history() {
     tab.document_mut().flush_session().unwrap();
 
     let mut reopened = Document::open(path.clone()).unwrap();
-    assert!(reopened.text_lossy().starts_with("ZYXabc\ndef\n"));
+    assert!(reopened.text_lossy().unwrap().starts_with("ZYXabc\ndef\n"));
     assert!(reopened.try_undo().unwrap());
-    assert!(reopened.text_lossy().starts_with("YXabc\ndef\n"));
+    assert!(reopened.text_lossy().unwrap().starts_with("YXabc\ndef\n"));
     assert!(reopened.try_redo().unwrap());
-    assert!(reopened.text_lossy().starts_with("ZYXabc\ndef\n"));
+    assert!(reopened.text_lossy().unwrap().starts_with("ZYXabc\ndef\n"));
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
@@ -1810,7 +1810,7 @@ fn same_path_async_save_discard_is_recoverable_without_manual_flush() {
     let reopened = Document::open(path.clone()).unwrap();
     assert!(reopened.is_dirty());
     assert!(reopened.has_piece_table());
-    assert!(reopened.text_lossy().starts_with("Z123abc\ndef\n"));
+    assert!(reopened.text_lossy().unwrap().starts_with("Z123abc\ndef\n"));
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
@@ -1866,13 +1866,13 @@ fn same_path_async_save_discard_preserves_removed_pre_save_add_history() {
         "discarded same-path save should remain recoverable even when older undo history references removed pre-save add text"
     );
     assert!(reopened.has_piece_table());
-    assert!(reopened.text_lossy().starts_with("Z123abc\ndef\n"));
+    assert!(reopened.text_lossy().unwrap().starts_with("Z123abc\ndef\n"));
     assert!(reopened.try_undo().unwrap());
-    assert!(reopened.text_lossy().starts_with("123abc\ndef\n"));
+    assert!(reopened.text_lossy().unwrap().starts_with("123abc\ndef\n"));
     assert!(reopened.try_undo().unwrap());
-    assert!(reopened.text_lossy().starts_with("abc\ndef\n"));
+    assert!(reopened.text_lossy().unwrap().starts_with("abc\ndef\n"));
     assert!(reopened.try_undo().unwrap());
-    assert!(reopened.text_lossy().starts_with("Xabc\ndef\n"));
+    assert!(reopened.text_lossy().unwrap().starts_with("Xabc\ndef\n"));
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
@@ -2022,7 +2022,9 @@ fn open_file_async_completes_and_exposes_progress() {
             .len_chars(),
         4
     );
-    let viewport = tab.read_viewport(ViewportRequest::new(0, 2).with_columns(0, 16));
+    let viewport = tab
+        .read_viewport(ViewportRequest::new(0, 2).with_columns(0, 16))
+        .unwrap();
     assert_eq!(viewport.rows()[0].text(), "alpha");
     assert!(matches!(
         tab.background_activity(),
@@ -2050,7 +2052,7 @@ fn open_file_async_failure_preserves_existing_tab_state() {
 
     let generation = tab.generation();
     let cursor = tab.cursor();
-    let text = tab.text();
+    let text = tab.text().unwrap();
 
     tab.open_file_async(missing.clone()).unwrap();
 
@@ -2085,7 +2087,7 @@ fn open_file_async_failure_preserves_existing_tab_state() {
     assert_eq!(tab.generation(), generation);
     assert_eq!(tab.cursor(), cursor);
     assert_eq!(tab.current_path(), Some(path.as_path()));
-    assert_eq!(tab.text(), text);
+    assert_eq!(tab.text().unwrap(), text);
     assert!(tab.is_dirty());
     let issue = tab
         .background_issue()
@@ -2191,7 +2193,7 @@ fn document_session_repeated_open_file_async_keeps_first_job_authoritative() {
     }
 
     assert_eq!(session.current_path(), Some(first.as_path()));
-    assert_eq!(session.text(), "first\n");
+    assert_eq!(session.text().unwrap(), "first\n");
 
     let _ = fs::remove_file(&first);
     let _ = fs::remove_file(&second);
@@ -2213,7 +2215,7 @@ fn editor_tab_try_insert_updates_cursor() {
     assert_eq!(tab.cursor().column(), 5);
     assert!(tab.is_dirty());
     assert_eq!(tab.display_line_count(), 2);
-    assert_eq!(tab.text(), "alpha\nbeta");
+    assert_eq!(tab.text().unwrap(), "alpha\nbeta");
     assert_eq!(status.id(), 11);
     assert_eq!(status.generation(), 0);
     assert_eq!(status.cursor().line(), 2);
@@ -2269,14 +2271,14 @@ fn editor_tab_selection_helpers_update_cursor() {
         }
     );
     let selection = TextSelection::new(TextPosition::new(1, 2), TextPosition::new(0, 4));
-    let selected = tab.read_selection(selection);
+    let selected = tab.read_selection(selection).unwrap();
     assert!(selected.is_exact());
     assert_eq!(selected.text(), "a\nbe");
     let cursor = tab.try_replace_selection(selection, "Z").unwrap();
 
     assert_eq!(cursor, TextPosition::new(0, 5));
     assert_eq!(tab.cursor_position(), TextPosition::new(0, 5));
-    assert_eq!(tab.text(), "alphZta");
+    assert_eq!(tab.text().unwrap(), "alphZta");
 
     let delete = tab
         .try_delete_selection(TextSelection::caret(TextPosition::new(0, 2)))
@@ -2297,7 +2299,7 @@ fn editor_tab_delete_forward_updates_cursor() {
     assert!(result.changed());
     assert_eq!(result.cursor(), TextPosition::new(0, 5));
     assert_eq!(tab.cursor_position(), TextPosition::new(0, 5));
-    assert_eq!(tab.text(), "alphabeta");
+    assert_eq!(tab.text().unwrap(), "alphabeta");
 }
 
 #[test]
@@ -2318,7 +2320,7 @@ fn editor_tab_cut_selection_updates_cursor() {
     assert!(cut.changed());
     assert_eq!(cut.cursor(), TextPosition::new(0, 3));
     assert_eq!(tab.cursor_position(), TextPosition::new(0, 3));
-    assert_eq!(tab.text(), "alpta");
+    assert_eq!(tab.text().unwrap(), "alpta");
 }
 
 #[test]
@@ -2337,7 +2339,7 @@ fn editor_tab_selection_delete_commands_update_cursor() {
     assert!(deleted.changed());
     assert_eq!(deleted.cursor(), TextPosition::new(0, 3));
     assert_eq!(tab.cursor_position(), TextPosition::new(0, 3));
-    assert_eq!(tab.text(), "alpta");
+    assert_eq!(tab.text().unwrap(), "alpta");
 
     let backspace = tab
         .try_backspace_selection(TextSelection::caret(TextPosition::new(0, 2)))
@@ -2345,7 +2347,7 @@ fn editor_tab_selection_delete_commands_update_cursor() {
     assert!(backspace.changed());
     assert_eq!(backspace.cursor(), TextPosition::new(0, 1));
     assert_eq!(tab.cursor_position(), TextPosition::new(0, 1));
-    assert_eq!(tab.text(), "apta");
+    assert_eq!(tab.text().unwrap(), "apta");
 }
 
 #[test]
@@ -2362,7 +2364,7 @@ fn cancel_clear_dirty_after_open_preserves_real_edit() {
     tab.after_text_edit_frame();
 
     assert!(tab.is_dirty());
-    assert!(tab.text().starts_with('X'));
+    assert!(tab.text().unwrap().starts_with('X'));
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
@@ -2388,7 +2390,7 @@ fn after_text_edit_frame_does_not_clear_real_tab_edit_after_clean_open() {
 
     assert!(tab.is_dirty());
     assert!(tab.status().is_dirty());
-    assert_eq!(tab.text(), "Xalpha\n");
+    assert_eq!(tab.text().unwrap(), "Xalpha\n");
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
@@ -2430,7 +2432,7 @@ fn after_document_frame_does_not_clear_real_session_edit_after_async_open() {
 
     assert!(session.is_dirty());
     assert!(session.status().is_dirty());
-    assert_eq!(session.text(), "Xalpha\n");
+    assert_eq!(session.text().unwrap(), "Xalpha\n");
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
@@ -2447,7 +2449,7 @@ fn document_session_rejects_edits_while_async_open_is_in_progress() {
 
     let mut session = DocumentSession::new();
     session.open_file(current.clone()).unwrap();
-    assert_eq!(session.text(), "current\n");
+    assert_eq!(session.text().unwrap(), "current\n");
 
     session.open_file_async(next.clone()).unwrap();
     assert!(session.is_loading());
@@ -2463,7 +2465,7 @@ fn document_session_rejects_edits_while_async_open_is_in_progress() {
         } if blocked_path == &current && reason == "cannot edit while background load is in progress"
     ));
     assert_eq!(session.current_path(), Some(current.as_path()));
-    assert_eq!(session.text(), "current\n");
+    assert_eq!(session.text().unwrap(), "current\n");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -2477,7 +2479,7 @@ fn document_session_rejects_edits_while_async_open_is_in_progress() {
 
     assert!(!session.is_busy());
     assert_eq!(session.current_path(), Some(next.as_path()));
-    assert_eq!(session.text(), "next\n");
+    assert_eq!(session.text().unwrap(), "next\n");
 
     let _ = fs::remove_file(&current);
     let _ = fs::remove_file(&next);
@@ -2539,7 +2541,7 @@ fn document_session_save_apis_report_loading_instead_of_no_path_during_first_asy
     }
 
     assert_eq!(session.current_path(), Some(input.as_path()));
-    assert_eq!(session.text(), "input\n");
+    assert_eq!(session.text().unwrap(), "input\n");
 
     let _ = fs::remove_file(&input);
     let _ = fs::remove_dir_all(&dir);
@@ -2588,7 +2590,7 @@ fn document_session_document_mut_during_async_open_discards_stale_load_result() 
     assert!(!session.is_busy());
     assert_eq!(session.current_path(), Some(current.as_path()));
     assert!(session.is_dirty());
-    assert_eq!(session.text(), "Xcurrent\n");
+    assert_eq!(session.text().unwrap(), "Xcurrent\n");
     let issue = session
         .background_issue()
         .expect("discarded background load should be retained");
@@ -2701,7 +2703,7 @@ fn editor_tab_set_path_during_async_save_discards_stale_save_result() {
     assert!(!tab.is_busy());
     assert!(tab.is_dirty());
     assert_eq!(tab.current_path(), Some(override_path.as_path()));
-    assert!(tab.text().starts_with("123abc\ndef\n"));
+    assert!(tab.text().unwrap().starts_with("123abc\ndef\n"));
     assert!(fs::read(&output).unwrap().starts_with(b"123abc\ndef\n"));
     assert_eq!(fs::read(&source).unwrap(), original);
     let issue = tab
@@ -2753,7 +2755,7 @@ fn document_session_set_path_during_async_open_discards_stale_load_result() {
     assert!(!session.is_busy());
     assert_eq!(session.current_path(), Some(override_path.as_path()));
     assert!(!session.is_dirty());
-    assert_eq!(session.text(), "current\n");
+    assert_eq!(session.text().unwrap(), "current\n");
     let issue = session
         .background_issue()
         .expect("discarded background load should be retained");
@@ -2812,7 +2814,7 @@ fn document_session_set_path_while_close_is_deferred_cancels_pending_close() {
     assert!(!session.is_busy());
     assert!(!session.close_pending());
     assert_eq!(session.current_path(), Some(override_path.as_path()));
-    assert_eq!(session.text(), "current\n");
+    assert_eq!(session.text().unwrap(), "current\n");
 
     let _ = fs::remove_file(&current);
     let _ = fs::remove_file(&next);
@@ -2979,7 +2981,7 @@ fn document_session_close_file_while_async_open_defers_until_completion() {
     assert!(session.is_busy());
     assert!(session.close_pending());
     assert_eq!(session.current_path(), Some(current.as_path()));
-    assert_eq!(session.text(), "current\n");
+    assert_eq!(session.text().unwrap(), "current\n");
     assert_eq!(session.generation(), generation);
     assert!(session.status().close_pending());
 
@@ -2999,7 +3001,7 @@ fn document_session_close_file_while_async_open_defers_until_completion() {
     assert!(!session.is_busy());
     assert!(!session.close_pending());
     assert_eq!(session.current_path(), None);
-    assert_eq!(session.text(), "");
+    assert_eq!(session.text().unwrap(), "");
     assert!(!session.is_dirty());
     assert_eq!(session.generation(), generation.wrapping_add(1));
     assert!(!session.status().close_pending());
@@ -3088,21 +3090,23 @@ fn document_session_open_save_and_viewport_flow() {
         }
     );
     let selection = TextSelection::new(TextPosition::new(1, 2), TextPosition::new(0, 4));
-    let selected = session.read_selection(selection);
+    let selected = session.read_selection(selection).unwrap();
     assert!(selected.is_exact());
     assert_eq!(selected.text(), "a\nbe");
-    let viewport = session.read_viewport(ViewportRequest::new(0, 2).with_columns(0, 16));
+    let viewport = session
+        .read_viewport(ViewportRequest::new(0, 2).with_columns(0, 16))
+        .unwrap();
     assert_eq!(viewport.rows()[0].text(), "alpha");
     assert_eq!(viewport.rows()[1].text(), "beta");
 
     let cursor = session.try_replace_selection(selection, "Z").unwrap();
     assert_eq!(cursor, TextPosition::new(0, 5));
-    assert_eq!(session.text(), "alphZta\n");
+    assert_eq!(session.text().unwrap(), "alphZta\n");
 
     let delete = session.try_delete_forward(TextPosition::new(0, 5)).unwrap();
     assert!(delete.changed());
     assert_eq!(delete.cursor(), TextPosition::new(0, 5));
-    assert_eq!(session.text(), "alphZa\n");
+    assert_eq!(session.text().unwrap(), "alphZa\n");
 
     let cut = session
         .try_cut_selection(TextSelection::new(
@@ -3113,7 +3117,7 @@ fn document_session_open_save_and_viewport_flow() {
     assert_eq!(cut.text(), "Za");
     assert!(cut.changed());
     assert_eq!(cut.cursor(), TextPosition::new(0, 4));
-    assert_eq!(session.text(), "alph\n");
+    assert_eq!(session.text().unwrap(), "alph\n");
 
     let deleted = session
         .try_delete_forward_selection(TextSelection::new(
@@ -3123,14 +3127,14 @@ fn document_session_open_save_and_viewport_flow() {
         .unwrap();
     assert!(deleted.changed());
     assert_eq!(deleted.cursor(), TextPosition::new(0, 1));
-    assert_eq!(session.text(), "ah\n");
+    assert_eq!(session.text().unwrap(), "ah\n");
 
     let backspace = session
         .try_backspace_selection(TextSelection::caret(TextPosition::new(0, 1)))
         .unwrap();
     assert!(backspace.changed());
     assert_eq!(backspace.cursor(), TextPosition::new(0, 0));
-    assert_eq!(session.text(), "h\n");
+    assert_eq!(session.text().unwrap(), "h\n");
 
     let _ = session
         .try_insert(TextPosition::new(0, 0), "// inserted by session\n")
@@ -3199,18 +3203,20 @@ fn document_session_crlf_viewport_edit_and_save_preserves_line_endings() {
         1
     );
 
-    let viewport = session.read_viewport(ViewportRequest::new(0, 2).with_columns(0, 16));
+    let viewport = session
+        .read_viewport(ViewportRequest::new(0, 2).with_columns(0, 16))
+        .unwrap();
     assert_eq!(viewport.rows()[0].text(), "alpha");
     assert_eq!(viewport.rows()[1].text(), "beta");
 
     let deleted = session.try_delete_forward(TextPosition::new(0, 5)).unwrap();
     assert!(deleted.changed());
     assert_eq!(deleted.cursor(), TextPosition::new(0, 5));
-    assert_eq!(session.text(), "alphabeta\n");
+    assert_eq!(session.text().unwrap(), "alphabeta\n");
 
     let cursor = session.try_insert(TextPosition::new(0, 5), "\n").unwrap();
     assert_eq!(cursor, TextPosition::new(1, 0));
-    assert_eq!(session.text(), "alpha\nbeta\n");
+    assert_eq!(session.text().unwrap(), "alpha\nbeta\n");
     assert_eq!(session.line_ending(), LineEnding::Crlf);
 
     session.save_as(output.clone()).unwrap();
@@ -3239,7 +3245,9 @@ fn document_session_long_line_viewport_edit_and_save_flow() {
     assert_eq!(session.display_line_count(), 3);
     assert_eq!(session.line_len_chars(0), long_line.len());
 
-    let viewport = session.read_viewport(ViewportRequest::new(0, 1).with_columns(column, 16));
+    let viewport = session
+        .read_viewport(ViewportRequest::new(0, 1).with_columns(column, 16))
+        .unwrap();
     assert_eq!(viewport.rows()[0].text(), &long_line[column..column + 16]);
     assert!(viewport.rows()[0].is_exact());
 
@@ -3247,7 +3255,7 @@ fn document_session_long_line_viewport_edit_and_save_flow() {
         TextPosition::new(0, column.saturating_sub(2)),
         TextPosition::new(0, column.saturating_add(2)),
     );
-    let selected = session.read_selection(selection);
+    let selected = session.read_selection(selection).unwrap();
     assert!(selected.is_exact());
     assert_eq!(selected.text(), &long_line[column - 2..column + 2]);
 
@@ -3257,7 +3265,9 @@ fn document_session_long_line_viewport_edit_and_save_flow() {
     assert_eq!(cursor, TextPosition::new(0, column + 5));
     assert_eq!(session.line_len_chars(0), long_line.len() + 5);
 
-    let edited = session.read_viewport(ViewportRequest::new(0, 1).with_columns(column - 2, 9));
+    let edited = session
+        .read_viewport(ViewportRequest::new(0, 1).with_columns(column - 2, 9))
+        .unwrap();
     assert_eq!(edited.rows()[0].text(), "xx[qem]xx");
     assert!(edited.rows()[0].is_exact());
 
@@ -3324,7 +3334,9 @@ fn document_session_large_async_open_reports_pending_exact_line_count_before_ind
         assert!(session.is_line_count_exact());
     }
 
-    let viewport = session.read_viewport(ViewportRequest::new(0, 2).with_columns(0, 16));
+    let viewport = session
+        .read_viewport(ViewportRequest::new(0, 2).with_columns(0, 16))
+        .unwrap();
     assert_eq!(viewport.rows()[0].text(), "a");
     assert!(!viewport.rows().is_empty());
 
@@ -3361,7 +3373,7 @@ fn session_try_undo_rejected_while_background_save_in_flight() {
     let err = session.try_undo().unwrap_err();
     assert!(matches!(err, DocumentError::EditUnsupported { .. }));
     assert!(session.is_saving());
-    assert!(session.text().starts_with("123abc\ndef\n"));
+    assert!(session.text().unwrap().starts_with("123abc\ndef\n"));
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -3383,7 +3395,7 @@ fn session_try_undo_rejected_while_background_save_in_flight() {
     let undo = session.try_undo().unwrap();
     assert!(!undo.changed());
     assert!(!session.is_dirty());
-    assert!(session.text().starts_with(
+    assert!(session.text().unwrap().starts_with(
         "123abc
 def
 "
@@ -3403,16 +3415,16 @@ fn session_try_undo_restores_text_after_edit() {
     let mut session = DocumentSession::new();
     session.open_file(path.clone()).unwrap();
     let _ = session.try_insert(TextPosition::new(0, 0), "X").unwrap();
-    assert!(session.text().starts_with("Xalpha\n"));
+    assert!(session.text().unwrap().starts_with("Xalpha\n"));
 
     let undo = session.try_undo().unwrap();
     assert!(undo.changed());
     assert_eq!(undo.cursor(), Some(TextPosition::new(0, 0)));
-    assert_eq!(session.text(), "alpha\nbeta\n");
+    assert_eq!(session.text().unwrap(), "alpha\nbeta\n");
 
     let redo = session.try_redo().unwrap();
     assert!(redo.changed());
-    assert_eq!(session.text(), "Xalpha\nbeta\n");
+    assert_eq!(session.text().unwrap(), "Xalpha\nbeta\n");
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);

@@ -162,7 +162,7 @@ fn edit_and_save_round_trip() {
     doc.try_replace_range(0, 0, 5, "")
         .expect("encoded delete-range must succeed");
 
-    let in_memory_text = doc.text_lossy();
+    let in_memory_text = doc.text_lossy().unwrap();
     assert!(
         in_memory_text.starts_with(NON_ASCII_INSERT),
         "in-memory text must start with the non-ASCII insertion after the encoded splice",
@@ -172,7 +172,7 @@ fn edit_and_save_round_trip() {
 
     let reopened = Document::open_with_encoding(&saved, encoding).expect("reopen saved fixture");
     assert_eq!(
-        reopened.text_lossy(),
+        reopened.text_lossy().unwrap(),
         in_memory_text,
         "edit → save → reopen must yield the same decoded text as the in-memory document",
     );

@@ -9,12 +9,15 @@ struct PieceTableSnapshot {
 }
 
 impl PieceTableSnapshot {
-    fn from_piece_table(piece_table: &PieceTable) -> Self {
-        Self {
+    /// Honest save snapshot: a piece page that no longer loads fails the
+    /// save instead of silently persisting the readable subset (a
+    /// truncated file masquerading as a successful save).
+    fn from_piece_table(piece_table: &PieceTable) -> io::Result<Self> {
+        Ok(Self {
             original: piece_table.original.clone(),
             add: piece_table.add.clone(),
-            pieces: piece_table.pieces.to_vec(),
-        }
+            pieces: piece_table.pieces.to_vec_result()?,
+        })
     }
 
     fn source_bytes(&self, src: PieceSource) -> &[u8] {
@@ -446,9 +449,12 @@ impl Document {
         piece_table.last_session_flush = Some(Instant::now());
     }
 
-    fn rendered_text_for_save(&self) -> String {
+    /// Honest save render: materializing the save content through an
+    /// unreadable piece page fails the save typed instead of persisting a
+    /// silently shortened document.
+    fn rendered_text_for_save(&self) -> Result<String, DocumentError> {
         if let Some(rope) = &self.rope {
-            return rope_text_with_line_endings(rope, self.line_ending);
+            return Ok(rope_text_with_line_endings(rope, self.line_ending));
         }
         if let Some(piece_table) = &self.piece_table {
             // A non-UTF-8 piece-tree carries raw target-encoding
@@ -459,11 +465,15 @@ impl Document {
             // canonical UTF-8 even when the piece-tree is in a Class A
             // / Class B encoding.
             if !self.encoding.is_utf8() {
-                let bytes = piece_table.read_range(0, piece_table.total_len());
+                let bytes = piece_table
+                    .read_range_result(0, piece_table.total_len())
+                    .map_err(|source| piece_table.read_error(source))?;
                 let (decoded, _) = self.encoding.as_encoding().decode_with_bom_removal(&bytes);
-                return decoded.into_owned();
+                return Ok(decoded.into_owned());
             }
-            return piece_table.to_string_lossy();
+            return piece_table
+                .to_string_lossy_result()
+                .map_err(|source| piece_table.read_error(source));
         }
         // Mmap-only Class A documents: decode through `encoding_rs` so that a
         // subsequent re-encode round-trips the original bytes.
@@ -472,9 +482,9 @@ impl Document {
                 .encoding
                 .as_encoding()
                 .decode_with_bom_removal(self.mmap_bytes());
-            return decoded.into_owned();
+            return Ok(decoded.into_owned());
         }
-        String::from_utf8_lossy(self.mmap_bytes()).to_string()
+        Ok(String::from_utf8_lossy(self.mmap_bytes()).to_string())
     }
 
     fn encoded_save_bytes(
@@ -482,7 +492,7 @@ impl Document {
         path: &Path,
         encoding: DocumentEncoding,
     ) -> Result<Vec<u8>, DocumentError> {
-        let rendered = self.rendered_text_for_save();
+        let rendered = self.rendered_text_for_save()?;
         encode_text_with_encoding(&rendered, encoding)
             .map_err(|reason| save_encoding_error(path, "save", encoding, reason))
     }
@@ -762,7 +772,10 @@ impl Document {
 
         let snapshot = if !explicit_conversion && encoding.is_utf8() && self.encoding.is_utf8() {
             if let Some(piece_table) = self.piece_table.as_ref() {
-                SaveSnapshot::PieceTable(PieceTableSnapshot::from_piece_table(piece_table))
+                SaveSnapshot::PieceTable(
+                    PieceTableSnapshot::from_piece_table(piece_table)
+                        .map_err(|source| piece_table.read_error(source))?,
+                )
             } else if let Some(rope) = self.rope.as_ref() {
                 SaveSnapshot::Rope {
                     rope: rope.clone(),
@@ -788,7 +801,10 @@ impl Document {
                 // otherwise corrupt data because
                 // `piece_table.to_string_lossy()` interprets raw legacy
                 // bytes as UTF-8.
-                SaveSnapshot::PieceTable(PieceTableSnapshot::from_piece_table(piece_table))
+                SaveSnapshot::PieceTable(
+                    PieceTableSnapshot::from_piece_table(piece_table)
+                        .map_err(|source| piece_table.read_error(source))?,
+                )
             } else if let Some(storage) = self.storage.as_ref() {
                 // Class A / Class B native preserve-save: the document
                 // is mmap-only with `rope: None` / `piece_table: None`,

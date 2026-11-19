@@ -253,7 +253,7 @@ fn edit_and_save_round_trip() {
     doc.try_replace_range(0, 0, 1, "")
         .expect("encoded delete-range must succeed for UTF-16LE");
 
-    let in_memory_text = doc.text_lossy();
+    let in_memory_text = doc.text_lossy().unwrap();
     assert!(
         in_memory_text.starts_with("ix Привет 你好"),
         "in-memory text must start with the mixed Cyrillic + CJK \
@@ -266,7 +266,7 @@ fn edit_and_save_round_trip() {
 
     let reopened = Document::open_with_encoding(&saved, encoding).expect("reopen saved fixture");
     assert_eq!(
-        reopened.text_lossy(),
+        reopened.text_lossy().unwrap(),
         in_memory_text,
         "edit → save → reopen must yield the same decoded text as the in-memory document",
     );

@@ -200,7 +200,14 @@ impl PieceTable {
             return Ok(false);
         }
 
-        let mut compacted = self.read_range(0, self.total_len);
+        // Honest materialization: compaction replaces the live root with
+        // the compacted piece, so a silently shortened read would shrink
+        // the document permanently. An unreadable piece page skips the
+        // compaction pass and keeps the live tree untouched; the read
+        // failure itself surfaces through every honest document read.
+        let Ok(mut compacted) = self.read_range_result(0, self.total_len) else {
+            return Ok(false);
+        };
         let compacted_len = compacted.len();
         let line_breaks = count_line_breaks_in_bytes(
             &compacted,
@@ -224,7 +231,7 @@ impl PieceTable {
         // same contract insert/delete enforce). Compaction is a
         // maintenance optimization: skip it and keep the live tree
         // untouched rather than leaving the root referencing pages reads
-        // would silently skip.
+        // would fail typed on.
         if self
             .pieces
             .replace_current_root_with_pieces(replacement)

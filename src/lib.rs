@@ -157,7 +157,7 @@
 //!         );
 //!     }
 //!
-//!     let viewport = session.read_viewport(ViewportRequest::new(0, 40).with_columns(0, 160));
+//!     let viewport = session.read_viewport(ViewportRequest::new(0, 40).with_columns(0, 160))?;
 //!     println!("scroll rows: {}", status.display_line_count());
 //!     println!("visible rows this frame: {}", viewport.len());
 //!

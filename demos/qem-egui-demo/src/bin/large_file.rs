@@ -4,7 +4,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, DragValue, FontFamily, FontId, Id, Key, Layout, Margin,
     Modal, ProgressBar, Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, Vec2,
 };
-use qem::{DocumentSession, EditCapability, TextPosition, ViewportRequest};
+use qem::{DocumentSession, EditCapability, LineCount, TextPosition, Viewport, ViewportRequest};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -780,10 +780,19 @@ impl LargeFileDemo {
     }
 
     fn render_editor(&mut self, ctx: &egui::Context) {
-        let viewport = self.session.read_viewport(
-            ViewportRequest::new(self.first_line0, self.viewport_rows)
-                .with_columns(self.start_col, self.viewport_cols),
-        );
+        // Demo-level degradation: a typed read failure (an unreadable
+        // session page) renders an empty viewport for the frame and
+        // surfaces through stderr instead of silently streaming shortened
+        // rows.
+        let viewport_request = ViewportRequest::new(self.first_line0, self.viewport_rows)
+            .with_columns(self.start_col, self.viewport_cols);
+        let viewport = self
+            .session
+            .read_viewport(viewport_request)
+            .unwrap_or_else(|err| {
+                eprintln!("viewport read failed: {err}");
+                Viewport::new(viewport_request, LineCount::Exact(0), Vec::new())
+            });
         let last_visible_line0 = viewport
             .rows()
             .last()

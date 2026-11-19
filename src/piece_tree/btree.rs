@@ -319,32 +319,53 @@ pub(super) fn coalesce_adjacent(pieces: &mut Vec<Piece>) {
 }
 
 impl PieceTree {
-    pub(super) fn collect_pieces(&self, child: ChildRef, out: &mut Vec<Piece>) {
-        let Some(page) = self.page(child.page_id) else {
-            return;
-        };
+    /// The typed error a read walker surfaces when a lazily read piece
+    /// page does not load (CRC mismatch, missing sidecar, IO failure).
+    /// Read walkers must never answer `None` quietly here: a skipped
+    /// subtree would shorten the read behind the root's advertised
+    /// `total_len`, so every read-time page miss becomes this error and
+    /// honest callers surface it all the way to `DocumentError::Read`.
+    pub(super) fn unreadable_page_error(page_id: u64) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "qem editlog piece page {page_id} is unreadable; \
+                 refusing to shorten the read below the advertised range"
+            ),
+        )
+    }
+
+    pub(super) fn collect_pieces_result(
+        &self,
+        child: ChildRef,
+        out: &mut Vec<Piece>,
+    ) -> io::Result<()> {
+        let page = self
+            .page(child.page_id)
+            .ok_or_else(|| Self::unreadable_page_error(child.page_id))?;
         match page.as_ref() {
             PiecePage::Internal { children } => {
                 for child in children {
-                    self.collect_pieces(*child, out);
+                    self.collect_pieces_result(*child, out)?;
                 }
             }
             PiecePage::Leaf { pieces } => out.extend_from_slice(pieces),
         }
+        Ok(())
     }
 
-    pub(super) fn collect_fragmentation_stats(
+    pub(super) fn collect_fragmentation_stats_result(
         &self,
         child: ChildRef,
         stats: &mut FragmentationStats,
-    ) {
-        let Some(page) = self.page(child.page_id) else {
-            return;
-        };
+    ) -> io::Result<()> {
+        let page = self
+            .page(child.page_id)
+            .ok_or_else(|| Self::unreadable_page_error(child.page_id))?;
         match page.as_ref() {
             PiecePage::Internal { children } => {
                 for child in children {
-                    self.collect_fragmentation_stats(*child, stats);
+                    self.collect_fragmentation_stats_result(*child, stats)?;
                 }
             }
             PiecePage::Leaf { pieces } => {
@@ -353,19 +374,20 @@ impl PieceTree {
                 }
             }
         }
+        Ok(())
     }
 
-    pub(super) fn visit_range_ref(
+    pub(super) fn visit_range_ref_result(
         &self,
         child: ChildRef,
         start: usize,
         end: usize,
         base: usize,
         visit: &mut impl FnMut(Piece, usize, usize),
-    ) {
-        let Some(page) = self.page(child.page_id) else {
-            return;
-        };
+    ) -> io::Result<()> {
+        let page = self
+            .page(child.page_id)
+            .ok_or_else(|| Self::unreadable_page_error(child.page_id))?;
         match page.as_ref() {
             PiecePage::Internal { children } => {
                 let mut child_base = base;
@@ -378,7 +400,7 @@ impl PieceTree {
                     if child_base >= end {
                         break;
                     }
-                    self.visit_range_ref(*child, start, end, child_base, visit);
+                    self.visit_range_ref_result(*child, start, end, child_base, visit)?;
                     child_base = child_end;
                 }
             }
@@ -402,19 +424,22 @@ impl PieceTree {
                 }
             }
         }
+        Ok(())
     }
 
-    pub(super) fn visit_range_ref_while(
+    /// Readability-only walk over `[start, end)`: descends exactly like the
+    /// visiting walkers but touches no callback, so an honest read can
+    /// pre-verify every page overlapping the bytes it is about to decode.
+    pub(super) fn verify_range_ref_readable(
         &self,
         child: ChildRef,
         start: usize,
         end: usize,
         base: usize,
-        visit: &mut impl FnMut(Piece, usize, usize) -> bool,
-    ) -> bool {
-        let Some(page) = self.page(child.page_id) else {
-            return true;
-        };
+    ) -> io::Result<()> {
+        let page = self
+            .page(child.page_id)
+            .ok_or_else(|| Self::unreadable_page_error(child.page_id))?;
         match page.as_ref() {
             PiecePage::Internal { children } => {
                 let mut child_base = base;
@@ -427,8 +452,40 @@ impl PieceTree {
                     if child_base >= end {
                         break;
                     }
-                    if !self.visit_range_ref_while(*child, start, end, child_base, visit) {
-                        return false;
+                    self.verify_range_ref_readable(*child, start, end, child_base)?;
+                    child_base = child_end;
+                }
+            }
+            PiecePage::Leaf { .. } => {}
+        }
+        Ok(())
+    }
+
+    pub(super) fn visit_range_ref_while_result(
+        &self,
+        child: ChildRef,
+        start: usize,
+        end: usize,
+        base: usize,
+        visit: &mut impl FnMut(Piece, usize, usize) -> bool,
+    ) -> io::Result<bool> {
+        let page = self
+            .page(child.page_id)
+            .ok_or_else(|| Self::unreadable_page_error(child.page_id))?;
+        match page.as_ref() {
+            PiecePage::Internal { children } => {
+                let mut child_base = base;
+                for child in children {
+                    let child_end = child_base.saturating_add(child.total_bytes);
+                    if child_end <= start {
+                        child_base = child_end;
+                        continue;
+                    }
+                    if child_base >= end {
+                        break;
+                    }
+                    if !self.visit_range_ref_while_result(*child, start, end, child_base, visit)? {
+                        return Ok(false);
                     }
                     child_base = child_end;
                 }
@@ -447,26 +504,26 @@ impl PieceTree {
                     let overlap_start = start.saturating_sub(piece_base).min(piece.len);
                     let overlap_end = end.min(piece_end).saturating_sub(piece_base).min(piece.len);
                     if overlap_start < overlap_end && !visit(*piece, overlap_start, overlap_end) {
-                        return false;
+                        return Ok(false);
                     }
                     piece_base = piece_end;
                 }
             }
         }
-        true
+        Ok(true)
     }
 
-    pub(super) fn visit_range_ref_rev_while(
+    pub(super) fn visit_range_ref_rev_while_result(
         &self,
         child: ChildRef,
         start: usize,
         end: usize,
         base: usize,
         visit: &mut impl FnMut(Piece, usize, usize) -> bool,
-    ) -> bool {
-        let Some(page) = self.page(child.page_id) else {
-            return true;
-        };
+    ) -> io::Result<bool> {
+        let page = self
+            .page(child.page_id)
+            .ok_or_else(|| Self::unreadable_page_error(child.page_id))?;
         match page.as_ref() {
             PiecePage::Internal { children } => {
                 let mut child_end = base.saturating_add(child.total_bytes);
@@ -479,8 +536,14 @@ impl PieceTree {
                     if child_end <= start {
                         break;
                     }
-                    if !self.visit_range_ref_rev_while(*child, start, end, child_start, visit) {
-                        return false;
+                    if !self.visit_range_ref_rev_while_result(
+                        *child,
+                        start,
+                        end,
+                        child_start,
+                        visit,
+                    )? {
+                        return Ok(false);
                     }
                     child_end = child_start;
                 }
@@ -502,23 +565,25 @@ impl PieceTree {
                         .saturating_sub(piece_start)
                         .min(piece.len);
                     if overlap_start < overlap_end && !visit(*piece, overlap_start, overlap_end) {
-                        return false;
+                        return Ok(false);
                     }
                     piece_end = piece_start;
                 }
             }
         }
-        true
+        Ok(true)
     }
 
-    pub(super) fn find_line_start_ref(
+    pub(super) fn find_line_start_ref_result(
         &self,
         child: ChildRef,
         target_break: usize,
         base: usize,
         locate_break: &mut impl FnMut(Piece, usize) -> Option<usize>,
-    ) -> Option<usize> {
-        let page = self.page(child.page_id)?;
+    ) -> io::Result<Option<usize>> {
+        let page = self
+            .page(child.page_id)
+            .ok_or_else(|| Self::unreadable_page_error(child.page_id))?;
         match page.as_ref() {
             PiecePage::Internal { children } => {
                 let mut child_base = base;
@@ -529,14 +594,14 @@ impl PieceTree {
                         child_base = child_base.saturating_add(child.total_bytes);
                         continue;
                     }
-                    return self.find_line_start_ref(
+                    return self.find_line_start_ref_result(
                         *child,
                         target_break,
                         child_base,
                         locate_break,
                     );
                 }
-                None
+                Ok(None)
             }
             PiecePage::Leaf { pieces } => {
                 let mut piece_base = base;
@@ -547,10 +612,12 @@ impl PieceTree {
                         piece_base = piece_base.saturating_add(piece.len);
                         continue;
                     }
-                    let local = locate_break(*piece, target_break)?;
-                    return Some(piece_base.saturating_add(local));
+                    let Some(local) = locate_break(*piece, target_break) else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(piece_base.saturating_add(local)));
                 }
-                None
+                Ok(None)
             }
         }
     }

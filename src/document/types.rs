@@ -1271,6 +1271,14 @@ pub enum DocumentError {
     Map { path: PathBuf, source: io::Error },
     /// A write, rename, or reload step failed.
     Write { path: PathBuf, source: io::Error },
+    /// A document read could not materialize the requested bytes.
+    ///
+    /// For a piece-table backing this is a piece page that no longer
+    /// loads from the session sidecar (CRC mismatch, missing file, IO
+    /// failure): the read must fail as a typed error instead of silently
+    /// returning content shortened behind the advertised `total_len`.
+    /// `path` names the sidecar the unreadable page lives in.
+    Read { path: PathBuf, source: io::Error },
     /// Encoding negotiation, decode, or save conversion failed.
     Encoding {
         path: PathBuf,
@@ -1291,6 +1299,7 @@ impl std::fmt::Display for DocumentError {
             Self::Open { path, source } => write!(f, "open `{}`: {source}", path.display()),
             Self::Map { path, source } => write!(f, "mmap `{}`: {source}", path.display()),
             Self::Write { path, source } => write!(f, "write `{}`: {source}", path.display()),
+            Self::Read { path, source } => write!(f, "read `{}`: {source}", path.display()),
             Self::Encoding {
                 path,
                 operation,
@@ -1315,9 +1324,10 @@ impl std::fmt::Display for DocumentError {
 impl std::error::Error for DocumentError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Open { source, .. } | Self::Map { source, .. } | Self::Write { source, .. } => {
-                Some(source)
-            }
+            Self::Open { source, .. }
+            | Self::Map { source, .. }
+            | Self::Write { source, .. }
+            | Self::Read { source, .. } => Some(source),
             Self::Encoding { .. } | Self::EditUnsupported { .. } => None,
         }
     }

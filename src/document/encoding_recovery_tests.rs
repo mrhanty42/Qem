@@ -59,7 +59,10 @@ fn recovered_session_restores_windows1251_encoding_without_explicit_request() {
         DocumentEncodingOrigin::ExplicitReinterpretation
     );
     assert!(!recovered.decoding_had_errors());
-    assert!(recovered.text_lossy().starts_with("123abc\u{042F}\n"));
+    assert!(recovered
+        .text_lossy()
+        .unwrap()
+        .starts_with("123abc\u{042F}\n"));
 
     // An explicit request that agrees with the stored label recovers the
     // session too.
@@ -68,6 +71,7 @@ fn recovered_session_restores_windows1251_encoding_without_explicit_request() {
     assert_eq!(reopened_explicit.encoding(), windows_1251());
     assert!(reopened_explicit
         .text_lossy()
+        .unwrap()
         .starts_with("123abc\u{042F}\n"));
 }
 
@@ -97,14 +101,17 @@ fn legacy_v2_sidecar_keeps_the_historical_open_behavior() {
     let reopened = Document::open(&path).unwrap();
     assert!(!reopened.has_edit_buffer());
     assert_eq!(reopened.encoding(), DocumentEncoding::utf8());
-    assert!(reopened.text_lossy().starts_with("abc\u{FFFD}\n"));
+    assert!(reopened.text_lossy().unwrap().starts_with("abc\u{FFFD}\n"));
 
     // Explicit open: the caller's encoding wins and no session is recovered
     // from a sidecar without a label.
     let reopened_explicit = Document::open_with_encoding(&path, windows_1251()).unwrap();
     assert!(!reopened_explicit.has_piece_table());
     assert_eq!(reopened_explicit.encoding(), windows_1251());
-    assert!(reopened_explicit.text_lossy().starts_with("abc\u{042F}\n"));
+    assert!(reopened_explicit
+        .text_lossy()
+        .unwrap()
+        .starts_with("abc\u{042F}\n"));
 
     // The invalid sidecar was dropped so the next session rebuilds cleanly.
     assert!(!sidecar.exists());
@@ -138,7 +145,7 @@ fn corrupt_encoding_label_rejects_the_session_and_rebuilds_from_source() {
 
     assert!(!reopened.has_edit_buffer());
     assert!(!reopened.has_piece_table());
-    assert!(reopened.text_lossy().starts_with("abc\u{FFFD}\n"));
+    assert!(reopened.text_lossy().unwrap().starts_with("abc\u{FFFD}\n"));
     assert!(!sidecar.exists(), "invalid sidecar must be dropped");
 }
 
@@ -171,7 +178,7 @@ fn corrupt_known_byte_len_rejects_the_session_and_rebuilds_from_source() {
 
     assert!(!reopened.has_edit_buffer());
     assert!(!reopened.has_piece_table());
-    assert!(reopened.text_lossy().starts_with("abc\u{FFFD}\n"));
+    assert!(reopened.text_lossy().unwrap().starts_with("abc\u{FFFD}\n"));
     assert!(!sidecar.exists(), "invalid sidecar must be dropped");
 }
 

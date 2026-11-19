@@ -159,8 +159,9 @@ impl EditorTab {
     /// [`Document::text_lossy`]. This is an advanced convenience helper rather
     /// than the recommended UI path. Prefer `read_viewport(...)` or
     /// `read_text(...)` when a frontend only needs a visible window or a
-    /// bounded selection.
-    pub fn text(&self) -> String {
+    /// bounded selection. Fails typed when the backing cannot materialize
+    /// the document bytes (see [`Document::text_lossy`]).
+    pub fn text(&self) -> Result<String, DocumentError> {
         self.core.document().text_lossy()
     }
 
@@ -369,12 +370,18 @@ impl EditorTab {
     }
 
     /// Reads a typed text range from the current document.
-    pub fn read_text(&self, range: TextRange) -> TextSlice {
+    ///
+    /// Fails typed when the backing cannot materialize the requested bytes
+    /// (see [`Document::read_text`]).
+    pub fn read_text(&self, range: TextRange) -> Result<TextSlice, DocumentError> {
         self.core.document().read_text(range)
     }
 
     /// Reads the current selection as a typed text slice.
-    pub fn read_selection(&self, selection: TextSelection) -> TextSlice {
+    ///
+    /// Fails typed when the backing cannot materialize the selected bytes
+    /// (see [`Document::read_selection`]).
+    pub fn read_selection(&self, selection: TextSelection) -> Result<TextSlice, DocumentError> {
         self.core.document().read_selection(selection)
     }
 
@@ -1269,7 +1276,10 @@ impl EditorTab {
     }
 
     /// Reads a visible viewport directly from the current document.
-    pub fn read_viewport(&self, request: ViewportRequest) -> Viewport {
+    ///
+    /// Fails typed when the backing cannot materialize the requested rows
+    /// (see [`Document::read_viewport`]).
+    pub fn read_viewport(&self, request: ViewportRequest) -> Result<Viewport, DocumentError> {
         self.core.read_viewport(request)
     }
 

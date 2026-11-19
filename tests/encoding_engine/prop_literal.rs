@@ -147,7 +147,7 @@ proptest! {
 
         let doc = qem::Document::open_with_encoding(&path, encoding)
             .expect("open fixture");
-        let decoded = doc.text_lossy();
+        let decoded = doc.text_lossy().unwrap();
         prop_assert_eq!(&decoded, &text, "document must decode to the fixture text");
 
         // Oracle: non-overlapping match start char indexes in the decoded

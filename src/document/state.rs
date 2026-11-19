@@ -545,7 +545,15 @@ impl Document {
                 let (decoded, _) = self.encoding.as_encoding().decode_with_bom_removal(&bytes);
                 return decoded.into_owned();
             }
-            return piece_table.to_string_lossy();
+            // Advisory preflight only: this validation feeds
+            // `save_error_for_options` / `can_save_with_options`, which
+            // cannot express a read failure. On an unreadable piece page it
+            // degrades to the readable prefix (a wrong-but-harmless
+            // recommendation) — the enforcing save path materializes
+            // through the honest `rendered_text_for_save` and fails typed
+            // instead.
+            let bytes = piece_table.read_range(0, piece_table.total_len());
+            return String::from_utf8_lossy(&bytes).to_string();
         }
         // Mmap-only Class A documents: decode through `encoding_rs` so the
         // validation re-encode round-trips the original bytes.
@@ -664,9 +672,16 @@ impl Document {
     /// It is an advanced convenience helper rather than the recommended
     /// frontend path. Prefer viewport or typed range reads for large-file
     /// frontends that only need a visible window or a bounded selection.
-    pub fn text_lossy(&self) -> String {
+    ///
+    /// Returns [`DocumentError::Read`] when the backing cannot materialize
+    /// the document bytes (for a piece-table backing: a piece page that no
+    /// longer loads from the session sidecar). A full-text materialization
+    /// must never come back silently shortened behind `total_len` — the
+    /// owner rule for every document read is "no silent truncation", so
+    /// this deliberately returns an error rather than a lossy-short text.
+    pub fn text_lossy(&self) -> Result<String, DocumentError> {
         if let Some(rope) = &self.rope {
-            return rope.to_string();
+            return Ok(rope.to_string());
         }
         if let Some(piece_table) = &self.piece_table {
             // A non-UTF-8 piece-tree holds raw target-encoding
@@ -675,11 +690,15 @@ impl Document {
             // so the returned `String` reflects the document's logical
             // text rather than mojibake of the legacy bytes.
             if !self.encoding.is_utf8() {
-                let bytes = piece_table.read_range(0, piece_table.total_len());
+                let bytes = piece_table
+                    .read_range_result(0, piece_table.total_len())
+                    .map_err(|source| piece_table.read_error(source))?;
                 let (decoded, _) = self.encoding.as_encoding().decode_with_bom_removal(&bytes);
-                return decoded.into_owned();
+                return Ok(decoded.into_owned());
             }
-            return piece_table.to_string_lossy();
+            return piece_table
+                .to_string_lossy_result()
+                .map_err(|source| piece_table.read_error(source));
         }
         // Class A native open path: documents whose encoding is not UTF-8 are
         // mmap-only with `rope: None` / `piece_table: None`, so the raw mmap
@@ -692,8 +711,8 @@ impl Document {
                 .encoding
                 .as_encoding()
                 .decode_with_bom_removal(self.mmap_bytes());
-            return decoded.into_owned();
+            return Ok(decoded.into_owned());
         }
-        String::from_utf8_lossy(self.mmap_bytes()).to_string()
+        Ok(String::from_utf8_lossy(self.mmap_bytes()).to_string())
     }
 }

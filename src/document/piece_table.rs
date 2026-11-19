@@ -12,6 +12,13 @@ pub(super) fn edit_span_unresolvable_error() -> DocumentError {
     }
 }
 
+/// `true` when the cell at `offset` (stepping `step` bytes) equals the
+/// whole `pattern` cell. The step must equal the pattern width for a
+/// match, so a truncated or wider cell can never alias a break cell.
+fn cell_matches(bytes: &[u8], offset: usize, step: usize, pattern: &[u8]) -> bool {
+    step == pattern.len() && bytes[offset..offset + step] == *pattern
+}
+
 impl PieceTable {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn new(original: FileStorage, line_lengths: Vec<usize>, full_index: bool) -> Self {
@@ -225,8 +232,16 @@ impl PieceTable {
         let known_line_count = self.line_count();
 
         // The first piece at or after the known-region boundary gives the
-        // constant doc→original offset of the pristine span.
-        let pieces = self.pieces.to_vec();
+        // constant doc→original offset of the pristine span. Honest collect:
+        // rebuilding the root from a snapshot that silently dropped an
+        // unreadable subtree would persist the loss as the new document.
+        let pieces = self
+            .pieces
+            .to_vec_result()
+            .map_err(|source| DocumentError::Read {
+                path: session_sidecar_path(None, self.original.path()),
+                source,
+            })?;
         let mut consumed = 0usize;
         let mut span_delta: i128 = 0;
         let mut span_found = false;
@@ -295,7 +310,10 @@ impl PieceTable {
         let target_doc_byte = (window_end_orig as i128 - span_delta) as usize;
         let mut expected_orig: Option<usize> = None;
         let mut pristine = true;
-        self.pieces.visit_range_while(
+        // Honest pristine check: an unreadable page inside the span must
+        // fail the splice instead of silently passing the walk over a
+        // subtree the rebuild would then drop.
+        let span_walk_complete = self.pieces.visit_range_while_result(
             known_byte_len,
             target_doc_byte,
             |piece, local_start, local_end| {
@@ -327,6 +345,12 @@ impl PieceTable {
                 true
             },
         );
+        if let Err(source) = span_walk_complete {
+            return Err(DocumentError::Read {
+                path: session_sidecar_path(None, self.original.path()),
+                source,
+            });
+        }
         if !pristine {
             return Err(edit_span_unresolvable_error());
         }
@@ -335,7 +359,13 @@ impl PieceTable {
         // [known_byte_len .. total_len): the annotated pieces replace it, and
         // a new pristine tail continues after the annotated region. Appending
         // after the tail would place the pieces out of document order.
-        let mut all = self.pieces.to_vec();
+        let mut all = self
+            .pieces
+            .to_vec_result()
+            .map_err(|source| DocumentError::Read {
+                path: session_sidecar_path(None, self.original.path()),
+                source,
+            })?;
         let tail = all.pop();
         match tail {
             Some(piece) if piece.src == PieceSource::Original => {
@@ -360,7 +390,7 @@ impl PieceTable {
         // refused while persistence is down and the resident window is
         // exhausted. Surface the refusal as a write error and leave the
         // piece tree untouched: landing a root that references pages
-        // reads would silently skip would truncate the document behind
+        // reads would fail typed on would truncate the document behind
         // `total_len`.
         let sidecar = session_sidecar_path(None, self.original.path());
         self.pieces
@@ -552,12 +582,24 @@ impl PieceTable {
         line0: usize,
         engine: &dyn encoding_engine::EncodingEngine,
     ) -> usize {
-        let (start, end) = self.line_range(line0);
+        self.line_len_chars_with_engine_result(line0, engine)
+            .unwrap_or(0)
+    }
+
+    /// Honest variant of [`PieceTable::line_len_chars_with_engine`]: fails
+    /// typed when the line's byte range crosses an unreadable piece page
+    /// instead of reporting a silently short column count.
+    pub(crate) fn line_len_chars_with_engine_result(
+        &self,
+        line0: usize,
+        engine: &dyn encoding_engine::EncodingEngine,
+    ) -> io::Result<usize> {
+        let (start, end) = self.line_range_result(line0)?;
         if start >= end {
-            return 0;
+            return Ok(0);
         }
-        let bytes = self.read_range(start, end);
-        engine.count_columns_exact(&bytes)
+        let bytes = self.read_range_result(start, end)?;
+        Ok(engine.count_columns_exact(&bytes))
     }
 
     pub(crate) fn line_visible_segment(
@@ -566,19 +608,32 @@ impl PieceTable {
         start_col: usize,
         max_cols: usize,
     ) -> String {
+        self.line_visible_segment_result(line0, start_col, max_cols)
+            .unwrap_or_default()
+    }
+
+    /// Honest variant of [`PieceTable::line_visible_segment`]: fails typed
+    /// when the line's bytes cross an unreadable piece page instead of
+    /// silently returning a truncated segment.
+    pub(crate) fn line_visible_segment_result(
+        &self,
+        line0: usize,
+        start_col: usize,
+        max_cols: usize,
+    ) -> io::Result<String> {
         if max_cols == 0 || line0 >= self.line_count() {
-            return String::new();
+            return Ok(String::new());
         }
-        let Some(line_start) = self.line_start_byte(line0) else {
-            return String::new();
+        let Some(line_start) = self.line_start_byte_result(line0)? else {
+            return Ok(String::new());
         };
-        let line_end = self.line_range(line0).1;
+        let line_end = self.line_range_result(line0)?.1;
         if line_start >= line_end {
-            return String::new();
+            return Ok(String::new());
         }
-        let start = self.byte_offset_for_col(line0, start_col);
+        let start = self.byte_offset_for_col_with_engine_result(line0, start_col, self.engine)?;
         if start >= line_end {
-            return String::new();
+            return Ok(String::new());
         }
 
         // Collect the requested columns as raw bytes and let the
@@ -589,8 +644,10 @@ impl PieceTable {
         let utf16_cells = utf16_break_cells(self.engine.encoding().name());
         let mut out = Vec::with_capacity(max_cols.min(4096).saturating_mul(4));
         let mut cols = 0usize;
-        self.pieces
-            .visit_range_while(start, line_end, |piece, local_start, local_end| {
+        self.pieces.visit_range_while_result(
+            start,
+            line_end,
+            |piece, local_start, local_end| {
                 if cols >= max_cols {
                     return false;
                 }
@@ -634,9 +691,10 @@ impl PieceTable {
                 }
 
                 true
-            });
+            },
+        )?;
 
-        self.decode_bytes(&out)
+        Ok(self.decode_bytes(&out))
     }
 
     /// Decodes a byte buffer with the document's engine. UTF-8 documents
@@ -655,18 +713,20 @@ impl PieceTable {
         decoded.into_owned()
     }
 
-    pub(crate) fn line_slices_exact(
+    /// Honest exact line slices: fails typed when any requested line's
+    /// bytes cross an unreadable piece page.
+    pub(crate) fn line_slices_exact_result(
         &self,
         first_line0: usize,
         line_count: usize,
         start_col: usize,
         max_cols: usize,
-    ) -> Vec<LineSlice> {
+    ) -> io::Result<Vec<LineSlice>> {
         if line_count == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if first_line0 >= self.line_count() {
-            return vec![LineSlice::new(String::new(), true); line_count];
+            return Ok(vec![LineSlice::new(String::new(), true); line_count]);
         }
 
         let available = self
@@ -677,12 +737,12 @@ impl PieceTable {
         for offset in 0..available {
             let line0 = first_line0.saturating_add(offset);
             slices.push(LineSlice::new(
-                self.line_visible_segment(line0, start_col, max_cols),
+                self.line_visible_segment_result(line0, start_col, max_cols)?,
                 true,
             ));
         }
         slices.resize(line_count, LineSlice::new(String::new(), true));
-        slices
+        Ok(slices)
     }
 
     pub(crate) fn insert_text_at(
@@ -948,9 +1008,12 @@ impl PieceTable {
         state.position()
     }
 
-    pub(crate) fn to_string_lossy(&self) -> String {
-        let bytes = self.read_range(0, self.total_len);
-        String::from_utf8_lossy(&bytes).to_string()
+    /// Honest full-document byte materialization for text reads. Fails
+    /// typed when any piece page does not load; the caller surfaces
+    /// [`DocumentError::Read`] instead of a silently shortened document.
+    pub(crate) fn to_string_lossy_result(&self) -> io::Result<String> {
+        let bytes = self.read_range_result(0, self.total_len)?;
+        Ok(String::from_utf8_lossy(&bytes).to_string())
     }
 
     pub(super) fn source_bytes(&self, src: PieceSource) -> &[u8] {
@@ -960,6 +1023,31 @@ impl PieceTable {
         }
     }
 
+    /// Honest line byte range: fails typed when the line starts resolved
+    /// through the piece tree hit an unreadable page, instead of silently
+    /// falling back to the known-region boundary.
+    pub(super) fn line_range_result(&self, line0: usize) -> io::Result<(usize, usize)> {
+        if line0 >= self.line_count() {
+            return Ok((self.total_len, self.total_len));
+        }
+        let Some(start) = self.line_start_byte_result(line0)? else {
+            return Ok((self.known_byte_len, self.known_byte_len));
+        };
+        let end = if line0 + 1 < self.line_count() {
+            self.line_start_byte_result(line0 + 1)?
+                .unwrap_or(self.known_byte_len)
+        } else {
+            self.known_byte_len
+        };
+        Ok((
+            start.min(self.total_len),
+            end.max(start).min(self.total_len),
+        ))
+    }
+
+    /// Legacy silent line byte range; see [`PieceTable::read_range`] for
+    /// the degradation contract. Used by the edit-path helpers and the
+    /// legacy best-effort line slices.
     pub(super) fn line_range(&self, line0: usize) -> (usize, usize) {
         if line0 >= self.line_count() {
             return (self.total_len, self.total_len);
@@ -1001,9 +1089,23 @@ impl PieceTable {
         (seg_start, seg_end)
     }
 
-    pub(super) fn read_range(&self, start: usize, end: usize) -> Vec<u8> {
+    /// Wraps a piece-tree read failure into the typed
+    /// [`DocumentError::Read`], naming the sidecar the unreadable page
+    /// lives in.
+    pub(super) fn read_error(&self, source: io::Error) -> DocumentError {
+        DocumentError::Read {
+            path: session_sidecar_path(None, self.original.path()),
+            source,
+        }
+    }
+
+    /// Honest byte read: fails typed (as an `io::Error` the document layer
+    /// wraps into [`DocumentError::Read`]) when a piece page overlapping
+    /// `[start, end)` does not load, instead of silently returning the
+    /// readable prefix.
+    pub(super) fn read_range_result(&self, start: usize, end: usize) -> io::Result<Vec<u8>> {
         if start >= end || start >= self.total_len {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let end = end.min(self.total_len);
         // Piece bounds come from the sidecar's piece pages; a hostile
@@ -1012,13 +1114,27 @@ impl PieceTable {
         // be the only reader that survives it.
         let mut out = Vec::with_capacity(end.saturating_sub(start));
         self.pieces
-            .visit_range(start, end, |piece, local_start, local_end| {
+            .visit_range_result(start, end, |piece, local_start, local_end| {
                 let src = self.source_bytes(piece.src);
                 let (seg_start, seg_end) =
                     self.clamped_piece_segment(piece, local_start, local_end, src.len());
                 out.extend_from_slice(&src[seg_start..seg_end]);
-            });
-        out
+            })?;
+        Ok(out)
+    }
+
+    /// Legacy silent byte read.
+    ///
+    /// Kept for callers where a missing piece page degrades to a shorter
+    /// buffer that downstream logic already guards against: the encoded
+    /// edit-path helpers (whose structural edits fail typed through
+    /// `insert_at` / `delete_at` the moment they touch the unreadable
+    /// page) and the byte-movement walks owned by the parallel
+    /// `advance_offset_by_text_units*` fix. Every content-producing
+    /// document read goes through [`PieceTable::read_range_result`]; do
+    /// not add new callers here.
+    pub(super) fn read_range(&self, start: usize, end: usize) -> Vec<u8> {
+        self.read_range_result(start, end).unwrap_or_default()
     }
 
     fn byte_at(&self, offset: usize) -> Option<u8> {
@@ -1060,11 +1176,24 @@ impl PieceTable {
         col0: usize,
         engine: &dyn encoding_engine::EncodingEngine,
     ) -> usize {
-        let (start, end) = self.line_range(line0);
+        self.byte_offset_for_col_with_engine_result(line0, col0, engine)
+            .unwrap_or(0)
+    }
+
+    /// Honest variant of [`PieceTable::byte_offset_for_col_with_engine`]:
+    /// fails typed when the line's bytes cross an unreadable piece page
+    /// instead of mapping the column onto a silently wrong offset.
+    pub(crate) fn byte_offset_for_col_with_engine_result(
+        &self,
+        line0: usize,
+        col0: usize,
+        engine: &dyn encoding_engine::EncodingEngine,
+    ) -> io::Result<usize> {
+        let (start, end) = self.line_range_result(line0)?;
         if col0 == 0 || start >= end {
-            return start;
+            return Ok(start);
         }
-        let bytes = self.read_range(start, end);
+        let bytes = self.read_range_result(start, end)?;
         let bytes_len = bytes.len();
         // Line breaks are recognised on WHOLE encoding cells (the same
         // discipline as `local_offset_after_break`): a raw byte check
@@ -1091,7 +1220,7 @@ impl PieceTable {
             local += step;
             col += 1;
         }
-        start.saturating_add(local).min(end)
+        Ok(start.saturating_add(local).min(end))
     }
 
     pub(super) fn advance_offset_by_text_units(&self, start: usize, text_units: usize) -> usize {
@@ -1153,12 +1282,19 @@ impl PieceTable {
     /// [`PieceTable::advance_offset_by_text_units`].
     ///
     /// Walks `text_units` text-unit cells forward from `start`, counting
-    /// each `engine.step` advance as one cell and treating `\r\n` as a
-    /// single CRLF cell when the engine reports `0x0D` and `0x0A` as
-    /// 1-byte cells. The piece-tree range is read in bounded 64 KiB
+    /// each `engine.step` advance as one cell and collapsing a stored
+    /// `\r\n` pair into a single text unit. The collapse works on WHOLE
+    /// encoding cells: for UTF-16 the pair spans two 2-byte cells
+    /// (`[0x0D, 0x00]` + `[0x0A, 0x00]` in LE), so the pending CRLF
+    /// context arms on the whole CR cell and merges with the whole LF
+    /// cell, while for 1-byte-cell engines the raw `\r` / `\n` bytes
+    /// are the cells. The piece-tree range is read in bounded 64 KiB
     /// chunks (plus a small decode-context tail) instead of one
     /// contiguous buffer, so a replace near the start of a
-    /// multi-gigabyte document never materializes the whole tail.
+    /// multi-gigabyte document never materializes the whole tail. The
+    /// pending CR-cell context crosses chunk edges: a CR cell consumed
+    /// as the last decodable cell of a chunk still collapses with an
+    /// LF cell read from the next one.
     ///
     /// Used by the non-UTF-8 edit paths so `try_replace_range` /
     /// `try_delete_range_at_encoded` compute deletion endpoints on
@@ -1179,6 +1315,13 @@ impl PieceTable {
         // Wideest cell any engine reports: 4 bytes (UTF-16 supplementary
         // pair, GB18030 four-byte sequence).
         const MAX_CELL_BYTES: usize = 4;
+        // Line-ending cells of the engine's encoding: 2-byte code units
+        // for UTF-16LE / UTF-16BE, the raw `\n` / `\r` bytes for every
+        // other engine (UTF-8 continuations and the CJK trail ranges can
+        // never alias 0x0A / 0x0D). CRLF collapse compares whole cells,
+        // so a UTF-16 CR cell consumed at the edge of one chunk still
+        // collapses with the LF cell read from the next one.
+        let utf16_cells = utf16_break_cells(engine.encoding().name());
         let mut local = 0usize;
         let mut remaining = text_units;
         let mut pending_cr = false;
@@ -1211,10 +1354,17 @@ impl PieceTable {
                 let next_step = engine.step(&bytes, chunk_local, bytes_len);
                 if pending_cr {
                     pending_cr = false;
-                    // CRLF collapses to a single text unit when the engine
-                    // recognises both halves as 1-byte ASCII cells.
-                    if next_step == 1 && bytes[chunk_local] == b'\n' {
-                        chunk_local += 1;
+                    // CRLF collapses to a single text unit when the next
+                    // cell is the engine's LF cell. The comparison spans
+                    // the whole cell: for UTF-16 the LF half is a 2-byte
+                    // code unit ([0x0A, 0x00] LE / [0x00, 0x0A] BE), so a
+                    // 1-byte check can never match it.
+                    let is_lf_cell = match utf16_cells {
+                        Some((lf, _)) => cell_matches(&bytes, chunk_local, next_step, &lf),
+                        None => next_step == 1 && bytes[chunk_local] == b'\n',
+                    };
+                    if is_lf_cell {
+                        chunk_local += next_step;
                         continue;
                     }
                 }
@@ -1224,7 +1374,16 @@ impl PieceTable {
                 if next_step == 0 {
                     break;
                 }
-                if next_step == 1 && bytes[chunk_local] == b'\r' {
+                // The pending CRLF context is the whole CR cell: for
+                // UTF-16 that is a 2-byte code unit ([0x0D, 0x00] LE /
+                // [0x00, 0x0D] BE), so the pending state must arm on a
+                // multi-byte cell too — its LF partner cell may live in
+                // the next chunk.
+                let is_cr_cell = match utf16_cells {
+                    Some((_, cr)) => cell_matches(&bytes, chunk_local, next_step, &cr),
+                    None => next_step == 1 && bytes[chunk_local] == b'\r',
+                };
+                if is_cr_cell {
                     pending_cr = true;
                 }
                 chunk_local += next_step;
@@ -1244,10 +1403,13 @@ impl PieceTable {
                 // here; further chunks cannot make progress.
                 break;
             }
-            // The pending_cr flag (and the first unconsumed byte at
-            // `start + local`) carry into the next chunk: a CRLF split
-            // across the boundary still collapses into one text unit,
-            // and no cell is ever counted on both sides of an edge.
+            // The pending CR-cell context (and the first unconsumed
+            // byte at `start + local`) carry into the next chunk: a
+            // CRLF split across the boundary still collapses into one
+            // text unit — for UTF-16 the whole 2-byte CR cell is always
+            // consumed before the edge, because the window guard never
+            // splits a cell — and no cell is ever counted on both sides
+            // of an edge.
         }
         start.saturating_add(local).min(self.total_len)
     }
@@ -1441,6 +1603,19 @@ impl PieceTable {
             .max(1);
     }
 
+    /// Honest line-start resolution: fails typed when the walk toward the
+    /// line's first break touches an unreadable piece page.
+    fn line_start_byte_result(&self, line0: usize) -> io::Result<Option<usize>> {
+        Ok(self
+            .pieces
+            .find_line_start_result(line0, |piece, local_break_idx| {
+                self.local_offset_after_break(piece, local_break_idx)
+            })?
+            .filter(|offset| *offset <= self.total_len))
+    }
+
+    /// Legacy silent line-start resolution; see [`PieceTable::read_range`]
+    /// for the degradation contract.
     fn line_start_byte(&self, line0: usize) -> Option<usize> {
         self.pieces
             .find_line_start(line0, |piece, local_break_idx| {

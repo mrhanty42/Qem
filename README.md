@@ -94,9 +94,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new("huge.log");
     let mut document = Document::open(path)?;
 
+    // Reads fail typed when the backing cannot materialize the requested
+    // rows (for example a session sidecar page that no longer passes its
+    // checksum) instead of silently returning shortened content.
     let viewport = document.read_viewport(
         ViewportRequest::new(100_000, 30).with_columns(0, 160),
-    );
+    )?;
 
     for row in viewport.rows() {
         println!("{:>8}  {}", row.line_number(), row.text());
@@ -131,6 +134,10 @@ Clean large files stay on the mmap-oriented path while Qem indexes lines in
 the background. During indexing, `display_line_count()` is suitable for
 scrollbar sizing and `indexing_state()` reports progress. Reads should
 remain bounded through `read_viewport`, `read_text`, and `read_selection`.
+These reads return `Result`: when the piece-tree backing cannot materialize
+the requested bytes (a session sidecar page that no longer passes its
+checksum), they fail as a typed `DocumentError::Read` instead of silently
+returning content shortened behind the advertised document length.
 
 Edits are accepted only when Qem can perform them within its safety limits.
 Frontends can query `edit_capability_at`, `edit_capability_for_range`, or
