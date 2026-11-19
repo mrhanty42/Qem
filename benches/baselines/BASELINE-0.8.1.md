@@ -37,10 +37,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\collect_perf_matrix.ps1 `
   -MeasureSave `
   -Release `
   -MatrixLabel post-0.9.0-50gb `
-  -OutputJsonl perf-baselines\perf-50gb-post-0.9.0.jsonl
+  -OutputJsonl benchesaselines\perf-50gb-post-0.9.0.jsonl
 powershell -ExecutionPolicy Bypass -File .\scripts\summarize_perf_matrix.ps1 `
-  -InputJsonl perf-baselines\perf-50gb-post-0.9.0.jsonl `
-  -OutputMarkdown perf-baselines\perf-50gb-post-0.9.0-summary.md
+  -InputJsonl benchesaselines\perf-50gb-post-0.9.0.jsonl `
+  -OutputMarkdown benchesaselines\perf-50gb-post-0.9.0-summary.md
 ```
 
 Procedure notes:

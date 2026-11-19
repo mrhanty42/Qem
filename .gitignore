@@ -18,3 +18,7 @@ examples/output.txt
 
 # Local mapbuild worktree (its own build cache).
 /mapbuild
+
+# Local-only agent and tooling files.
+agent-protocol-v2.2.md
+.zcodeignore
