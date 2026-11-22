@@ -154,6 +154,30 @@ fix was verified by temporarily reverting it and watching that test fail.
   implementation details in rustdoc, and write down the semver policy for
   the post-1.0 line.
 
+## Completed after the 1.0 release
+
+- **Splice absorption in CJK regex windows is fixed with absolute
+  character-phase tracking.** The Class B regex scan used to re-align a
+  window that opened mid-sequence by probing the decode: as long as the
+  window head did not decode with a replacement character first, the head
+  was accepted even when it sat on a trail byte, and a trail byte that
+  spliced into a valid pair with the next byte (the Shift_JIS, GB18030,
+  and EUC-KR trail ranges overlap the lead ranges) shifted the whole
+  window's decode off the document's character phase, so needle
+  occurrences absorbed into the spliced pairs were never reported. On
+  GB18030 the window edges could sit mid-cell on the decoder's grid
+  outright, because the leading-byte detector answers four bytes for
+  every lead + digit pair while the decoder decomposes a rejected
+  four-byte sequence into a one-byte replacement plus reprocessed bytes,
+  and the re-pairing persists through a whole run of two-byte characters.
+  The scan now walks its window edges with the encoding_rs decoder's own
+  per-cell consumption instead of the plain detector, the probe is gone,
+  and the decoded-to-source mapping walks the decoded characters and the
+  source window in lockstep, so corrupt cells in front of a match no
+  longer drift its offsets. Deterministic Shift_JIS and GB18030
+  absorption fixtures pin the behavior, and each fix component was
+  verified by re-introducing it and watching its test fail.
+
 ## Known limitations
 
 These are documented trade-offs, not bugs. Each is visible in the public
@@ -168,13 +192,12 @@ documentation.
 
 - Search mapping stays approximate for **genuinely corrupt bytes**: a
   U+FFFD decoded from ill-formed data mid-window re-encodes to a numeric
-  character reference in Shift_JIS / EUC-KR, drifting the mapping for
-  matches after it inside the same window.
-- The leading-byte window probe is one-sided for CJK: a window opening on
-  a trail byte that happens to splice into a valid pair with the next byte
-  decodes clean and is accepted mid-sequence, so occurrences absorbed into
-  spliced pairs are missed. A full fix needs absolute character-phase
-  tracking instead of probing; it is planned for the post-1.0 line.
+  character reference in Shift_JIS / EUC-KR, drifting positions computed
+  after it. The regex scan's candidate-to-source mapping walks around
+  replacements exactly now (see the splice-absorption fix above); the
+  residual approximation lives in the piece-table position mapping, the
+  amortized window-cache cursor, and the overlap threshold, which still
+  re-encode replacement characters.
 - Pre-edit viewport estimates on the mmap path stay approximate until the
   exact line mapping reaches the requested line; this is the documented
   estimate contract.
@@ -221,5 +244,4 @@ May stay unstable:
 
 The post-1.0 line starts with the items above plus the decisions parked
 during the 1.0 cycle: the session history cap (it changes the user-visible
-undo depth), the crates.io publication policy for patch releases, and the
-absolute character-phase tracking for CJK search candidates.
+undo depth) and the crates.io publication policy for patch releases.

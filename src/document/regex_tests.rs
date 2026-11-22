@@ -1846,6 +1846,173 @@ fn find_next_regex_rejects_phantom_match_at_shift_jis_window_head() {
 }
 
 // ---------------------------------------------------------------------------
+// Splice absorption + corrupt-cell drift on CJK regex windows
+//
+// Two deterministic pins for the absolute character-phase tracking:
+//
+//  1. GB18030: a window edge cut on a leading-byte-DETECTOR boundary that is
+//     mid-cell on the decoder's grid made the next window open on a trail
+//     byte that spliced into a valid pair with the next byte (trail ranges
+//     overlap the lead ranges), decode clean, and re-phase the whole
+//     window - needle occurrences absorbed into spliced pairs were never
+//     reported. The scan now walks window edges with the encoding_rs
+//     decoder's own per-cell consumption, so every edge is reachable by
+//     whole cells from the window's known boundary.
+//
+//  2. Shift_JIS: a corrupt cell in front of a match used to drift its
+//     mapped offsets, because a U+FFFD replacement character re-encodes to
+//     an eight-byte numeric character reference regardless of the one-byte
+//     cell that produced it. The mapping now walks the decoded characters
+//     and the source window in lockstep (re-encode widths for clean
+//     characters, the decoder's own cell consumption around replacements).
+//
+// Each fix component was verified by re-introducing it and watching its
+// test fail.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn find_next_regex_finds_needle_absorbed_into_gb18030_spliced_pairs() {
+    // Fixture layout (GB18030 bytes):
+    //
+    //   0..2    [0xC4, 0xE3]  "你" - a clean GB2312 pair so window 1's head
+    //                         decodes clean from byte 0
+    //   2..6    [0x81, 0x31, 0x41, 0x82] - lead + digit opens a four-byte
+    //           sequence whose third byte (0x41) is not a lead: the decoder
+    //           REJECTS it and decomposes the attempt into one U+FFFD cell
+    //           for the lead, ASCII '1' for the digit, ASCII 'A' for the
+    //           reprocessed third byte, and REPROCESSES the fourth byte
+    //           (0x82) as a fresh lead - cells of 1 + 1 + 1 source bytes.
+    //           The leading-byte detector instead answers four for every
+    //           lead + digit pair: one detector cell spanning bytes 2..6.
+    //   5..7    [0x82, 0xB0]  a true two-byte cell ("偘"), bytes 5-6
+    //   7..9    [0xD6, 0xD0]  "中" - the NEEDLE, a true cell on bytes 7-8.
+    //           Byte 6 (0xB0) is a detector boundary but sits INSIDE the
+    //           decoder's [5..7) cell, so a window opening at byte 6
+    //           re-pairs [0xB0, 0xD6] (a valid GB2312 pair: trail ranges
+    //           overlap the lead ranges) and absorbs the needle's lead; the
+    //           needle's trail then leads the next shifted pair.
+    //   9..57   [0xB9, 0xFA] x 24 ("国" pairs) - mapped pairs keep the
+    //           splice going so every shifted window stays off-phase.
+    //   57..62  "tail\n"      ASCII baseline: the shifted pre-fix pairing
+    //                         absorbs its 't' into [0xFA, 't'] as well, so
+    //                         this line is green only after the fix too.
+    //
+    // Geometry is pinned to chunk = 8 / overlap = 2. Detector walk (the old
+    // behaviour): window 1 = [0, 8), next head = byte 6 (mid-cell on the
+    // decoder's grid). Decoder walk (the fix): window 1 = [0, 7), window 2
+    // opens at byte 5 - the true cell boundary - and decodes the needle.
+    super::regex_search::class_b_chunk_geometry_override::set(8, 2);
+
+    let mut bytes: Vec<u8> = vec![0xC4, 0xE3, 0x81, 0x31, 0x41, 0x82, 0xB0, 0xD6, 0xD0];
+    for _ in 0..24 {
+        bytes.extend_from_slice(&[0xB9, 0xFA]);
+    }
+    bytes.extend_from_slice(b"tail\n");
+    assert_eq!(bytes.len(), 62);
+
+    // Independent oracle: the whole-document decode must contain the needle
+    // (after 你, the U+FFFD, '1', 'A', and the spliced-pair character), and
+    // the fixture must be ill-formed exactly where the layout says.
+    let (decoded, _, had_errors) = GB18030.decode(&bytes);
+    assert!(
+        had_errors,
+        "fixture must be ill-formed at the rejected four-byte head"
+    );
+    assert_eq!(
+        decoded,
+        format!("你\u{FFFD}1A偘中{}tail\n", "国".repeat(24))
+    );
+    assert_eq!(decoded.matches("中").count(), 1, "fixture phase drifted");
+
+    let dir = fresh_test_dir("gb18030-regex-splice-absorption");
+    let path = dir.join("source.txt");
+    fs::write(&path, &bytes).unwrap();
+
+    let doc = Document::open_with_encoding(&path, DocumentEncoding::from_label("gb18030").unwrap())
+        .unwrap();
+    wait_until_indexed(&doc);
+
+    // THE REGRESSION: the needle occurrence absorbed into spliced pairs must
+    // be found. Before the decoder-cell walk, the shifted windows re-paired
+    // [0xB0, 0xD6] and [0xD0, 0xB9] and "中" never appeared in any window's
+    // decoded text: find_all answered an empty iterator.
+    let matches: Vec<_> = doc.find_all_regex("中").unwrap().collect();
+    assert_eq!(matches.len(), 1, "the absorbed 中 occurrence must be found");
+    let m = &matches[0];
+    assert_eq!(m.len_chars(), 1);
+    // Byte 7 (the needle's lead) is mid-cell on the ENGINE grid (cells: 你,
+    // the detector's 4-byte cell, [0xB0, 0xD6] on bytes 6..8), and the
+    // engine grid is the document's position model: the reported column is
+    // the engine's floor over [0..7) - three cells (你, the 4-byte cell, the
+    // byte-6 fragment), so column 3.
+    assert_eq!(m.start(), TextPosition::new(0, 3));
+    assert_eq!(m.end(), TextPosition::new(0, 4));
+
+    let one_shot = doc
+        .find_next_regex("中", TextPosition::new(0, 0))
+        .unwrap()
+        .expect("find_next_regex must agree with the iterator");
+    assert_eq!(one_shot.start(), TextPosition::new(0, 3));
+
+    // Baseline: the ASCII tail is found exactly once as well.
+    let tail: Vec<_> = doc.find_all_regex("tail").unwrap().collect();
+    assert_eq!(
+        tail.len(),
+        1,
+        "the ASCII baseline must be found exactly once"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn find_next_regex_maps_shift_jis_match_after_corrupt_cell_without_drift() {
+    // Fixture layout (Shift_JIS bytes):
+    //
+    //   0..2    [0x82, 0x60]  a clean two-byte cell ("Ａ")
+    //   2..3    [0xA0]        ill-formed: Malformed(1) - one U+FFFD cell of
+    //                         exactly ONE source byte
+    //   3..5    "ZZ"          the needle, true bytes 3-4 (true column 2)
+    //   5..15   "abcdefghij"  filler keeps the match away from the EOF edge
+    //
+    // The match's decoded prefix contains the U+FFFD. Re-encoding the prefix
+    // mapped the replacement to an eight-byte numeric character reference
+    // ("&#65533;") instead of its one-byte cell and drifted the match seven
+    // bytes right (reported at column 9 instead of 2). The lockstep mapping
+    // walks the corrupt cell with the decoder's own per-cell consumption.
+    let mut bytes: Vec<u8> = vec![0x82, 0x60, 0xA0, b'Z', b'Z'];
+    bytes.extend_from_slice(b"abcdefghij");
+    assert_eq!(bytes.len(), 15);
+
+    let (decoded, _, had_errors) = SHIFT_JIS.decode(&bytes);
+    assert!(had_errors, "fixture must be ill-formed at the lone 0xA0");
+    assert_eq!(decoded, "Ａ\u{FFFD}ZZabcdefghij");
+
+    let dir = fresh_test_dir("shift-jis-regex-fffd-drift");
+    let path = dir.join("source.txt");
+    fs::write(&path, &bytes).unwrap();
+
+    let doc =
+        Document::open_with_encoding(&path, DocumentEncoding::from_label("shift_jis").unwrap())
+            .unwrap();
+    wait_until_indexed(&doc);
+
+    let matches: Vec<_> = doc.find_all_regex("ZZ").unwrap().collect();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].start(), TextPosition::new(0, 2));
+    assert_eq!(matches[0].end(), TextPosition::new(0, 4));
+    assert_eq!(matches[0].len_chars(), 2);
+
+    let one_shot = doc
+        .find_next_regex("ZZ", TextPosition::new(0, 0))
+        .unwrap()
+        .expect("find_next_regex must agree with the iterator");
+    assert_eq!(one_shot.start(), TextPosition::new(0, 2));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
 // Dense find_all_regex on a Class B piece-table document (quadratic-mapping
 // reproduction, guard test).
 // ---------------------------------------------------------------------------

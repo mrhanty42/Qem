@@ -28,6 +28,30 @@
   the CR half. The walk now carries the pending CRLF context as whole
   cells, matching the canonical one-unit-per-CRLF contract; regression
   tests cover the cell collapse across a chunk edge and at EOF.
+- Regex search over CJK multibyte documents no longer loses needle
+  occurrences absorbed into spliced byte pairs. The Class B regex scan
+  used to re-align a window that opened mid-sequence with a one-sided
+  leading-byte probe: as long as the window head did not decode with a
+  replacement character first, the head was accepted even when it sat on
+  a trail byte, and a trail byte that spliced into a valid pair with the
+  next byte (the Shift_JIS, GB18030, and EUC-KR trail ranges overlap the
+  lead ranges) shifted the whole window's decode off the document's
+  character phase, so every later cell paired its neighbor's halves and
+  needle occurrences falling inside those spliced pairs were never
+  reported. GB18030 window edges additionally sat mid-cell on the
+  decoder's grid outright: the leading-byte detector answers four bytes
+  for every lead + digit pair, while the decoder decomposes a rejected
+  four-byte sequence into a one-byte replacement plus reprocessed bytes,
+  and the re-pairing persists through a whole run of two-byte characters.
+  The scan now keeps the window phase absolute instead of probing it:
+  window edges are walked with the encoding_rs decoder's own per-cell
+  consumption, the probe is gone, and the decoded-to-source mapping walks
+  the decoded characters and the source window in lockstep (re-encode
+  widths for clean characters, the decoder's own cell consumption around
+  replacement characters), so a corrupt cell in front of a match no
+  longer drifts its offsets either. Deterministic Shift_JIS and GB18030
+  absorption fixtures pin the behavior; each fix component was verified
+  by re-introducing it and watching its test fail.
 
 ## 1.0.1 (2026-11-19)
 

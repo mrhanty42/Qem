@@ -1850,71 +1850,17 @@ fn reverse_dfa_finalize_rope_window(
 //
 //   * CJK multibyte (Shift_JIS, GB18030, EUC-KR): characters are
 //     variable-length (1 / 2 / 4 bytes) with no uniform alignment, so
-//     the source-byte length of a decoded prefix is computed by
-//     re-encoding the prefix through `encoding_rs::Encoding::encode`.
-//     The decode → re-encode round-trip preserves character boundaries
-//     for byte sequences originating from a real CJK file, so an
-//     explicit alignment post-filter is not needed: any candidate
-//     whose offsets the round-trip cannot reproduce already implies
-//     boundary corruption and is naturally rejected upstream by the
-//     decoder. We still verify alignment lazily by relying on the
-//     fact that `encoding_rs::Encoding::encode` for the prefix
-//     yields a byte-length that, summed with the match's encoded
-//     byte-length, equals the slice taken from the original window.
+//     the source-byte offsets of a decoded span are computed by the
+//     lockstep walk in `class_b_lockstep_source_span`: the decoded
+//     characters and the source window are walked together from the
+//     window's known boundary, re-encoding clean characters for their
+//     exact width and taking the decoder's own per-cell consumption
+//     (`class_b_decoder_cell_len`) around `U+FFFD` cells. Window edges
+//     are cut on decoder cells for the same reason, so the walk never
+//     disagrees with the decode and no explicit alignment post-filter
+//     is needed: any candidate whose offsets the walk cannot reach is
+//     treated as unmappable and skipped.
 // ---------------------------------------------------------------------------
-
-/// Returns the source-byte length occupied by `decoded_byte_count` UTF-8
-/// bytes of `decoded` in the original encoded byte stream.
-///
-/// Branches on `encoding`:
-///
-/// * For UTF-16 (LE or BE) the mapping is the per-character UTF-16 byte
-///   length: every Unicode scalar contributes `c.len_utf16() * 2`
-///   source bytes.
-///
-/// * For the CJK multibyte encodings (Shift_JIS, GB18030, EUC-KR) the
-///   mapping is `encoding.encode(prefix).0.len()`: re-encoding the
-///   decoded UTF-8 prefix through `encoding_rs::Encoding::encode` is
-///   the canonical inverse of the decode that produced `decoded` from
-///   the original window. The re-encode is byte-exact for character
-///   sequences that round-trip cleanly through the encoding (which is
-///   every well-formed sequence we observe at the regex layer); for
-///   any sequence the encoder has to substitute, the chunked walker
-///   above retries on subsequent windows.
-///
-/// Returns `None` when `decoded_byte_count` is not on a UTF-8 character
-/// boundary in `decoded`. The regex engine never produces such offsets,
-/// so this is a defensive guard rather than a real branch.
-fn class_b_source_bytes_for_decoded_prefix(
-    encoding: DocumentEncoding,
-    decoded: &str,
-    decoded_byte_count: usize,
-) -> Option<usize> {
-    if decoded_byte_count > decoded.len() {
-        return None;
-    }
-    if !decoded.is_char_boundary(decoded_byte_count) {
-        return None;
-    }
-    let prefix = &decoded[..decoded_byte_count];
-    if encoding.name() == "UTF-16LE" || encoding.name() == "UTF-16BE" {
-        let mut bytes: usize = 0;
-        for c in prefix.chars() {
-            bytes = bytes.saturating_add(c.len_utf16().saturating_mul(2));
-        }
-        return Some(bytes);
-    }
-    // CJK multibyte (Shift_JIS, GB18030, EUC-KR): re-encode the prefix
-    // through encoding_rs to obtain the source-byte length. `encode`
-    // returns `(Cow<[u8]>, &Encoding, bool had_unmappable)`; we use
-    // only the byte length here. `had_unmappable` cannot legitimately
-    // fire for input that came from `decode_without_bom_handling` over
-    // the original encoded window: every character was produced by a
-    // well-formed multibyte sequence (or a U+FFFD for ill-formed
-    // bytes, which the encoder maps back to a known representation).
-    let encoded = encoding.as_encoding().encode(prefix).0;
-    Some(encoded.len())
-}
 
 /// Returns `true` when `encoding` requires a 2-byte alignment
 /// post-filter on the absolute byte offsets of a Class B regex match.
@@ -1928,6 +1874,228 @@ fn class_b_source_bytes_for_decoded_prefix(
 /// and the post-filter is intentionally skipped.
 fn class_b_requires_even_alignment(encoding: DocumentEncoding) -> bool {
     matches!(encoding.name(), "UTF-16LE" | "UTF-16BE")
+}
+
+/// Returns the number of source bytes the `encoding_rs` decoder consumes
+/// for the next character cell of a CJK multibyte encoding, starting from
+/// `offset` with the decoder in its initial state.
+///
+/// This is the decoder's OWN per-cell consumption, ported cell rule by cell
+/// rule from `encoding_rs`'s generated decoders (`shift_jis.rs`, `gb18030.rs`,
+/// `euc_kr.rs`). It deliberately disagrees with the plain leading-byte
+/// detector ([`super::encoding_engine::EncodingEngine::step`]) in exactly the
+/// cases where the detector's byte grid drifts off the decoder's grid:
+///
+/// * Shift_JIS / GB18030 / EUC-KR lead + invalid trail below `0x80`: the
+///   decoder emits `U+FFFD` for the lead alone and REPROCESSES the trail
+///   byte from the initial state, so the lead is a one-byte cell where the
+///   detector answered two.
+/// * GB18030 rejected four-byte sequence: the detector answers four for
+///   every lead + digit pair, while the decoder decomposes the rejection
+///   into a one-byte replacement for the lead plus reprocessed bytes — a
+///   lead-or-ASCII fourth byte shifts every later cell boundary by one.
+///
+/// A window edge cut on a detector boundary that is mid-cell on the
+/// decoder's grid made the next window open on a trail byte that spliced
+/// into a valid pair with the following byte (trail ranges overlap the
+/// lead ranges), decode clean, and silently re-phase the whole window.
+/// Walking edges with the decoder's own consumption keeps the window phase
+/// absolute: every edge is reachable by whole decoder cells from the
+/// window's known boundary.
+///
+/// UTF-16 never reaches this helper (its even 2-byte grid is absolute and
+/// handled arithmetically), and the returns always make forward progress:
+/// every in-range cell is at least one byte.
+fn class_b_decoder_cell_len(
+    encoding: DocumentEncoding,
+    bytes: &[u8],
+    offset: usize,
+    end: usize,
+) -> usize {
+    let end = end.min(bytes.len());
+    if offset >= end {
+        return 0;
+    }
+    let remaining = end - offset;
+    let b = bytes[offset];
+    let is_pair_trail = |t: u8, lo: u8, hi: u8| (lo..=hi).contains(&t);
+    match encoding.name() {
+        "Shift_JIS" => match b {
+            // Lead bytes 0x81..=0x9F / 0xE0..=0xFC open a trail state.
+            0x81..=0x9F | 0xE0..=0xFC => {
+                if remaining < 2 {
+                    // Truncated lead at the slice end: Malformed(1).
+                    return 1;
+                }
+                let t = bytes[offset + 1];
+                if is_pair_trail(t, 0x40, 0x7E) || is_pair_trail(t, 0x80, 0xFC) {
+                    // Valid trail shape: the pair is consumed as one cell
+                    // whether the index lookup maps or reports Malformed(2).
+                    2
+                } else if t < 0x80 {
+                    // Invalid trail below 0x80: Malformed(1) for the lead and
+                    // the trail byte is reprocessed from the initial state.
+                    1
+                } else {
+                    // t in 0xFD..=0xFF: Malformed(2) consumes the pair.
+                    2
+                }
+            }
+            // ASCII, 0x80 (U+0080), halfwidth katakana 0xA1..=0xDF, and the
+            // lone 0xA0 / 0xFD..=0xFF bytes all consume exactly one byte.
+            _ => 1,
+        },
+        "EUC-KR" => match b {
+            0x81..=0xFE => {
+                if remaining < 2 {
+                    return 1;
+                }
+                let t = bytes[offset + 1];
+                if is_pair_trail(t, 0x41, 0x5A)
+                    || is_pair_trail(t, 0x61, 0x7A)
+                    || is_pair_trail(t, 0x81, 0xFE)
+                {
+                    2
+                } else if t < 0x80 {
+                    1
+                } else {
+                    2
+                }
+            }
+            _ => 1,
+        },
+        // encoding_rs's canonical name for GB18030 is lowercase.
+        "gb18030" => match b {
+            0x81..=0xFE => {
+                if remaining < 2 {
+                    return 1;
+                }
+                let t = bytes[offset + 1];
+                if is_pair_trail(t, 0x40, 0x7E) || is_pair_trail(t, 0x80, 0xFE) {
+                    2
+                } else if (0x30..=0x39).contains(&t) {
+                    if remaining < 4 {
+                        // Truncated four-byte head at the slice end: the
+                        // decoder consumes everything it has (Malformed(pending)).
+                        return remaining;
+                    }
+                    let third = bytes[offset + 2];
+                    let fourth = bytes[offset + 3];
+                    if (0x81..=0xFE).contains(&third) {
+                        if (0x30..=0x39).contains(&fourth) {
+                            // Complete four-byte cell: valid, or consumed as
+                            // Malformed(4) when the pointer is out of range.
+                            4
+                        } else {
+                            // Rejected at the fourth byte: the lead becomes
+                            // one U+FFFD cell, the digit turns into pending
+                            // ASCII, and the third byte is re-paired with the
+                            // fourth. The walk continues after the lead.
+                            1
+                        }
+                    } else {
+                        // Rejected at the third byte: the lead becomes one
+                        // U+FFFD cell, the digit turns into pending ASCII,
+                        // and the third byte is reprocessed from the initial
+                        // state. The walk continues after the lead.
+                        1
+                    }
+                } else if t < 0x80 {
+                    // Invalid two-byte trail below 0x80: Malformed(1) for the
+                    // lead, trail reprocessed.
+                    1
+                } else {
+                    // t == 0xFF: Malformed(2) consumes the pair.
+                    2
+                }
+            }
+            // 0x00..=0x7F ASCII, 0x80 (U+20AC), 0xFF (Malformed(1)).
+            _ => 1,
+        },
+        // The CJK geometry walk only dispatches here for Shift_JIS,
+        // GB18030, and EUC-KR; UTF-16 keeps the even-grid arithmetic.
+        _ => 1,
+    }
+}
+
+/// Maps a decoded-text span of a Class B window back to source-byte offsets
+/// by walking the decoded characters and the source window in lockstep.
+///
+/// Returns `(source_offset_of_start, source_length_of_span)` for the decoded
+/// byte span `[start_decoded, end_decoded)` of `decoded`, which was produced
+/// by decoding `window` through `encoding` from its first byte.
+///
+/// This is the absolute character-phase tracking for candidate mapping: the
+/// walk starts at the window's known boundary (source byte 0 of the window,
+/// a decoder-true cell edge by the geometry walk) and advances one cell per
+/// decoded character, so a candidate's offsets are by construction reachable
+/// by whole cells from a known boundary. Widths are encoding-dispatched:
+///
+/// * UTF-16: every scalar contributes `c.len_utf16() * 2` source bytes —
+///   including `U+FFFD`, whose malformed surrogate cell also consumes two
+///   bytes.
+/// * CJK multibyte: a clean character re-encodes to its exact source width;
+///   a `U+FFFD` replacement character takes the decoder's OWN per-cell
+///   consumption ([`class_b_decoder_cell_len`]) at the current source
+///   position. Re-encoding a replacement instead would answer a numeric
+///   character reference (`&#65533;`, eight bytes in Shift_JIS / EUC-KR)
+///   for a one- or two-byte cell and drift every later offset in the
+///   window.
+///
+/// Returns `None` when the span is not on UTF-8 character boundaries, the
+/// walk cannot reach `end_decoded`, or a cell would overrun the window —
+/// the caller then skips the candidate instead of mapping garbage.
+fn class_b_lockstep_source_span(
+    encoding: DocumentEncoding,
+    window: &[u8],
+    decoded: &str,
+    start_decoded: usize,
+    end_decoded: usize,
+) -> Option<(usize, usize)> {
+    if start_decoded > end_decoded
+        || end_decoded > decoded.len()
+        || !decoded.is_char_boundary(start_decoded)
+        || !decoded.is_char_boundary(end_decoded)
+    {
+        return None;
+    }
+    let is_utf16 = matches!(encoding.name(), "UTF-16LE" | "UTF-16BE");
+    let mut src = 0usize;
+    let mut dec = 0usize;
+    let mut start_src: Option<usize> = None;
+    for c in decoded.chars() {
+        if dec == start_decoded {
+            start_src = Some(src);
+        }
+        if dec == end_decoded {
+            break;
+        }
+        let width = if is_utf16 {
+            c.len_utf16().saturating_mul(2)
+        } else if c == '\u{FFFD}' {
+            class_b_decoder_cell_len(encoding, window, src, window.len())
+        } else {
+            let mut buf = [0u8; 4];
+            encoding
+                .as_encoding()
+                .encode(c.encode_utf8(&mut buf))
+                .0
+                .len()
+        };
+        if width == 0 || src.saturating_add(width) > window.len() {
+            // The decoded text and the source window disagree on cell
+            // widths; treat the candidate as unmappable rather than
+            // returning a drifted offset.
+            return None;
+        }
+        src = src.saturating_add(width);
+        dec = dec.saturating_add(c.len_utf8());
+    }
+    if dec != end_decoded {
+        return None;
+    }
+    let start_src = start_src.unwrap_or(src);
+    Some((start_src, src - start_src))
 }
 
 /// Amortized Class B regex window cache carried by [`RegexSearchIter`].
@@ -1944,10 +2112,10 @@ fn class_b_requires_even_alignment(encoding: DocumentEncoding) -> bool {
 /// text and walking the cursor forward from the previous match.
 #[derive(Debug)]
 struct ClassBRegexWindowCache {
-    /// Absolute source-byte offset of `window[0]` (after the
-    /// cell-alignment skip).
+    /// Absolute source-byte offset of `window[0]` (a decoder-cell
+    /// boundary by the geometry walk).
     chunk_start: usize,
-    /// Raw source bytes of the window (post cell-alignment skip).
+    /// Raw source bytes of the window.
     window: Vec<u8>,
     /// The window decoded through the document encoding.
     decoded: String,
@@ -1968,12 +2136,15 @@ struct ClassBRegexWindowCache {
 /// regex window to `target_decoded` and returns the absolute source-byte
 /// offset.
 ///
-/// Mirrors [`class_b_source_bytes_for_decoded_prefix`] exactly (UTF-16:
-/// `len_utf16() * 2` per scalar; CJK multibyte: per-character re-encode
-/// through encoding_rs) but walks forward one character at a time from the
-/// cursor instead of re-encoding the whole prefix, so mapping every match
-/// in a window costs O(characters between matches) instead of
-/// O(window prefix).
+/// Mirrors the scan's lockstep mapping on the clean-character axis
+/// (UTF-16: `len_utf16() * 2` per scalar; CJK multibyte: per-character
+/// re-encode through encoding_rs) but walks forward one character at a
+/// time from the cursor instead of re-encoding the whole prefix, so
+/// mapping every match in a window costs O(characters between matches)
+/// instead of O(window prefix). Replacement characters still re-encode
+/// through the numeric-character-reference width here — the documented
+/// amortized-cursor residual in ROADMAP; a drifted cursor trips the
+/// `end_rel > window.len()` guard below and falls back to a fresh scan.
 ///
 /// Returns `None` when `target_decoded` is behind the cursor (monotone
 /// contract violation), past the decoded text, or not on a char boundary;
@@ -2127,8 +2298,8 @@ type AcceptedClassBCandidate = ((usize, usize, Vec<u8>), usize);
 /// backings.
 ///
 /// Iterates `[start_offset, end_offset)` in `REGEX_CHUNK_BYTES` windows
-/// (even-byte aligned for UTF-16; walked to whole encoding cells through
-/// `EncodingEngine::step` for CJK multibyte, whose byte grids are not
+/// (even-byte aligned for UTF-16; walked to whole decoder cells through
+/// [`class_b_decoder_cell_len`] for CJK multibyte, whose byte grids are not
 /// self-synchronizing — see the geometry comment in the body), with
 /// `REGEX_CHUNK_OVERLAP_BYTES` of overlap on continuation chunks so a
 /// match that straddles a chunk boundary is still observed. Each
@@ -2137,10 +2308,14 @@ type AcceptedClassBCandidate = ((usize, usize, Vec<u8>), usize);
 /// text-engine regex is run against the resulting `&str`, and the
 /// first match is mapped back to absolute source-byte offsets.
 ///
-/// Source-byte mapping is encoding-dispatched: UTF-16 uses
-/// `c.len_utf16() * 2` per character; CJK multibyte re-encodes the
-/// decoded prefix through `encoding_rs::Encoding::encode`. See
-/// [`class_b_source_bytes_for_decoded_prefix`].
+/// Source-byte mapping is the lockstep walk in
+/// [`class_b_lockstep_source_span`]: UTF-16 uses `c.len_utf16() * 2` per
+/// character; CJK multibyte re-encodes clean characters and takes the
+/// decoder's own per-cell consumption around `U+FFFD` cells, walking the
+/// decoded text and the source window in lockstep from the window's known
+/// boundary. Every accepted candidate's offsets are therefore reachable by
+/// whole cells from a known boundary — the absolute character-phase
+/// tracking that replaced the old one-sided leading-byte window probe.
 ///
 /// Post-filter on absolute byte offsets is alignment-dispatched:
 /// UTF-16 rejects matches whose start or end is not on a 2-byte
@@ -2148,11 +2323,11 @@ type AcceptedClassBCandidate = ((usize, usize, Vec<u8>), usize);
 /// straddles a `U+FFFD` replacement character produced by ill-formed
 /// surrogate pairs in the source. CJK multibyte does not enforce a
 /// global alignment grid, so the post-filter is
-/// skipped: the encode-decode round-trip itself validates character
-/// boundaries (any byte sequence the encoder cannot reproduce was
-/// already a `U+FFFD`-substituted boundary corruption upstream and
-/// contributes no `match_bytes` slice that would survive the slice
-/// arithmetic below).
+/// skipped: the decoder-cell walk and the lockstep mapping themselves
+/// validate character boundaries (any byte sequence the encoder cannot
+/// reproduce was already a `U+FFFD`-substituted boundary corruption
+/// upstream and contributes no `match_bytes` slice that would survive the
+/// slice arithmetic below).
 ///
 /// On continuation chunks we skip matches that lie entirely inside the
 /// previous-chunk overlap, mirroring the byte-engine pattern used by
@@ -2201,7 +2376,6 @@ fn scan_class_b_regex_candidates(
     } else {
         start_offset
     };
-    let engine = doc.encoding_engine();
     let mut first_chunk = true;
     let mut prev_chunk_end: Option<usize> = None;
     while chunk_start < end_offset {
@@ -2217,20 +2391,23 @@ fn scan_class_b_regex_candidates(
         //
         // * CJK multibyte (Shift_JIS, GB18030, EUC-KR): the byte grids
         //   are not self-synchronizing, so BOTH window edges are walked
-        //   to whole encoding cells from the known character boundary
-        //   `chunk_start` through `engine.step` — the same discipline
-        //   `boundary_walk_ok` applies to literal-search candidates in
-        //   `super::search`. A raw byte cut here used to split a
-        //   multibyte cell at the window tail (the fragment decoded to
-        //   U+FFFD, so a match straddling the boundary was invisible in
-        //   this window) and, worse, at the next window's head: the
-        //   leading trail byte decodes as a plain ASCII character (a
-        //   phantom that does not exist in the document text), and a
-        //   match anchored on it was reported at a position where the
-        //   text has no such character. With whole-cell boundaries every
-        //   window decodes exactly as its source bytes would as a whole
-        //   document, and the decode -> re-encode source mapping stays
-        //   drift-free.
+        //   to whole DECODER cells from the known character boundary
+        //   `chunk_start` through [`class_b_decoder_cell_len`] — the
+        //   encoding_rs decoder's own per-cell consumption, not the
+        //   plain leading-byte detector. The two disagree exactly where
+        //   it matters: the detector answers four bytes for every
+        //   GB18030 lead + digit pair while the decoder decomposes a
+        //   rejected four-byte sequence into a one-byte replacement plus
+        //   reprocessed bytes, so detector edges can sit mid-cell on the
+        //   decoder's grid. A window that opened on such an edge opened
+        //   on a trail byte that spliced into a valid pair with the next
+        //   byte (trail ranges overlap the lead ranges), decoded clean,
+        //   and shifted the whole window's decode off the document's
+        //   character phase — needle occurrences absorbed into the
+        //   spliced pairs were never reported. With decoder-cell edges
+        //   every window decodes exactly as its source bytes would as a
+        //   whole document, and the phase stays absolute from the
+        //   window's known boundary.
         let (chunk_end, next_head, window) = if requires_even_alignment {
             let chunk_end = if target_end & 1 == 1 && target_end > chunk_start {
                 target_end - 1
@@ -2249,7 +2426,7 @@ fn scan_class_b_regex_candidates(
                 .saturating_add(MAX_CLASS_B_CELL_BYTES)
                 .min(end_offset);
             let peek = fetch_class_b_window(doc, chunk_start, peek_end)?;
-            // Walk the cell boundaries from the known boundary
+            // Walk the decoder cell boundaries from the known boundary
             // `chunk_start`. `floor` tracks the last boundary at or
             // before the target (the window end); `head` tracks the
             // last boundary at or before `floor - overlap` (the next
@@ -2259,14 +2436,22 @@ fn scan_class_b_regex_candidates(
             let mut floor = chunk_start;
             let mut head = chunk_start;
             while cursor < target_end {
-                let step = engine.step(&peek, cursor - chunk_start, peek.len()).max(1);
+                let step =
+                    class_b_decoder_cell_len(doc_encoding, &peek, cursor - chunk_start, peek.len())
+                        .max(1);
                 let next = cursor.saturating_add(step);
                 if next > target_end {
                     break;
                 }
                 floor = next;
                 while head < floor {
-                    let head_step = engine.step(&peek, head - chunk_start, peek.len()).max(1);
+                    let head_step = class_b_decoder_cell_len(
+                        doc_encoding,
+                        &peek,
+                        head - chunk_start,
+                        peek.len(),
+                    )
+                    .max(1);
                     let head_next = head.saturating_add(head_step);
                     if head_next.saturating_add(overlap) <= floor {
                         head = head_next;
@@ -2283,7 +2468,7 @@ fn scan_class_b_regex_candidates(
             let chunk_end = if floor > chunk_start {
                 floor
             } else {
-                let step = engine.step(&peek, 0, peek.len()).max(1);
+                let step = class_b_decoder_cell_len(doc_encoding, &peek, 0, peek.len()).max(1);
                 (chunk_start + step).min(end_offset)
             };
             let window = peek[..chunk_end - chunk_start].to_vec();
@@ -2292,47 +2477,6 @@ fn scan_class_b_regex_candidates(
         if chunk_end <= chunk_start {
             break;
         }
-
-        // For UTF-16 the even grid keeps every window on a code-unit
-        // cell. For CJK multibyte the window head is already walked to
-        // a whole cell above, so on well-formed input the probe below
-        // never fires; it stays as a safety net for genuinely corrupt
-        // heads (a leading fragment that decodes to U+FFFD whose
-        // re-encode length has nothing to do with the fragment's source
-        // width — Shift_JIS / EUC-KR emit an 8-byte numeric character
-        // reference — would otherwise make every
-        // `class_b_source_bytes_for_decoded_prefix` mapping after it
-        // drift). The dropped bytes belong to the previous window's
-        // tail, which the overlap already covered. Genuinely corrupt
-        // bytes inside the window still decode to U+FFFD and keep the
-        // re-encode mapping approximate (see the ROADMAP reverse-regex
-        // item).
-        let cjk_window_skip = if requires_even_alignment {
-            0usize
-        } else {
-            let probe_end = window.len().min(4);
-            let mut skip = 0usize;
-            while skip < probe_end {
-                let (probe_decoded, _, probe_had_errors) =
-                    encoding.decode(&window[skip..probe_end]);
-                let opens_on_boundary = if probe_had_errors {
-                    !probe_decoded.starts_with('\u{FFFD}')
-                } else {
-                    true
-                };
-                if opens_on_boundary {
-                    break;
-                }
-                skip += 1;
-            }
-            skip
-        };
-        chunk_start = chunk_start.saturating_add(cjk_window_skip);
-        let window = if cjk_window_skip > 0 {
-            window[cjk_window_skip..].to_vec()
-        } else {
-            window
-        };
 
         // Decode the window into a Cow<str>. `decode_without_bom_handling`
         // is documented to ignore the BOM in the byte stream (we already
@@ -2344,17 +2488,16 @@ fn scan_class_b_regex_candidates(
             0
         } else {
             // The leading `REGEX_CHUNK_OVERLAP_BYTES` source bytes were
-            // already part of the previous chunk's window — minus the
-            // `cjk_window_skip` bytes this window dropped: the covered
-            // span is the previous window's tail, which shrinks by the
-            // same skip. Translate that source-byte overlap into a
+            // already part of the previous chunk's window, and adjacent
+            // window edges are decoder-cell boundaries, so the covered
+            // span is exactly `prev_chunk_end - chunk_start` source
+            // bytes. Translate that source-byte overlap into a
             // decoded-byte threshold so matches fully inside the overlap
-            // are rejected without also rejecting matches that end
-            // within the `skip` bytes past the previous window's end -
-            // those live outside anything the previous window scanned.
+            // are rejected without also rejecting matches that reach
+            // past the previous window's end.
             let overlap_source_bytes = prev_chunk_end
                 .unwrap_or(0)
-                .saturating_sub(chunk_start.saturating_add(cjk_window_skip))
+                .saturating_sub(chunk_start)
                 .min(window.len());
             decoded_prefix_for_source_byte_count(doc_encoding, &decoded, overlap_source_bytes)
         };
@@ -2394,24 +2537,18 @@ fn scan_class_b_regex_candidates(
             // Skip matches fully inside the previous-chunk overlap on
             // continuation chunks; they were either already returned or
             // will be returned by an earlier window.
-            // Map the decoded match back to source bytes. A mapping
-            // failure (not currently reachable: match offsets are
-            // always char boundaries inside `decoded`) must not abort
-            // the whole scan - in `keep_last` mode that would discard
-            // a match already accumulated on an earlier window - so
-            // fall through to the window slide and keep scanning.
-            let prefix_source_len =
-                class_b_source_bytes_for_decoded_prefix(doc_encoding, &decoded, m.start());
-            let match_source_len = prefix_source_len.and_then(|_| {
-                class_b_source_bytes_for_decoded_prefix(
-                    doc_encoding,
-                    &decoded[m.start()..],
-                    m.end() - m.start(),
-                )
-            });
-            if let (Some(prefix_source_len), Some(match_source_len)) =
-                (prefix_source_len, match_source_len)
-            {
+            // Map the decoded match back to source bytes with the
+            // lockstep walk (clean characters re-encode to their exact
+            // width; a U+FFFD cell takes the decoder's own per-cell
+            // consumption). A mapping failure (not currently reachable:
+            // match offsets are always char boundaries inside `decoded`)
+            // must not abort the whole scan - in `keep_last` mode that
+            // would discard a match already accumulated on an earlier
+            // window - so fall through to the window slide and keep
+            // scanning.
+            let mapped_span =
+                class_b_lockstep_source_span(doc_encoding, &window, &decoded, m.start(), m.end());
+            if let Some((prefix_source_len, match_source_len)) = mapped_span {
                 // Forward mode: a returned candidate is the answer.
                 // Reverse mode (`keep_last = true`) records it and
                 // keeps scanning until the range is exhausted.
@@ -2460,20 +2597,21 @@ fn scan_class_b_regex_candidates(
             break;
         }
         // Slide forward keeping the overlap. `next_head` was walked to a
-        // whole cell for CJK multibyte (and stays on the even grid for
-        // UTF-16), so the next window opens on a character boundary.
+        // whole decoder cell for CJK multibyte (and stays on the even grid
+        // for UTF-16), so the next window opens on a character boundary.
         // Forward progress is guaranteed by the
         // `next_head > chunk_start` check below: if the slide would not
         // advance (degenerate geometry where the overlap covers the
-        // whole window), we step forward by one whole encoding cell
-        // (2 bytes for UTF-16) so the loop cannot stall and the next
-        // window head stays aligned.
+        // whole window), we step forward by one whole cell (2 bytes for
+        // UTF-16, one decoder cell for CJK) so the loop cannot stall and
+        // the next window head stays aligned.
         chunk_start = if next_head > chunk_start {
             next_head
         } else if requires_even_alignment {
             chunk_start.saturating_add(2)
         } else {
-            chunk_start.saturating_add(engine.step(&window, 0, window.len()).max(1))
+            let step = class_b_decoder_cell_len(doc_encoding, &window, 0, window.len()).max(1);
+            chunk_start.saturating_add(step)
         };
         first_chunk = false;
         prev_chunk_end = Some(chunk_end);
@@ -2540,8 +2678,8 @@ fn map_and_keep_class_b_candidate(
 ///
 /// Used to translate the source-byte overlap region into the decoded-byte
 /// space so we can reject continuation-chunk matches that lie entirely
-/// inside it. Encoding-dispatched on the same axis as
-/// [`class_b_source_bytes_for_decoded_prefix`]:
+/// inside it. Encoding-dispatched on the same width axis as the scan's
+/// lockstep mapping:
 ///
 /// * UTF-16: every Unicode scalar contributes `c.len_utf16() * 2`
 ///   source bytes; we walk the chars and keep the largest prefix that
