@@ -14,6 +14,7 @@ recorded numbers live in [`BENCHMARKS.md`](BENCHMARKS.md).
 | 0.9.0 | shipped 2026-11-08 | ropey dependency replaced by the Qem-native edit buffer, rope-path undo/redo history, far-edit support, performance baselines |
 | 1.0.0 | shipped 2026-11-19 | cell-exact line model for multi-byte encodings, hardening of the persistence and search paths, public API freeze |
 | 1.0.1 | shipped 2026-11-19 | documentation corrections for the release page |
+| 1.1.0 | shipped 2026-11-22 | additive typed reads on the frozen surface, CJK regex character-phase tracking, decoder-cell port corrections, internal module splits |
 
 ## Planning rules
 
@@ -114,33 +115,14 @@ fix was verified by temporarily reverting it and watching that test fail.
   the next save and reopen. A cap or sliding window changes the
   user-visible undo depth, so it needs an explicit product decision before
   implementation.
-- **Typed reads on unreadable pages.** Structural edits already refuse to
-  reference a page that the resident window dropped, but the read walkers
-  still silently skip a lazily read page that fails its CRC, shortening
-  reads behind the documented length instead of surfacing a typed error.
-  The fix converts the read-walker family to a `Result` contour; it is
-  deferred so the hot read path is not churned unreviewed.
 - **Checksums for `.qem.lineidx` pages.** Index pages validate their
   structural invariants but carry no CRC, so a flipped byte inside a
   checkpoint value parses cleanly and yields silently wrong line starts.
   The fix belongs with the next sidecar format bump.
-- **Engine-aware bounded-read context.** The text-unit advance walk reads
-  the document in bounded windows and carries a single CRLF-context byte
-  across window edges; for UTF-16 the CRLF pair spans two cells, so the
-  context must widen to the encoding's maximum cell width.
 - **Cheaper snapshot backing off Windows.** Non-Windows snapshot backing
   still copies the whole source file at open; a cheaper backing needs
   design work. Snapshot `save_async` should also share the edit buffer
   through `Arc` instead of cloning it on the caller thread.
-- **Focused refactors, not a rewrite.** Split the overgrown modules into
-  focused units (history, persistence, fragmentation, and the core
-  piece-tree structure; named lifecycle helpers around inspection,
-  indexing, sidecar recovery, and final state construction), and reduce the
-  duplication between `DocumentSession` and `EditorTab` through composition
-  without breaking the public surface.
-- **Drop non-critical `unsafe` blocks** where a safe equivalent exists at
-  the same performance tier, and document in place why each remaining
-  `unsafe` site is load-bearing.
 - **Remove `unwrap` and `expect` from recoverable paths**, replacing the
   remaining default-value patterns with typed error propagation.
 - **Backing transitions surface as events.** The `mmap → piece_table`
@@ -150,12 +132,42 @@ fix was verified by temporarily reverting it and watching that test fail.
 - **Regression benchmarks in CI.** Open, first viewport, first edit on huge
   files, edited save, literal search, and regex search each get a short
   regression bench tied to the recorded baselines.
-- **Public API freeze.** Label the stable surface against internal
-  implementation details in rustdoc, and write down the semver policy for
-  the post-1.0 line.
 
 ## Completed after the 1.0 release
 
+- **The frozen read surface stays infallible; unreadable pages surface
+  through additive typed methods.** `read_text`, `read_selection`,
+  `read_viewport`, and `text_lossy` keep their 1.0.0 signatures and their
+  best-effort degradation, documented on each method. The additive
+  `read_text_result`, `read_selection_result`, `read_viewport_result`,
+  `text_lossy_result`, and `line_slices_result` return the typed
+  `DocumentReadError` when a session sidecar page no longer passes its
+  checksum. Save and cut fail typed (`DocumentError::Write`) through the
+  same contour; compaction, detach, and the discarded-save history rebase
+  refuse their pass and keep the live piece tree untouched; the
+  piece-table-to-rope promotion fails typed instead of opening a silently
+  emptied rope.
+- **The UTF-16 text-unit advance collapses stored CRLF on whole cells.**
+  The pending context carries the entire CR cell across window edges and
+  at EOF, so a CRLF pair spanning two UTF-16 cells counts as one unit
+  behind inserts, splits, and caret movement.
+- **The Shift_JIS / EUC-KR / gb18030 decoder-cell port matches
+  encoding_rs on rejected sequences.** Valid-shape trails below 0x80
+  (Shift_JIS unmapped pointers, EUC-KR letter trails outside the hangul
+  extension) report Malformed(1) with the trail reprocessed, so the lead
+  stays a one-byte cell; a gb18030 truncated four-byte head decomposes
+  exactly like the decoder, including the pending three-byte end flush;
+  and the euro sign maps through gb18030's `0x80`. The Shift_JIS
+  low-trail mapped table covers the full lead range (the 3780-entry table
+  panicked on leads above 0x9F and is resized to 11280 entries). The port
+  was verified by a differential sweep against encoding_rs on all three
+  encodings.
+- **The overgrown modules are split into focused units.** `src/document.rs`
+  (piece_table, scan, fixtures, pieces) and `src/piece_tree.rs` (store,
+  btree, session, history) are now module directories. The public surface
+  is unchanged; the stability labels in the rustdoc keep marking the
+  frozen API, and the semver rules for the 1.x line are written down in
+  the stability contract below.
 - **Splice absorption in CJK regex windows is fixed with absolute
   character-phase tracking.** The Class B regex scan used to re-align a
   window that opened mid-sequence by probing the decode: as long as the
@@ -225,6 +237,15 @@ May stay unstable:
 - the sidecar on-disk formats;
 - low-level cache and layout choices;
 - internal storage details.
+
+### Semver policy for the post-1.0 line
+
+The 1.x line is additive: new types, methods, fields, and feature flags,
+plus fixes, ship in minor releases (1.1.0, 1.2.0, …). A change that alters
+a frozen signature, removes or renames a public item, changes documented
+behavior, or breaks compatibility for a released crate requires the next
+major release (2.0.0). Patch releases (1.x.y with no new API) carry fixes
+and documentation corrections only.
 
 ## 1.0.0 freeze criteria — met at release (2026-11-19)
 

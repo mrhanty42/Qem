@@ -171,6 +171,12 @@
 //! - `editor` (default): enables the backend-first session wrapper
 //!   [`DocumentSession`], the convenience cursor wrapper [`EditorTab`], and
 //!   the related progress/save helper types.
+//! - `tmp-auto` (default): explicit marker for the default scratch policy;
+//!   the flag adds no code path of its own.
+//! - `tmp-source-dir` / `tmp-system-dir` / `tmp-exe-dir`: mutually picked
+//!   scratch-placement policies; exactly one is active per build. They can
+//!   also be overridden at runtime with the `QEM_TMP_POLICY` and
+//!   `QEM_TMP_DIR` environment variables.
 //!
 //! # Official Integration Demos
 //!

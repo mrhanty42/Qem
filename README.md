@@ -53,7 +53,7 @@ Native-route documents save and reopen at any size.
 
 ```toml
 [dependencies]
-qem = "1.0.1"
+qem = "1.1.0"
 ```
 
 The default features include the editor/session layer and automatic
@@ -61,7 +61,7 @@ temporary-directory selection. For the lower-level document engine only:
 
 ```toml
 [dependencies]
-qem = { version = "1.0.1", default-features = false }
+qem = { version = "1.1.0", default-features = false }
 ```
 
 ### Feature flags
@@ -201,9 +201,13 @@ command, commit, toolchain, OS, hardware, storage, and cache conditions.
 
 ## Project status
 
-Qem 1.0.0 shipped on 2026-11-19: the public API is frozen and follows the
-documented semver policy. The release plan in [`ROADMAP.md`](ROADMAP.md)
-tracks completed work, the post-1.0 line, and the stability contract.
+Qem 1.0.0 shipped on 2026-11-19: the public API is frozen. The 1.x line
+carries additive changes only — new types, methods, and fixes; breaking
+changes are parked for 2.0.0 (the semver policy is written down in
+[`ROADMAP.md`](ROADMAP.md)). Qem 1.1.0 shipped on 2026-11-22 with the
+additive typed read methods, the CJK regex character-phase fix, and the
+internal module splits. The release plan tracks completed work, the
+post-1.0 line, and the stability contract.
 
 ## License
 

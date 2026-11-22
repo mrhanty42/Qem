@@ -1,57 +1,42 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 (2026-11-22)
 
 ### Added
 
-- Additive typed-read surface next to the frozen infallible reads: the new
-  `read_text_result`, `read_selection_result`, `read_viewport_result`, and
-  `text_lossy_result` document methods return the new public
-  `DocumentReadError` when the backing cannot materialize the requested
-  bytes (for a piece-table backing: a session sidecar page that no longer
-  loads), instead of degrading best-effort the way the frozen 1.0.0
-  surface (`text_lossy`, `read_text`, `read_selection`, `read_viewport`)
-  documents. The frozen signatures are unchanged, so this is additive.
-- An internal honest read contour behind those methods: piece-tree read
-  walkers and piece-table byte materialization fail typed on an unreadable
-  page, and the save path maps such a failure to the save target's
-  `DocumentError::Write` rather than persisting a silently shortened
-  document.
+- Additive typed read methods on the frozen surface: `read_text_result`,
+  `read_selection_result`, `read_viewport_result`, `text_lossy_result`
+  (all `Result<_, DocumentReadError>`) and the `DocumentReadError` type.
+  The frozen infallible read surface is unchanged and degrades
+  best-effort on unreadable piece pages, documented on each method; the
+  typed path surfaces `DocumentError`-grade read failures (a piece page
+  that stops passing its CRC) instead of silently shortened content.
+- Save, compaction, detach, history-rebase, and cut no longer materialize
+  through an unreadable piece page: save and cut fail typed
+  (`DocumentError::Write`), while compaction, detach, and the
+  discarded-save history rebase refuse the pass and keep the live piece
+  tree untouched (a silently truncated save is no longer possible).
+- Internal refactors: `src/document.rs` and `src/piece_tree.rs` split
+  into focused modules (piece_table, scan, fixtures, pieces; store,
+  btree, session, history) without public-surface changes.
 
 ### Fixed
 
-- UTF-16 documents counted a stored CRLF as two text units in the
-  piece-table advance walk: the walker recognized the CR and LF bytes but
-  not the whole two-byte CR and LF cells, so the collapse into one unit
-  broke everywhere the pair spans cell boundaries — including the deferred
-  tail at the bounded-read chunk edge and a CRLF that ends the document on
-  the CR half. The walk now carries the pending CRLF context as whole
-  cells, matching the canonical one-unit-per-CRLF contract; regression
-  tests cover the cell collapse across a chunk edge and at EOF.
 - Regex search over CJK multibyte documents no longer loses needle
-  occurrences absorbed into spliced byte pairs. The Class B regex scan
-  used to re-align a window that opened mid-sequence with a one-sided
-  leading-byte probe: as long as the window head did not decode with a
-  replacement character first, the head was accepted even when it sat on
-  a trail byte, and a trail byte that spliced into a valid pair with the
-  next byte (the Shift_JIS, GB18030, and EUC-KR trail ranges overlap the
-  lead ranges) shifted the whole window's decode off the document's
-  character phase, so every later cell paired its neighbor's halves and
-  needle occurrences falling inside those spliced pairs were never
-  reported. GB18030 window edges additionally sat mid-cell on the
-  decoder's grid outright: the leading-byte detector answers four bytes
-  for every lead + digit pair, while the decoder decomposes a rejected
-  four-byte sequence into a one-byte replacement plus reprocessed bytes,
-  and the re-pairing persists through a whole run of two-byte characters.
-  The scan now keeps the window phase absolute instead of probing it:
-  window edges are walked with the encoding_rs decoder's own per-cell
-  consumption, the probe is gone, and the decoded-to-source mapping walks
-  the decoded characters and the source window in lockstep (re-encode
-  widths for clean characters, the decoder's own cell consumption around
-  replacement characters), so a corrupt cell in front of a match no
-  longer drifts its offsets either. Deterministic Shift_JIS and GB18030
-  absorption fixtures pin the behavior; each fix component was verified
-  by re-introducing it and watching its test fail.
+  occurrences absorbed into spliced byte pairs (absolute
+  character-phase tracking with decoder-true window edges; the
+  one-sided leading-byte probe is gone).
+- The Shift_JIS / EUC-KR / gb18030 decoder-cell port now matches
+  encoding_rs on rejected sequences (valid-shape trails below 0x80,
+  letter trails outside the extension tables, truncated four-byte
+  heads) and the euro-sign mapping — verified by a differential sweep
+  against encoding_rs.
+- The text-unit advance walk collapses stored CRLF as one unit for
+  UTF-16 (the pending context carries the whole CR cell across chunk
+  edges and at EOF).
+- The piece-table-to-rope promotion fails typed when its
+  materialization hits an unreadable piece page (a silently emptied
+  rope followed by a save was a permanent document loss).
 
 ## 1.0.1 (2026-11-19)
 
@@ -81,10 +66,6 @@ the post-1.0 line by decision.
 - The recorded performance baselines moved from the repository root to
   `benches/baselines/`; the baseline documents' internal command paths are
   updated.
-
-
-### Changed
-
 - The `qem::index` module is no longer part of the public API. Every item
   inside it was already `pub(crate)`, so the module re-export exposed an
   empty namespace; closing it keeps the disk line index an internal detail

@@ -209,6 +209,10 @@ fn open_storage_backing(path: &Path) -> Result<StorageBacking, StorageOpenError>
 
     #[cfg(windows)]
     {
+        // SAFETY: `file` is a valid read-only handle and stays open for
+        // the mapping's whole lifetime inside the same `StorageBacking`
+        // variant (`_file`), which is the contract `Mmap::map` relies
+        // on.
         let mmap = unsafe { Mmap::map(&file) }.map_err(StorageOpenError::Map)?;
         Ok(StorageBacking::Mapped { _file: file, mmap })
     }
@@ -255,6 +259,9 @@ fn open_snapshot_backing(path: &Path) -> Result<StorageBacking, StorageOpenError
                     let _ = fs::remove_file(&snapshot_path);
                     continue;
                 }
+                // SAFETY: same contract as the mapped backing — `file`
+                // is a valid read-only handle kept open inside
+                // `SnapshotMapping.file` for the mapping's lifetime.
                 let mmap = unsafe { Mmap::map(&file) }.map_err(StorageOpenError::Map)?;
                 return Ok(StorageBacking::Snapshot {
                     mapping: SnapshotMapping {
@@ -578,6 +585,9 @@ fn replace_temp_file(temp_path: &Path, path: &Path) -> io::Result<()> {
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
     const REPLACEFILE_WRITE_THROUGH: u32 = 0x00000002;
 
+    // SAFETY: declarations match the Win32 `MoveFileExW` and
+    // `ReplaceFileW` signatures; both are called synchronously and
+    // retain none of the passed pointers beyond the call.
     unsafe extern "system" {
         fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
         fn ReplaceFileW(
@@ -601,6 +611,10 @@ fn replace_temp_file(temp_path: &Path, path: &Path) -> io::Result<()> {
     let to = wide(path);
     let ok = if path.exists() {
         unsafe {
+            // SAFETY: `to` and `from` are NUL-terminated wide paths
+            // from `wide()` that outlive the call; the null
+            // backup/exclude/reserved pointers are allowed by the
+            // Win32 contract.
             ReplaceFileW(
                 to.as_ptr(),
                 from.as_ptr(),
@@ -612,6 +626,9 @@ fn replace_temp_file(temp_path: &Path, path: &Path) -> io::Result<()> {
         }
     } else {
         unsafe {
+            // SAFETY: `from` and `to` are NUL-terminated wide paths
+            // from `wide()` that outlive the call; the flags are plain
+            // integers.
             MoveFileExW(
                 from.as_ptr(),
                 to.as_ptr(),

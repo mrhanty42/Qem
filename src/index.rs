@@ -727,6 +727,9 @@ fn windows_allocated_ranges(
     const ERROR_MORE_DATA: i32 = 234;
     const FSCTL_QUERY_ALLOCATED_RANGES: u32 = 0x0009_40CF;
 
+    // SAFETY: declaration matches the Win32 `DeviceIoControl`
+    // signature; the call is synchronous and retains none of the
+    // passed pointers beyond the call.
     unsafe extern "system" {
         fn DeviceIoControl(
             device: *mut c_void,
@@ -753,6 +756,11 @@ fn windows_allocated_ranges(
         let mut output = vec![FileAllocatedRangeBuffer::default(); capacity];
         let mut returned = 0u32;
         let ok = unsafe {
+            // SAFETY: `handle` is the raw handle of the read-only
+            // `file` opened above, kept alive in this scope; the
+            // in/out buffers are valid for their declared sizes; the
+            // null overlapped pointer is the documented synchronous
+            // form for a non-overlapped handle.
             DeviceIoControl(
                 handle,
                 FSCTL_QUERY_ALLOCATED_RANGES,
