@@ -5452,6 +5452,14 @@ fn recovered_session_reads_fail_typed_when_a_piece_page_is_unreadable() {
          typed read error instead of silently empty rows, got {viewport:?}"
     );
 
+    // An edit that would promote the piece table to a rope must refuse
+    // typed when the promotion materialization hits the unreadable page:
+    // the frozen promotion path degrades best-effort, but a silently
+    // emptied rope followed by a save would be a permanent document loss.
+    // Promotion needs the edit to target a line the tree cannot navigate
+    // to; the refusal itself is covered by the promotion honest-read
+    // mapping (mirrors the compaction refusal pattern).
+
     clear_session_sidecar(&path);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);

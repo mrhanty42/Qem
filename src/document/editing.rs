@@ -378,7 +378,21 @@ impl Document {
                 "document is too large to widen partial piece-table editing beyond the indexed prefix",
             ));
         }
-        let bytes = piece_table.read_range(0, piece_table.total_len());
+        // Honest materialization: promotion replaces the piece table with a
+        // rope, so a silently shortened read would shrink the document
+        // permanently (empty rope on an unreadable piece page). An
+        // unreadable piece page refuses the promotion and keeps the live
+        // piece table untouched; the read failure surfaces through every
+        // honest document read afterwards.
+        let bytes = piece_table
+            .read_range_result(0, piece_table.total_len())
+            .map_err(|source| DocumentError::Write {
+                path: session_sidecar_path(
+                    self.path.as_deref(),
+                    self.path.as_deref().unwrap_or(std::path::Path::new("")),
+                ),
+                source,
+            })?;
         let (rope, had_errors) = if self.encoding.is_utf8() {
             build_rope_from_bytes(&bytes)
         } else {

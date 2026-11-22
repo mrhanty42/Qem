@@ -548,7 +548,7 @@ impl Document {
             // Advisory preflight only: this validation feeds
             // `save_error_for_options` / `can_save_with_options`, which
             // cannot express a read failure. On an unreadable piece page it
-            // degrades to the readable prefix (a wrong-but-harmless
+            // degrades best-effort (an unreadable page yields an empty materialization) (a wrong-but-harmless
             // recommendation) — the enforcing save path materializes
             // through the honest `rendered_text_for_save` and fails typed
             // instead.

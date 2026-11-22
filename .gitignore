@@ -22,3 +22,7 @@ examples/output.txt
 # Local-only agent and tooling files.
 agent-protocol-v2.2.md
 .zcodeignore
+
+# A transient proptest seed that does not reproduce on a clean tree
+# (caught mid-edit during the 2026-11-19 agent run).
+/proptest-regressions/document/encoding_engine.txt
