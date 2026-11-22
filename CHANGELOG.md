@@ -37,6 +37,14 @@
 - The piece-table-to-rope promotion fails typed when its
   materialization hits an unreadable piece page (a silently emptied
   rope followed by a save was a permanent document loss).
+- The exact line count no longer reports a short total as exact on the
+  mmap open path. The background scanner stamps `indexed_bytes` to the
+  full file length before the pusher thread applies its last line
+  offsets, so in that window `wait_for_exact_line_count` could return a
+  total one line short of the real one (a race CI caught on a 16 MiB
+  fixture whose last line lacks a trailing break). The bounded-count
+  publication now waits for the indexing barrier, which is the pusher
+  clearing the flag only after every offsets chunk is applied.
 
 ## 1.0.1 (2026-11-19)
 

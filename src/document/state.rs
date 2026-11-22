@@ -321,12 +321,21 @@ impl Document {
         if let Some(total_lines) = self.disk_index_total_lines() {
             return Some(total_lines.max(1));
         }
-        if self.is_fully_indexed() {
+        if self.is_fully_indexed() && !self.is_indexing() {
             // `indexed_bytes` is stamped to the full file length once a piece
             // table owns line bookkeeping, but a partial piece table only
             // carries boundaries for its bounded window. Reporting the window
             // count as the exact document total silently capped scroll ranges
             // at the window size (4096 lines on a 352-million-line file).
+            //
+            // The scanner thread stamps `indexed_bytes` to the full length
+            // before the pusher thread has drained the last offsets chunk
+            // from the channel (the pusher clears `indexing` only after it
+            // applied every chunk), so publishing the bounded count while
+            // indexing is still on would report a short line total as exact.
+            // The `!self.is_indexing()` gate waits for that barrier; every
+            // constructor that stamps `indexed_bytes` without a scanner
+            // thread starts with `indexing` already false.
             let window_covers_document = self
                 .piece_table
                 .as_ref()
