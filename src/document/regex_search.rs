@@ -1876,24 +1876,74 @@ fn class_b_requires_even_alignment(encoding: DocumentEncoding) -> bool {
     matches!(encoding.name(), "UTF-16LE" | "UTF-16BE")
 }
 
+/// Per-pointer mappedness of Shift_JIS lead + valid-shape ASCII trail pairs
+/// (`trail 0x40..=0x7E`), indexed by the JIS0208 pointer
+/// `lead_minus_offset * 188 + (trail - 0x40)` (60 lead rows x 63 trail
+/// columns = 11280 pointers).
+///
+/// Consulted through the `encoding_rs` decoder itself on first use: a
+/// pointer is mapped iff decoding its two-byte pair reports one
+/// non-replacement UTF-16 unit; an unmapped pointer is `Malformed(1)` with
+/// the trail byte reprocessed from the initial state. The table is derived
+/// at runtime instead of hard-coded so it can never drift from the decoder
+/// this module mirrors, and it is only built once per process.
+fn sjis_low_trail_mapped_table(encoding: &'static encoding_rs::Encoding) -> &'static [bool; 11280] {
+    static TABLE: OnceLock<[bool; 11280]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [false; 11280];
+        for offset in 0..60usize {
+            let lead = if offset <= 0x1E {
+                0x81 + offset as u8
+            } else {
+                0xC1 + offset as u8
+            };
+            for trail_minus_offset in 0..63usize {
+                let trail = 0x40 + trail_minus_offset as u8;
+                let mut decoder = encoding.new_decoder();
+                let mut units = [0u16; 2];
+                let (_, _, written, _) = decoder.decode_to_utf16(&[lead, trail], &mut units, true);
+                // Mapped: one non-replacement unit. Unmapped: Malformed(1)
+                // with the trail unread — the replacement for the lead plus
+                // the reprocessed ASCII trail byte (two units, first
+                // U+FFFD). No Shift_JIS pair maps to U+FFFD itself, so the
+                // two outcomes cannot be confused.
+                table[offset * 188 + trail_minus_offset] = !(written == 2 && units[0] == 0xFFFD);
+            }
+        }
+        table
+    })
+}
+
 /// Returns the number of source bytes the `encoding_rs` decoder consumes
 /// for the next character cell of a CJK multibyte encoding, starting from
 /// `offset` with the decoder in its initial state.
 ///
-/// This is the decoder's OWN per-cell consumption, ported cell rule by cell
-/// rule from `encoding_rs`'s generated decoders (`shift_jis.rs`, `gb18030.rs`,
-/// `euc_kr.rs`). It deliberately disagrees with the plain leading-byte
-/// detector ([`super::encoding_engine::EncodingEngine::step`]) in exactly the
-/// cases where the detector's byte grid drifts off the decoder's grid:
+/// This is the decoder's OWN per-cell consumption, mirroring `encoding_rs`'s
+/// generated decoders (`shift_jis.rs`, `gb18030.rs`, `euc_kr.rs`) rule by
+/// rule. It deliberately disagrees with the plain leading-byte detector
+/// ([`super::encoding_engine::EncodingEngine::step`]) in exactly the cases
+/// where the detector's byte grid drifts off the decoder's grid:
 ///
 /// * Shift_JIS / GB18030 / EUC-KR lead + invalid trail below `0x80`: the
 ///   decoder emits `U+FFFD` for the lead alone and REPROCESSES the trail
 ///   byte from the initial state, so the lead is a one-byte cell where the
 ///   detector answered two.
+/// * Shift_JIS lead + valid-shape ASCII trail (`0x40..=0x7E`) whose JIS0208
+///   pointer is unmapped: same decomposition — `Malformed(1)` with the
+///   trail unread — where the detector answers two. Mapped pointers
+///   ([`sjis_low_trail_mapped_table`]) consume the pair.
+/// * EUC-KR lead (>= `0xA1`) + extension-left letter trail
+///   (`0x41..=0x5A` / `0x61..=0x7A`) whose CP949 left pointer falls outside
+///   the hangul extension: `Malformed(1)` with the letter unread, where the
+///   detector answers two.
 /// * GB18030 rejected four-byte sequence: the detector answers four for
 ///   every lead + digit pair, while the decoder decomposes the rejection
 ///   into a one-byte replacement for the lead plus reprocessed bytes — a
 ///   lead-or-ASCII fourth byte shifts every later cell boundary by one.
+///   When a truncated four-byte head is rejected at its third byte, the
+///   decoder consumes only the lead for the replacement cell and
+///   re-emits the digit from its pending state, so the lead is again a
+///   one-byte cell.
 ///
 /// A window edge cut on a detector boundary that is mid-cell on the
 /// decoder's grid made the next window open on a trail byte that spliced
@@ -1928,13 +1978,25 @@ fn class_b_decoder_cell_len(
                     return 1;
                 }
                 let t = bytes[offset + 1];
-                if is_pair_trail(t, 0x40, 0x7E) || is_pair_trail(t, 0x80, 0xFC) {
-                    // Valid trail shape: the pair is consumed as one cell
-                    // whether the index lookup maps or reports Malformed(2).
+                if is_pair_trail(t, 0x40, 0x7E) {
+                    // Valid-shape ASCII trail: the pair maps iff its JIS0208
+                    // pointer falls in a mapped region; an unmapped pointer
+                    // is Malformed(1) with the trail byte reprocessed from
+                    // the initial state, so the lead is a one-byte cell.
+                    let lead_minus_offset = if b <= 0x9F { b - 0x81 } else { b - 0xC1 } as usize;
+                    let pointer = lead_minus_offset * 188 + (t - 0x40) as usize;
+                    if sjis_low_trail_mapped_table(encoding.as_encoding())[pointer] {
+                        2
+                    } else {
+                        1
+                    }
+                } else if is_pair_trail(t, 0x80, 0xFC) {
+                    // Trail 0x80..=0xFC: consumed with the lead whether the
+                    // pointer maps or reports Malformed(2).
                     2
                 } else if t < 0x80 {
-                    // Invalid trail below 0x80: Malformed(1) for the lead and
-                    // the trail byte is reprocessed from the initial state.
+                    // Non-shape trail below 0x80 (0x00..=0x3F, 0x7F):
+                    // Malformed(1) for the lead, trail reprocessed.
                     1
                 } else {
                     // t in 0xFD..=0xFF: Malformed(2) consumes the pair.
@@ -1951,14 +2013,37 @@ fn class_b_decoder_cell_len(
                     return 1;
                 }
                 let t = bytes[offset + 1];
-                if is_pair_trail(t, 0x41, 0x5A)
-                    || is_pair_trail(t, 0x61, 0x7A)
-                    || is_pair_trail(t, 0x81, 0xFE)
-                {
-                    2
-                } else if t < 0x80 {
-                    1
+                if t < 0x80 {
+                    if is_pair_trail(t, 0x41, 0x5A) || is_pair_trail(t, 0x61, 0x7A) {
+                        // Extension-left letter trail: mapped iff the CP949
+                        // left pointer sits inside the hangul extension,
+                        // i.e. (lead - 0xA1) * 84 + left_trail < 3126; an
+                        // out-of-range pointer is Malformed(1) with the
+                        // letter reprocessed from the initial state. Leads
+                        // below 0xA1 take the extension-above path, whose
+                        // decoder maps every valid-shape trail.
+                        if b >= 0xA1 {
+                            let left_lead = (b - 0xA1) as usize;
+                            let left_trail = if t <= 0x5A {
+                                (t - 0x41) as usize
+                            } else {
+                                (t - 0x47) as usize
+                            };
+                            if left_lead * 84 + left_trail >= 3126 {
+                                return 1;
+                            }
+                        }
+                        2
+                    } else {
+                        // Non-shape trail below 0x80 (0x00..=0x40,
+                        // 0x5B..=0x60, 0x7B..=0x7F): Malformed(1) for the
+                        // lead, trail reprocessed.
+                        1
+                    }
                 } else {
+                    // Trail 0x80..=0xFF (KS X 1001, extension high halves,
+                    // 0xFF): consumed with the lead whether the pointer
+                    // maps or reports Malformed(2).
                     2
                 }
             }
@@ -1974,12 +2059,28 @@ fn class_b_decoder_cell_len(
                 if is_pair_trail(t, 0x40, 0x7E) || is_pair_trail(t, 0x80, 0xFE) {
                     2
                 } else if (0x30..=0x39).contains(&t) {
-                    if remaining < 4 {
-                        // Truncated four-byte head at the slice end: the
-                        // decoder consumes everything it has (Malformed(pending)).
-                        return remaining;
+                    if remaining == 2 {
+                        // Truncated lead + digit at the slice end: the end
+                        // flush consumes both bytes (Malformed(2)).
+                        return 2;
                     }
                     let third = bytes[offset + 2];
+                    if remaining == 3 {
+                        if (0x81..=0xFE).contains(&third) {
+                            // The third byte enters the pending state; the
+                            // end flush consumes all three bytes as one
+                            // replacement cell.
+                            return 3;
+                        }
+                        // Rejected at the third byte (Malformed(1,1), the
+                        // third byte is unread): the lead is one U+FFFD
+                        // cell, the digit is re-emitted from the pending
+                        // state, and the reprocessed third byte re-derives
+                        // from the initial state — fresh decodes from the
+                        // digit byte onward reproduce the same character
+                        // stream, so the walk continues after the lead.
+                        return 1;
+                    }
                     let fourth = bytes[offset + 3];
                     if (0x81..=0xFE).contains(&third) {
                         if (0x30..=0x39).contains(&fourth) {
@@ -2018,6 +2119,48 @@ fn class_b_decoder_cell_len(
     }
 }
 
+/// Returns the source-byte width the Class B lockstep mapping advances for
+/// decoded character `c` at source position `src` of `window`.
+///
+/// UTF-16: every scalar contributes `c.len_utf16() * 2` source bytes —
+/// including `U+FFFD`, whose malformed surrogate cell consumes two bytes.
+///
+/// CJK multibyte: the re-encode width through `encoding_rs::Encoding::encode`
+/// is used only when it AGREES with the decoder's own per-cell consumption
+/// ([`class_b_decoder_cell_len`]) at the current source position. The two
+/// disagree exactly where re-encoding is not the inverse of the decode:
+/// gb18030 byte `0x80` decodes to U+20AC but re-encodes to a two-byte
+/// canonical form, and `U+FFFD` re-encodes to a numeric character reference
+/// (`&#65533;`, eight bytes in Shift_JIS / EUC-KR). In those cases the
+/// decoder's own consumption is taken, so a fresh decode from
+/// `src + width` reproduces the remaining character stream by construction
+/// and every walked position stays on the decoder's cell grid.
+fn class_b_char_source_width(
+    encoding: DocumentEncoding,
+    window: &[u8],
+    src: usize,
+    c: char,
+) -> usize {
+    if matches!(encoding.name(), "UTF-16LE" | "UTF-16BE") {
+        return c.len_utf16().saturating_mul(2);
+    }
+    let decoder_width = class_b_decoder_cell_len(encoding, window, src, window.len());
+    if c == '\u{FFFD}' {
+        return decoder_width;
+    }
+    let mut buf = [0u8; 4];
+    let reencoded = encoding
+        .as_encoding()
+        .encode(c.encode_utf8(&mut buf))
+        .0
+        .len();
+    if reencoded == decoder_width {
+        reencoded
+    } else {
+        decoder_width
+    }
+}
+
 /// Maps a decoded-text span of a Class B window back to source-byte offsets
 /// by walking the decoded characters and the source window in lockstep.
 ///
@@ -2029,18 +2172,11 @@ fn class_b_decoder_cell_len(
 /// walk starts at the window's known boundary (source byte 0 of the window,
 /// a decoder-true cell edge by the geometry walk) and advances one cell per
 /// decoded character, so a candidate's offsets are by construction reachable
-/// by whole cells from a known boundary. Widths are encoding-dispatched:
-///
-/// * UTF-16: every scalar contributes `c.len_utf16() * 2` source bytes —
-///   including `U+FFFD`, whose malformed surrogate cell also consumes two
-///   bytes.
-/// * CJK multibyte: a clean character re-encodes to its exact source width;
-///   a `U+FFFD` replacement character takes the decoder's OWN per-cell
-///   consumption ([`class_b_decoder_cell_len`]) at the current source
-///   position. Re-encoding a replacement instead would answer a numeric
-///   character reference (`&#65533;`, eight bytes in Shift_JIS / EUC-KR)
-///   for a one- or two-byte cell and drift every later offset in the
-///   window.
+/// by whole cells from a known boundary. Widths come from
+/// [`class_b_char_source_width`]: the re-encode width is used only when it
+/// agrees with the decoder's own per-cell consumption; otherwise the
+/// decoder's consumption is taken, so every walked position stays on the
+/// decoder's cell grid.
 ///
 /// Returns `None` when the span is not on UTF-8 character boundaries, the
 /// walk cannot reach `end_decoded`, or a cell would overrun the window —
@@ -2059,7 +2195,6 @@ fn class_b_lockstep_source_span(
     {
         return None;
     }
-    let is_utf16 = matches!(encoding.name(), "UTF-16LE" | "UTF-16BE");
     let mut src = 0usize;
     let mut dec = 0usize;
     let mut start_src: Option<usize> = None;
@@ -2070,18 +2205,7 @@ fn class_b_lockstep_source_span(
         if dec == end_decoded {
             break;
         }
-        let width = if is_utf16 {
-            c.len_utf16().saturating_mul(2)
-        } else if c == '\u{FFFD}' {
-            class_b_decoder_cell_len(encoding, window, src, window.len())
-        } else {
-            let mut buf = [0u8; 4];
-            encoding
-                .as_encoding()
-                .encode(c.encode_utf8(&mut buf))
-                .0
-                .len()
-        };
+        let width = class_b_char_source_width(encoding, window, src, c);
         if width == 0 || src.saturating_add(width) > window.len() {
             // The decoded text and the source window disagree on cell
             // widths; treat the candidate as unmappable rather than
@@ -2136,19 +2260,20 @@ struct ClassBRegexWindowCache {
 /// regex window to `target_decoded` and returns the absolute source-byte
 /// offset.
 ///
-/// Mirrors the scan's lockstep mapping on the clean-character axis
-/// (UTF-16: `len_utf16() * 2` per scalar; CJK multibyte: per-character
-/// re-encode through encoding_rs) but walks forward one character at a
-/// time from the cursor instead of re-encoding the whole prefix, so
-/// mapping every match in a window costs O(characters between matches)
-/// instead of O(window prefix). Replacement characters still re-encode
-/// through the numeric-character-reference width here — the documented
-/// amortized-cursor residual in ROADMAP; a drifted cursor trips the
-/// `end_rel > window.len()` guard below and falls back to a fresh scan.
+/// Walks forward one character at a time from the cursor with the SAME
+/// per-character widths as the scan's lockstep mapping
+/// ([`class_b_char_source_width`]: re-encode widths cross-checked against
+/// the decoder's own consumption, decoder cell lengths around `U+FFFD`
+/// cells), so mapping every match in a window costs O(characters between
+/// matches) instead of O(window prefix) while the cursor positions stay
+/// exactly on the scan's cell grid. The `end_rel > window.len()` guard in
+/// the caller remains as a pure safety net; it is no longer expected to
+/// fire.
 ///
 /// Returns `None` when `target_decoded` is behind the cursor (monotone
-/// contract violation), past the decoded text, or not on a char boundary;
-/// the caller then discards the cache and falls back to a fresh scan.
+/// contract violation), past the decoded text, not on a char boundary, or
+/// when a cell would overrun the cached window; the caller then discards
+/// the cache and falls back to a fresh scan.
 fn advance_class_b_window_cursor(
     cache: &mut ClassBRegexWindowCache,
     target_decoded: usize,
@@ -2159,17 +2284,15 @@ fn advance_class_b_window_cursor(
     {
         return None;
     }
-    let is_utf16 = matches!(cache.encoding.name(), "UTF-16LE" | "UTF-16BE");
-    let encoding = cache.encoding.as_encoding();
-    let mut buf = [0u8; 4];
     while cache.decoded_cursor < target_decoded {
         let c = cache.decoded[cache.decoded_cursor..].chars().next()?;
-        let width = if is_utf16 {
-            c.len_utf16().saturating_mul(2)
-        } else {
-            let s = c.encode_utf8(&mut buf);
-            encoding.encode(s).0.len()
-        };
+        let width =
+            class_b_char_source_width(cache.encoding, &cache.window, cache.source_cursor, c);
+        if width == 0 || cache.source_cursor.saturating_add(width) > cache.window.len() {
+            // The decoded text and the cached source bytes disagree on cell
+            // widths; the caller discards the cache and re-scans.
+            return None;
+        }
         cache.decoded_cursor += c.len_utf8();
         cache.source_cursor = cache.source_cursor.saturating_add(width);
     }
@@ -2371,6 +2494,17 @@ fn scan_class_b_regex_candidates(
     // through `search_byte_offset_for_position`, and every later window
     // head is walked to a whole cell below, so no head ever opens
     // mid-sequence on well-formed input.
+    //
+    // Known limit (see ROADMAP "Known limitations"): the ORIGIN byte comes
+    // from the engine's leading-byte grid (the document position model),
+    // and on ill-formed CJK input that grid can sit mid-cell on the
+    // decoder's grid — e.g. a search origin inside a gb18030 region the
+    // decoder decomposes differently from the detector. The phase chain
+    // below is absolute from whatever boundary `chunk_start` carries in;
+    // an origin that is not a decoder cell boundary re-phases the windows
+    // it starts, the same way the pre-fix edges did. Later windows slide
+    // back onto decoder-true heads, so only matches near the origin are
+    // affected.
     let mut chunk_start = if requires_even_alignment {
         start_offset.saturating_add(start_offset & 1)
     } else {
@@ -2499,7 +2633,12 @@ fn scan_class_b_regex_candidates(
                 .unwrap_or(0)
                 .saturating_sub(chunk_start)
                 .min(window.len());
-            decoded_prefix_for_source_byte_count(doc_encoding, &decoded, overlap_source_bytes)
+            decoded_prefix_for_source_byte_count(
+                doc_encoding,
+                &window,
+                &decoded,
+                overlap_source_bytes,
+            )
         };
 
         // Forward mode takes the first valid candidate of the window;
@@ -2678,48 +2817,30 @@ fn map_and_keep_class_b_candidate(
 ///
 /// Used to translate the source-byte overlap region into the decoded-byte
 /// space so we can reject continuation-chunk matches that lie entirely
-/// inside it. Encoding-dispatched on the same width axis as the scan's
-/// lockstep mapping:
-///
-/// * UTF-16: every Unicode scalar contributes `c.len_utf16() * 2`
-///   source bytes; we walk the chars and keep the largest prefix that
-///   still fits inside `source_bytes`.
-///
-/// * CJK multibyte (Shift_JIS, GB18030, EUC-KR): each character's
-///   source-byte cost is `encoding.encode(c)`; we accumulate per
-///   character until the next step would exceed `source_bytes`.
+/// inside it. Per-character widths come from
+/// [`class_b_char_source_width`] — the same axis as the scan's lockstep
+/// mapping (UTF-16: `len_utf16() * 2` per scalar; CJK multibyte:
+/// re-encode widths cross-checked against the decoder's own consumption,
+/// decoder cell lengths around `U+FFFD` cells) — so the threshold is exact
+/// with respect to the scan's cell walk. `window` is the source window the
+/// `decoded` text was produced from; the decoder-cell widths are evaluated
+/// against it at the accumulated source position.
 fn decoded_prefix_for_source_byte_count(
     encoding: DocumentEncoding,
+    window: &[u8],
     decoded: &str,
     source_bytes: usize,
 ) -> usize {
-    let is_utf16 = matches!(encoding.name(), "UTF-16LE" | "UTF-16BE");
     let mut acc_source = 0usize;
     let mut acc_decoded = 0usize;
-    if is_utf16 {
-        for c in decoded.chars() {
-            let next_source = acc_source.saturating_add(c.len_utf16().saturating_mul(2));
-            if next_source > source_bytes {
-                break;
-            }
-            acc_source = next_source;
-            acc_decoded = acc_decoded.saturating_add(c.len_utf8());
+    for c in decoded.chars() {
+        let width = class_b_char_source_width(encoding, window, acc_source, c);
+        let next_source = acc_source.saturating_add(width);
+        if width == 0 || next_source > source_bytes {
+            break;
         }
-    } else {
-        // CJK multibyte: per-character re-encode. We keep a single
-        // small buffer to bound allocations. `encoding_rs::Encoding::encode`
-        // accepts `&str`, so we re-encode each char individually.
-        let mut buf = [0u8; 4];
-        for c in decoded.chars() {
-            let s = c.encode_utf8(&mut buf);
-            let encoded = encoding.as_encoding().encode(s).0;
-            let next_source = acc_source.saturating_add(encoded.len());
-            if next_source > source_bytes {
-                break;
-            }
-            acc_source = next_source;
-            acc_decoded = acc_decoded.saturating_add(c.len_utf8());
-        }
+        acc_source = next_source;
+        acc_decoded = acc_decoded.saturating_add(c.len_utf8());
     }
     acc_decoded
 }
