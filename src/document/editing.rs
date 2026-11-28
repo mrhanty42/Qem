@@ -359,7 +359,7 @@ impl Document {
             self.decoding_had_errors = true;
             self.invalidate_cached_content_values();
         }
-        self.rope = Some(rope);
+        self.rope = Some(Arc::new(rope));
         Ok(())
     }
 
@@ -407,7 +407,7 @@ impl Document {
             self.decoding_had_errors = true;
             self.invalidate_cached_content_values();
         }
-        self.rope = Some(rope);
+        self.rope = Some(Arc::new(rope));
         Ok(())
     }
 
@@ -421,7 +421,7 @@ impl Document {
                 reason: "internal error: rope buffer is unavailable after materialization",
             });
         };
-        Ok(rope)
+        Ok(Arc::make_mut(rope))
     }
 
     pub(super) fn rope_line_len_chars_without_newline(rope: &EditBuffer, line0: usize) -> usize {

@@ -73,7 +73,7 @@ enum SaveSnapshot {
     Bytes(Vec<u8>),
     Mmap(FileStorage),
     Rope {
-        rope: EditBuffer,
+        rope: Arc<EditBuffer>,
         line_ending: LineEnding,
     },
     PieceTable(PieceTableSnapshot),
@@ -612,6 +612,7 @@ impl Document {
         let Some(rope) = self.rope.as_mut() else {
             return Ok(UndoResult::noop());
         };
+        let rope = Arc::make_mut(rope);
         let Some(cursor_char) = self.rope_history.undo(rope) else {
             return Ok(UndoResult::noop());
         };
@@ -645,6 +646,7 @@ impl Document {
         let Some(rope) = self.rope.as_mut() else {
             return Ok(UndoResult::noop());
         };
+        let rope = Arc::make_mut(rope);
         let Some(cursor_char) = self.rope_history.redo(rope) else {
             return Ok(UndoResult::noop());
         };

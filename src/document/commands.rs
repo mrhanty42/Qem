@@ -468,6 +468,7 @@ impl Document {
         let Some(rope) = self.rope.as_mut() else {
             return Err(self.missing_rope_error());
         };
+        let rope = Arc::make_mut(rope);
         let actual_col0 = Self::rope_line_len_chars_without_newline(rope, line0);
         let start_col0 = col0.min(actual_col0);
         let start = Self::line_col_to_char_index(rope, line0, start_col0);
@@ -522,6 +523,7 @@ impl Document {
             let Some(rope) = self.rope.as_mut() else {
                 return Err(self.missing_rope_error());
             };
+            let rope = Arc::make_mut(rope);
             let actual_col0 = Self::rope_line_len_chars_without_newline(rope, line0);
             let start_col0 = col0.min(actual_col0);
             let start = Self::line_col_to_char_index(rope, line0, start_col0);
@@ -848,6 +850,7 @@ impl Document {
             let Some(rope) = self.rope.as_mut() else {
                 return Err(self.missing_rope_error());
             };
+            let rope = Arc::make_mut(rope);
             if rope.len_chars() == 0 {
                 return Ok((false, line0, col0));
             }
@@ -1069,6 +1072,7 @@ impl Document {
         let Some(rope) = self.rope.as_mut() else {
             return Err(self.missing_rope_error());
         };
+        let rope = Arc::make_mut(rope);
         if rope.len_chars() == 0 {
             return Ok((false, line0, col0));
         }
@@ -1199,6 +1203,7 @@ impl Document {
         let Some(rope) = self.rope.as_mut() else {
             return Err(self.missing_rope_error());
         };
+        let rope = Arc::make_mut(rope);
         let actual_col0 = Self::rope_line_len_chars_without_newline(rope, line0);
         let start_col0 = col0.min(actual_col0);
         let start = Self::line_col_to_char_index(rope, line0, start_col0);

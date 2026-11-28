@@ -29,7 +29,11 @@ recorded numbers live in [`BENCHMARKS.md`](BENCHMARKS.md).
   microbenchmarks.
 - Sidecars and internal storage layout are implementation details unless
   they are explicitly promoted into the public contract.
-- Every release ships with the regression tests it needs. "Truth after
+- Every release ships with the regression tests it needs.
+- The undo history is unbounded by product decision: no caps, sliding
+  windows, or entry limits ever change how many edits a session keeps.
+  Where growth becomes a cost, the fix is compaction of the storage
+  format - never trimming the history. "Truth after
   error" coverage (failed saves, failed opens, discarded stale workers,
   deferred closes, mutations through busy handles) is added incrementally
   as each surface stabilizes, not bundled into one later release.
@@ -109,13 +113,7 @@ fix was verified by temporarily reverting it and watching that test fail.
 
 ## Post-1.0 work
 
-- **Bounded session history.** The piece-tree edit history and its sidecar
-  rewrite are unbounded: every flush re-serializes all history entries and
-  appends fresh history pages, so long editing sessions on huge files pay
-  quadratic sidecar writes and monotonically growing flush latency until
-  the next save and reopen. A cap or sliding window changes the
-  user-visible undo depth, so it needs an explicit product decision before
-  implementation.
+
 - **Share the edit buffer through `Arc` in snapshot `save_async`** instead
   of cloning it on the caller thread (the snapshot backing itself now
   clones copy-on-write on supported filesystems).

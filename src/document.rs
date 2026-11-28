@@ -469,7 +469,7 @@ pub struct Document {
     rope_file_len_cache: Cell<Option<usize>>,
 
     // Mutable text storage. When present, it becomes the source of truth for rendering/editing.
-    rope: Option<EditBuffer>,
+    rope: Option<Arc<EditBuffer>>,
     piece_table: Option<PieceTable>,
     /// In-memory undo/redo history for the rope edit buffer. The piece-tree
     /// buffer keeps its own snapshot history; this field only covers edits
