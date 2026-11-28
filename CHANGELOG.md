@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 1.1.1 (2026-11-28)
+
+### Added
+
+- A short `regression` benchmark runs on every CI push (open + first
+  viewport, first edit + save, literal and regex search on a 20k-line
+  fixture); the numbers land in the job log and a criterion-results
+  artifact for comparison against the recorded baselines. Threshold
+  gating stays out of CI on purpose: shared-runner timing noise would
+  flake.
 
 ### Fixed
 

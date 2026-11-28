@@ -15,6 +15,7 @@ recorded numbers live in [`BENCHMARKS.md`](BENCHMARKS.md).
 | 1.0.0 | shipped 2026-11-19 | cell-exact line model for multi-byte encodings, hardening of the persistence and search paths, public API freeze |
 | 1.0.1 | shipped 2026-11-19 | documentation corrections for the release page |
 | 1.1.0 | shipped 2026-11-22 | additive typed reads on the frozen surface, CJK regex character-phase tracking, decoder-cell port corrections, internal module splits |
+| 1.1.1 | shipped 2026-11-28 | performance fixes: append-only edit log, balanced page splits, checksummed line index, clone-on-write snapshots, CI regression bench |
 
 ## Planning rules
 
@@ -160,6 +161,31 @@ fix was verified by temporarily reverting it and watching that test fail.
   ready to be compared against the recorded baselines in
   `benches/baselines/`. Threshold gating stays out of CI on purpose:
   shared-runner timing noise would flake.
+- **The edit-log sidecar is an append-only log (format v4).** The v3
+  sidecar rewrote the whole history vector and the whole add buffer on
+  every flush and kept every dead page, so a session of 10,000 small edits
+  inflated the sidecar to 6.6 GB and refused further edits once the disk
+  filled. Each history entry now carries its parent link, history-vector
+  position, and epoch; recovery walks the parents and rebuilds the redo
+  tail from the committed epoch; two small index pages are rewritten on
+  each commit while data pages never are. Legacy v3 sidecars recover and
+  convert to the v4 layout at reopen with the recovered state committed
+  immediately. A degenerate piece-tree page split (a full page plus a
+  1-item tail on every overflow) grew a "ladder" tree whose page path
+  every edit rewrote; page splits now divide evenly, keeping the tree
+  shallow. Measured on a 2 MiB fixture with 20,000 inserts: 5.9 s total
+  with a 203 MB sidecar (previously the run refused further edits at
+  ~13,900 edits with a 6.6 GB sidecar).
+- **`.qem.lineidx` pages carry a CRC32 (sidecar format version 4).** A
+  flipped byte inside a checkpoint value now fails typed and the stale
+  sidecar rebuilds instead of parsing into silently wrong line starts.
+  Sidecars written by older builds are rejected as stale and rebuilt
+  automatically.
+- **Snapshot backing clones copy-on-write on macOS and Linux.** APFS
+  (fclonefileat) and reflink-capable Linux filesystems (FICLONE) hand
+  back an instant snapshot; filesystems without cloning fall back to the
+  full-copy path unchanged, and a 50 GB file opens in seconds instead of
+  minutes on supported filesystems.
 - **Recoverable paths carry no `unwrap`/`expect`.** A full sweep of the
   non-test code found no recoverable `unwrap`/`expect` calls: the remaining
   ones are either test fixtures or static invariants whose inputs are
