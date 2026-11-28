@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Long editing sessions no longer grind to a halt. Two defects compounded:
+  (1) the `.qem.editlog` sidecar rewrote the whole history vector and the
+  whole add buffer on every flush and kept every dead page, so a session of
+  10,000 small edits inflated the sidecar to 6.6 GB and refused further
+  edits once the disk filled; (2) the piece-tree page split emitted a full
+  page plus a 1-item tail on every overflow, so repeated inserts at one end
+  grew a degenerate "ladder" tree whose page path every edit had to rewrite.
+  The sidecar is now an append-only log (format v4): each history entry
+  carries its parent link, vector position, and epoch; recovery walks the
+  parents and rebuilds the redo tail from the committed epoch; the two small
+  index pages are rewritten on each commit while data pages never are.
+  Legacy v3 sidecars recover read-only and convert to the v4 layout at
+  reopen with the recovered state committed immediately (unsaved edits are
+  never lost). Page splits now divide evenly, keeping the tree shallow.
+  Measured on a 2 MiB fixture with 20,000 inserts: 5.9 s total with a
+  203 MB sidecar (previously the run refused further edits at ~13,900
+  edits with a 6.6 GB sidecar). Redo tails survive reopen; undo-branch
+  truncation still ends them.
+
 ## 1.1.0 (2026-11-22)
 
 ### Added

@@ -41,9 +41,13 @@ const MAX_INTERNAL_CHILDREN: usize = 64;
 // sidecars carry no label and are rejected by the version check; recovery
 // drops them and rebuilds from the source file.
 const EDITLOG_MAGIC: &[u8; 8] = b"QEMEDT1\0";
-const EDITLOG_VERSION: u32 = 3;
+const EDITLOG_VERSION: u32 = 4;
 const EDITLOG_PAGE_SIZE: usize = 4096;
-const EDITLOG_HEADER_BYTES: usize = 192;
+const EDITLOG_HEADER_BYTES: usize = 256;
+/// The v3 header was 192 bytes; legacy sidecars keep their pages behind that
+/// offset, so v3 recovery must read pages with the old header size while v4
+/// files use `EDITLOG_HEADER_BYTES`.
+const EDITLOG_V3_HEADER_BYTES: usize = 192;
 /// v3 header tail: NUL-padded `encoding_rs` label of the document encoding.
 pub(crate) const EDITLOG_ENCODING_LABEL_OFFSET: usize = 128;
 pub(crate) const EDITLOG_ENCODING_LABEL_BYTES: usize = 64;
@@ -65,6 +69,29 @@ pub(crate) const RESIDENT_PAGES_FAILED_PERSISTENCE_CAP: usize = 4096;
 const LEAF_ENTRY_BYTES: usize = 32;
 const INTERNAL_ENTRY_BYTES: usize = 24;
 const HISTORY_ENTRY_BYTES: usize = 32;
+/// v4 log entry: the 32-byte v3 root record (present + root ChildRef) plus
+/// `parent_flat`, `vector_index`, and `epoch`, so recovery rebuilds the
+/// history vector by walking parents and redo entries by the epoch filter
+/// instead of re-serializing the whole vector on every flush.
+const HISTORY_LOG_ENTRY_BYTES_V4: usize = 56;
+/// v4 pages carry an 8-byte chain link in the reserved page-header field
+/// (`[16..24]`): the id of the next page of the same chain, or 0 at the end.
+const PAGE_CHAIN_LINK_OFFSET: usize = 16;
+/// v4 header extension (offset 192..256). The v3 header layout is reused up
+/// to 128 (source identity, chain counters, flags, encoding), and the
+/// extension adds the fields the append-only log needs.
+const EDITLOG_V4_EXT_OFFSET: usize = 192;
+/// v4 ext [192..200]: the number of history-vector entries the committed
+/// state carries (the full vector length, including the redo tail).
+const EDITLOG_V4_EXT_VECTOR_LEN_OFFSET: usize = EDITLOG_V4_EXT_OFFSET;
+/// v4 ext [200..208]: the epoch of the committed state. History-vector
+/// truncation after undo bumps the epoch, so recovery can distinguish the
+/// live redo tail from dead entries of abandoned branches.
+const EDITLOG_V4_EXT_EPOCH_OFFSET: usize = EDITLOG_V4_EXT_OFFSET + 8;
+/// v4 ext [208..216]: page id of the committed history-log index page.
+const EDITLOG_V4_EXT_LOG_INDEX_OFFSET: usize = EDITLOG_V4_EXT_OFFSET + 16;
+/// v4 ext [216..224]: page id of the committed add-chain index page.
+const EDITLOG_V4_EXT_ADD_INDEX_OFFSET: usize = EDITLOG_V4_EXT_OFFSET + 24;
 const DEFAULT_FRAGMENTATION_SMALL_PIECE_BYTES: usize = 1024;
 const EDITLOG_FLAG_FULL_INDEX: u64 = 1;
 const EDITLOG_FLAG_HAS_ENCODING_ORIGIN: u64 = 1 << 1;
@@ -163,6 +190,15 @@ enum PageKind {
     Leaf = 2,
     History = 3,
     Add = 4,
+    /// v4: the append-only log of history entries (one page of a chain
+    /// enumerated by the log-index page).
+    HistoryLog = 5,
+    /// v4: one page of the add-buffer chain enumerated by the add-index page.
+    AddChain = 6,
+    /// v4: the enumeration of HistoryLog page ids, rewritten on every commit.
+    LogIndex = 7,
+    /// v4: the enumeration of AddChain page ids, rewritten on every commit.
+    AddIndex = 8,
 }
 
 #[derive(Debug)]
@@ -200,7 +236,7 @@ impl PieceTree {
 
     pub(crate) fn from_pieces_disk(source_path: &Path, pieces: Vec<Piece>) -> io::Result<Self> {
         let mut this = Self {
-            store: PageStore::Disk(DiskPageStore::create(source_path)?),
+            store: PageStore::Disk(Box::new(DiskPageStore::create(source_path)?)),
             root: None,
             history: Vec::new(),
             known_history: Vec::new(),
@@ -233,7 +269,7 @@ impl PieceTree {
             .root;
         let known_history = vec![(meta.known_byte_len, meta.full_index); history.len()];
         let tree = Self {
-            store: PageStore::Disk(store),
+            store: PageStore::Disk(Box::new(store)),
             root,
             history,
             known_history,
@@ -649,7 +685,7 @@ impl PieceTree {
         }
 
         let mut rebuilt = Self {
-            store: PageStore::Disk(DiskPageStore::create(source_path)?),
+            store: PageStore::Disk(Box::new(DiskPageStore::create(source_path)?)),
             root: None,
             history: Vec::with_capacity(remapped_history.len()),
             known_history: Vec::with_capacity(remapped_history.len()),

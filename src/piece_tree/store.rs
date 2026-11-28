@@ -2,20 +2,22 @@ use super::btree::{read_page_from_file, serialize_page, ChildRef, PiecePage};
 use super::editlog_path;
 use super::history::RootEntry;
 use super::session::{
-    add_page_capacity, bounded_page_count, decode_encoding_origin, encode_encoding_origin,
-    history_page_capacity, read_add_bytes, read_editlog_header, read_history_entries,
-    serialize_add_page, serialize_history_page, write_editlog_header, EditLogHeader, SessionMeta,
+    add_page_capacity_v4, bounded_page_count, decode_encoding_origin, encode_encoding_origin,
+    log_page_capacity_v4, read_add_bytes, read_add_bytes_v4, read_editlog_header,
+    read_editlog_header_v4, read_history_entries, read_index_chain_v4, read_log_entries_v4,
+    serialize_add_chain_page_v4, serialize_history_log_page_v4, serialize_index_page_v4,
+    write_editlog_header_v4, EditLogHeaderV4, HistoryLogEntryV4, SessionMeta,
 };
 use super::{
-    EDITLOG_CACHE_PAGES, EDITLOG_FLAG_DECODING_HAD_ERRORS, EDITLOG_FLAG_FULL_INDEX,
+    PageKind, EDITLOG_CACHE_PAGES, EDITLOG_FLAG_DECODING_HAD_ERRORS, EDITLOG_FLAG_FULL_INDEX,
     EDITLOG_FLAG_HAS_ENCODING_ORIGIN, EDITLOG_HEADER_BYTES, EDITLOG_PAGE_SIZE,
-    RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
+    EDITLOG_V3_HEADER_BYTES, RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
 };
 use crate::source_identity::{sampled_content_fingerprint, sampled_file_fingerprint};
 use crate::storage::FileStorage;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
@@ -35,6 +37,30 @@ pub(super) struct DiskPageStore {
     pub(super) resident_pages: HashMap<u64, Arc<PiecePage>>,
     next_page_id: u64,
     persistence_failed: bool,
+    /// v4: the history vector already committed to the append-only log,
+    /// paired with each entry's flat log id. The next flush diffs the live
+    /// vector against this snapshot and appends only the new entries.
+    flushed: Vec<(Option<ChildRef>, u64)>,
+    /// v4: the flat id the next appended log entry receives.
+    next_flat: u64,
+    /// v4: committed epoch; bumped whenever the flushed vector prefix
+    /// diverges (a new edit after undo), so recovery can tell the live redo
+    /// tail from dead entries of abandoned branches.
+    epoch: u64,
+    /// v4: page ids of the append-only history log, in chain order.
+    log_page_ids: Vec<u64>,
+    /// v4: page ids of the append-only add chain, in chain order.
+    add_page_ids: Vec<u64>,
+    /// v4: add-buffer bytes already committed to the chain; the next flush
+    /// appends only the tail past this length.
+    committed_add_len: usize,
+    /// The store reopened a legacy v3 sidecar: its pages sit behind the
+    /// 192-byte v3 header, so the first flush rewrites the file into the v4
+    /// layout before any append-only bookkeeping can start.
+    legacy: bool,
+    /// Byte offset the sidecar's pages start at (192 for an unconverted v3
+    /// sidecar, 256 for v4), used by every page read.
+    page_read_header_bytes: u64,
 }
 
 impl std::fmt::Debug for DiskPageStore {
@@ -52,6 +78,13 @@ impl std::fmt::Debug for DiskPageStore {
             )
             .field("resident_pages", &self.resident_pages.len())
             .field("persistence_failed", &self.persistence_failed)
+            .field("flushed_len", &self.flushed.len())
+            .field("next_flat", &self.next_flat)
+            .field("epoch", &self.epoch)
+            .field("log_pages", &self.log_page_ids.len())
+            .field("add_pages", &self.add_page_ids.len())
+            .field("committed_add_len", &self.committed_add_len)
+            .field("legacy", &self.legacy)
             .finish()
     }
 }
@@ -59,7 +92,7 @@ impl std::fmt::Debug for DiskPageStore {
 #[derive(Debug)]
 pub(super) enum PageStore {
     InMemory(InMemoryPageStore),
-    Disk(DiskPageStore),
+    Disk(Box<DiskPageStore>),
 }
 
 impl Default for PageStore {
@@ -179,7 +212,7 @@ impl DiskPageStore {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(parent)?;
         FileStorage::replace_with(&path, |file| {
-            write_editlog_header(file, EditLogHeader::default())?;
+            write_editlog_header_v4(file, EditLogHeaderV4::default())?;
             file.flush()?;
             file.sync_all()
         })?;
@@ -193,6 +226,14 @@ impl DiskPageStore {
             resident_pages: HashMap::new(),
             next_page_id: 0,
             persistence_failed: false,
+            flushed: Vec::new(),
+            next_flat: 1,
+            epoch: 0,
+            log_page_ids: Vec::new(),
+            add_page_ids: Vec::new(),
+            committed_add_len: 0,
+            legacy: false,
+            page_read_header_bytes: EDITLOG_HEADER_BYTES as u64,
         })
     }
 
@@ -203,6 +244,247 @@ impl DiskPageStore {
         }
 
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        match read_editlog_header_v4(&mut file)? {
+            Some(header) => Self::open_v4(path, file, header, source),
+            None => Self::open_v3_legacy(path, file, source),
+        }
+    }
+
+    /// v4 recovery: rebuilds the history vector by walking the append-only
+    /// log's parent links from the committed entry, then appends the redo
+    /// tail (entries of the committed epoch with a higher vector index).
+    fn open_v4(
+        path: PathBuf,
+        mut file: File,
+        header: EditLogHeaderV4,
+        source: SourceMetadata,
+    ) -> io::Result<OpenDiskSession> {
+        if header.source_len != source.len
+            || header.source_mtime_ns != source.mtime_ns
+            || header.source_fingerprint != source.fingerprint
+        {
+            return Ok(None);
+        }
+        let known_byte_len = usize::try_from(header.known_byte_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog known_byte_len exceeds the addressable size",
+            )
+        })?;
+        let meta = SessionMeta {
+            known_byte_len,
+            full_index: (header.flags & EDITLOG_FLAG_FULL_INDEX) != 0,
+            encoding: header.encoding,
+            encoding_origin: ((header.flags & EDITLOG_FLAG_HAS_ENCODING_ORIGIN) != 0)
+                .then(|| decode_encoding_origin(header.encoding_origin))
+                .flatten(),
+            decoding_had_errors: (header.flags & EDITLOG_FLAG_DECODING_HAD_ERRORS) != 0,
+        };
+
+        let file_len = file.metadata()?.len();
+        let page_count = usize::try_from(header.page_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog page_count exceeds the addressable size",
+            )
+        })?;
+        if page_count > bounded_page_count(Some(file_len), usize::MAX, EDITLOG_HEADER_BYTES as u64)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog page_count exceeds what the sidecar can physically hold",
+            ));
+        }
+
+        let max_chain_pages =
+            bounded_page_count(Some(file_len), usize::MAX, EDITLOG_HEADER_BYTES as u64);
+        let log_page_ids = read_index_chain_v4(
+            &mut file,
+            header.log_index_page_id,
+            PageKind::LogIndex,
+            max_chain_pages,
+        )?;
+        if log_page_ids.len() as u64 != header.log_page_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog log index does not enumerate the committed page count",
+            ));
+        }
+        let add_page_ids = read_index_chain_v4(
+            &mut file,
+            header.add_index_page_id,
+            PageKind::AddIndex,
+            max_chain_pages,
+        )?;
+        if add_page_ids.len() as u64 != header.add_page_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog add index does not enumerate the committed page count",
+            ));
+        }
+
+        let mut max_referenced_page_id = log_page_ids
+            .iter()
+            .chain(add_page_ids.iter())
+            .copied()
+            .max()
+            .unwrap_or(0);
+        max_referenced_page_id = max_referenced_page_id
+            .max(header.log_head_page_id)
+            .max(header.add_head_page_id);
+        if max_referenced_page_id > page_count as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog page_count is below the pages the chains reference",
+            ));
+        }
+
+        // The header is the commit record: pages appended after the last
+        // committed `page_count` are orphans from a crash between the page
+        // append and the header rewrite. Truncating to the committed size
+        // restores the exact pre-crash append position (same protocol as v3).
+        let committed_len = EDITLOG_HEADER_BYTES as u64
+            + (page_count as u64).saturating_mul(EDITLOG_PAGE_SIZE as u64);
+        if file_len > committed_len {
+            file.set_len(committed_len)?;
+        }
+
+        let log_entry_count = usize::try_from(header.log_entry_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog log_entry_count exceeds the addressable size",
+            )
+        })?;
+        if log_entry_count == 0 && header.vector_len == 0 {
+            return Ok(None);
+        }
+        let entries = read_log_entries_v4(&mut file, &log_page_ids, log_entry_count)?;
+        if entries.len() != log_entry_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog history log is shorter than the committed entry count",
+            ));
+        }
+        if header.current_flat == 0 || header.current_flat > header.log_entry_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog current entry points outside the history log",
+            ));
+        }
+
+        // Rebuild the committed history vector: walk parent links from the
+        // current entry to the root, then append the redo tail (entries of
+        // the committed epoch with a higher vector index). `flat` is the
+        // 1-based position of an entry inside the log.
+        let mut branch: Vec<(Option<ChildRef>, u64, u64)> = Vec::new();
+        let mut flat = header.current_flat;
+        loop {
+            let entry = entries.get((flat - 1) as usize).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "qem editlog history parent link points outside the log",
+                )
+            })?;
+            branch.push((entry.root, flat, entry.vector_index));
+            flat = entry.parent_flat;
+            if flat == 0 {
+                break;
+            }
+            if branch.len() > log_entry_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "qem editlog history parent links form a cycle",
+                ));
+            }
+        }
+        branch.reverse();
+        let current_vector_index = branch.last().map(|(_, _, v)| *v).unwrap_or(0);
+        for (position, (_, _, vector_index)) in branch.iter().enumerate() {
+            if *vector_index != position as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "qem editlog history vector positions are inconsistent",
+                ));
+            }
+        }
+
+        let mut redo: Vec<(u64, Option<ChildRef>, u64)> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.epoch == header.epoch && entry.vector_index > current_vector_index
+            })
+            .map(|(idx, entry)| (entry.vector_index, entry.root, idx as u64 + 1))
+            .collect();
+        redo.sort_by_key(|(vector_index, _, _)| *vector_index);
+        let expected_redo_len = header.vector_len.saturating_sub(current_vector_index + 1);
+        if redo.len() as u64 != expected_redo_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog redo tail does not match the committed vector length",
+            ));
+        }
+        for (offset, (vector_index, _, _)) in redo.iter().enumerate() {
+            if *vector_index != current_vector_index + 1 + offset as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "qem editlog redo tail positions are inconsistent",
+                ));
+            }
+        }
+
+        let flushed: Vec<(Option<ChildRef>, u64)> = branch
+            .iter()
+            .map(|(root, flat, _)| (*root, *flat))
+            .chain(redo.iter().map(|(_, root, flat)| (*root, *flat)))
+            .collect();
+        let history: Vec<RootEntry> = flushed
+            .iter()
+            .map(|(root, _)| RootEntry { root: *root })
+            .collect();
+        let history_index = (current_vector_index as usize).min(history.len().saturating_sub(1));
+
+        let add_len = usize::try_from(header.add_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qem editlog add_len exceeds the addressable size",
+            )
+        })?;
+        let add = read_add_bytes_v4(&mut file, &add_page_ids, add_len)?;
+
+        Ok(Some((
+            Self {
+                path,
+                source,
+                file: Some(file),
+                cache: Mutex::new(PageCache::default()),
+                resident_pages: HashMap::new(),
+                next_page_id: page_count as u64,
+                persistence_failed: false,
+                flushed,
+                next_flat: header.log_entry_count + 1,
+                epoch: header.epoch,
+                log_page_ids,
+                add_page_ids,
+                committed_add_len: add_len,
+                legacy: false,
+                page_read_header_bytes: EDITLOG_HEADER_BYTES as u64,
+            },
+            history,
+            history_index,
+            add,
+            meta,
+        )))
+    }
+
+    /// Legacy (v3) recovery: contiguous history/add blocks rewritten whole
+    /// on every flush. Read-only support; the first flush of a reopened v3
+    /// session converts it to the append-only v4 format without data loss.
+    fn open_v3_legacy(
+        path: PathBuf,
+        mut file: File,
+        source: SourceMetadata,
+    ) -> io::Result<OpenDiskSession> {
         let header = read_editlog_header(&mut file)?;
         if header.source_len != source.len
             || header.source_mtime_ns != source.mtime_ns
@@ -263,7 +545,9 @@ impl DiskPageStore {
                 "qem editlog page_count exceeds the addressable size",
             )
         })?;
-        if page_count > bounded_page_count(Some(file_len), usize::MAX) {
+        if page_count
+            > bounded_page_count(Some(file_len), usize::MAX, EDITLOG_V3_HEADER_BYTES as u64)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "qem editlog page_count exceeds what the sidecar can physically hold",
@@ -299,28 +583,45 @@ impl DiskPageStore {
         // so orphan bytes would poison every later flush into
         // `persistence_failed` and silently kill persistence for the rest
         // of the session. Truncating to the committed size restores the
-        // exact pre-crash append position.
-        let committed_len = EDITLOG_HEADER_BYTES as u64
+        // exact pre-crash append position. Legacy v3 sidecars keep their
+        // pages behind the 192-byte v3 header.
+        let committed_len = EDITLOG_V3_HEADER_BYTES as u64
             + (page_count as u64).saturating_mul(EDITLOG_PAGE_SIZE as u64);
         if file.metadata()?.len() > committed_len {
             file.set_len(committed_len)?;
         }
 
-        Ok(Some((
-            Self {
-                path,
-                source,
-                file: Some(file),
-                cache: Mutex::new(PageCache::default()),
-                resident_pages: HashMap::new(),
-                next_page_id: page_count as u64,
-                persistence_failed: false,
-            },
-            history,
-            history_index,
-            add,
-            meta,
-        )))
+        let mut store = Self {
+            path,
+            source,
+            file: Some(file),
+            cache: Mutex::new(PageCache::default()),
+            resident_pages: HashMap::new(),
+            next_page_id: page_count as u64,
+            persistence_failed: false,
+            // Legacy v3 state: nothing is in the append-only log yet, so
+            // the first flush rewrites every entry and the add buffer
+            // into the v4 format (one-time conversion, no data loss).
+            flushed: Vec::new(),
+            next_flat: 1,
+            epoch: 0,
+            log_page_ids: Vec::new(),
+            add_page_ids: Vec::new(),
+            committed_add_len: 0,
+            legacy: false,
+            page_read_header_bytes: EDITLOG_V3_HEADER_BYTES as u64,
+        };
+
+        // Convert the legacy layout right at reopen: the new pages an edit
+        // allocates must land at the v4 offsets, and deferring the rewrite
+        // to the first flush would fail that append-order check. The
+        // conversion alone would leave a crash window where the unsaved
+        // edits are still only in memory, so the recovered state is
+        // committed to the fresh log immediately.
+        store.convert_legacy_file_to_v4()?;
+        store.flush_session(&history, history_index, &add, meta)?;
+
+        Ok(Some((store, history, history_index, add, meta)))
     }
 
     fn get_page(&self, page_id: u64) -> Option<Arc<PiecePage>> {
@@ -334,7 +635,8 @@ impl DiskPageStore {
         }
 
         let mut file = OpenOptions::new().read(true).open(&self.path).ok()?;
-        let page = Arc::new(read_page_from_file(&mut file, page_id).ok()?);
+        let page =
+            Arc::new(read_page_from_file(&mut file, page_id, self.page_read_header_bytes).ok()?);
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(page_id, Arc::clone(&page));
         }
@@ -405,6 +707,75 @@ impl DiskPageStore {
         Ok(())
     }
 
+    /// Rewrites a legacy v3 sidecar file into the v4 page layout. The v3
+    /// pages sit behind the 192-byte v3 header; the append-only format needs
+    /// them behind the 256-byte v4 header, and an in-place append would
+    /// desync every page offset. The rewrite shifts each existing page to
+    /// its v4 offset (last page first, so a page is never read after its
+    /// source bytes were overwritten), resets the append-only bookkeeping,
+    /// and stamps a fresh v4 header; the following flush appends the whole
+    /// in-memory history as new log entries. Piece-page ids are preserved,
+    /// so the recovered tree keeps referencing the same pages.
+    fn convert_legacy_file_to_v4(&mut self) -> io::Result<()> {
+        let Some(file) = self.file.as_mut() else {
+            return Err(io::Error::other("missing editlog handle"));
+        };
+        let page_count = self.next_page_id;
+        let mut buf = vec![0u8; EDITLOG_PAGE_SIZE];
+        for page_id in (1..=page_count).rev() {
+            let source_offset = (EDITLOG_V3_HEADER_BYTES as u64)
+                .saturating_add((page_id - 1).saturating_mul(EDITLOG_PAGE_SIZE as u64));
+            let target_offset = (EDITLOG_HEADER_BYTES as u64)
+                .saturating_add((page_id - 1).saturating_mul(EDITLOG_PAGE_SIZE as u64));
+            file.seek(SeekFrom::Start(source_offset))?;
+            file.read_exact(&mut buf)?;
+            file.seek(SeekFrom::Start(target_offset))?;
+            file.write_all(&buf)?;
+        }
+        file.set_len(
+            (EDITLOG_HEADER_BYTES as u64)
+                .saturating_add(page_count.saturating_mul(EDITLOG_PAGE_SIZE as u64)),
+        )?;
+        let header = EditLogHeaderV4 {
+            page_count,
+            source_len: self.source.len,
+            source_mtime_ns: self.source.mtime_ns,
+            source_fingerprint: self.source.fingerprint,
+            log_head_page_id: 0,
+            log_page_count: 0,
+            log_entry_count: 0,
+            current_flat: 0,
+            epoch: 0,
+            add_head_page_id: 0,
+            add_page_count: 0,
+            add_len: 0,
+            known_byte_len: 0,
+            flags: 0,
+            encoding_origin: 0,
+            encoding: None,
+            vector_len: 0,
+            log_index_page_id: 0,
+            add_index_page_id: 0,
+        };
+        write_editlog_header_v4(file, header)?;
+        file.flush()?;
+        file.sync_all()?;
+        self.flushed.clear();
+        self.next_flat = 1;
+        self.epoch = 0;
+        self.log_page_ids.clear();
+        self.add_page_ids.clear();
+        self.committed_add_len = 0;
+        self.page_read_header_bytes = EDITLOG_HEADER_BYTES as u64;
+        Ok(())
+    }
+
+    /// v4 flush: appends only the history entries the log does not hold yet
+    /// (diffed against the flushed snapshot), appends only the add-buffer
+    /// tail past the committed length, rewrites the two small index pages,
+    /// and commits by rewriting the fixed header. Data pages are never
+    /// rewritten, so a long session pays linear sidecar growth instead of
+    /// the v3 quadratic rewrite of the whole history on every flush.
     fn flush_session(
         &mut self,
         history: &[RootEntry],
@@ -417,26 +788,114 @@ impl DiskPageStore {
             return Err(io::Error::other("editlog persistence is unavailable"));
         }
 
-        let (history_first_page_id, history_page_count) = self.write_history_pages(history)?;
-        let (add_first_page_id, add_page_count) = self.write_add_pages(add_bytes)?;
+        if self.legacy {
+            self.convert_legacy_file_to_v4()?;
+            self.legacy = false;
+        }
 
-        let Some(file) = self.file.as_mut() else {
-            self.persistence_failed = true;
-            return Err(io::Error::other("missing editlog handle"));
+        // History diff: find the first position where the live vector
+        // diverges from the flushed snapshot. Entries before it are already
+        // on disk; entries past it are appended now.
+        let common = self.flushed.len().min(history.len());
+        let mut prefix = 0usize;
+        while prefix < common && self.flushed[prefix].0 == history[prefix].root {
+            prefix += 1;
+        }
+        // A divergence inside the shared prefix (a new edit after undo)
+        // abandons the committed redo tail: entries of the new branch carry
+        // the next epoch, so recovery keeps only the live tail.
+        if prefix < self.flushed.len().min(history.len()) {
+            self.epoch += 1;
+        }
+
+        let page_capacity = log_page_capacity_v4().max(1);
+        let mut pending_page: Vec<HistoryLogEntryV4> = Vec::new();
+        let mut new_flushed: Vec<(Option<ChildRef>, u64)> = Vec::new();
+        let mut parent_flat = if prefix > 0 {
+            self.flushed[prefix - 1].1
+        } else {
+            0
         };
+        for (i, entry) in history.iter().enumerate().skip(prefix) {
+            if pending_page.len() == page_capacity {
+                let bytes = serialize_history_log_page_v4(&pending_page, 0)?;
+                let page_id = self.write_raw_page(bytes)?;
+                self.log_page_ids.push(page_id);
+                pending_page.clear();
+            }
+            let flat = self.next_flat;
+            self.next_flat += 1;
+            pending_page.push(HistoryLogEntryV4 {
+                root: entry.root,
+                parent_flat,
+                vector_index: i as u64,
+                epoch: self.epoch,
+            });
+            new_flushed.push((entry.root, flat));
+            parent_flat = flat;
+        }
+        if !pending_page.is_empty() {
+            let bytes = serialize_history_log_page_v4(&pending_page, 0)?;
+            let page_id = self.write_raw_page(bytes)?;
+            self.log_page_ids.push(page_id);
+        }
+        self.flushed.truncate(prefix);
+        self.flushed.append(&mut new_flushed);
 
-        let header = EditLogHeader {
+        // Add-buffer diff: append only the bytes past the committed length.
+        // A shrinking add buffer rewrites the chain from scratch (defensive:
+        // the buffer grows through inserts, and durability must never
+        // silently shrink).
+        if add_bytes.len() < self.committed_add_len {
+            self.add_page_ids.clear();
+            self.committed_add_len = 0;
+        }
+        let add_capacity = add_page_capacity_v4().max(1);
+        if add_bytes.len() > self.committed_add_len {
+            let mut start = self.committed_add_len;
+            while start < add_bytes.len() {
+                let end = (start + add_capacity).min(add_bytes.len());
+                let bytes = serialize_add_chain_page_v4(&add_bytes[start..end], 0)?;
+                let page_id = self.write_raw_page(bytes)?;
+                self.add_page_ids.push(page_id);
+                start = end;
+            }
+            self.committed_add_len = add_bytes.len();
+        }
+        let add_head = self.add_page_ids.first().copied().unwrap_or(0);
+
+        // Index pages are rewritten on every commit: they enumerate the
+        // chain page ids, which is what keeps every data page append-only.
+        let mut log_index_page_id = 0u64;
+        if !self.log_page_ids.is_empty() {
+            let bytes = serialize_index_page_v4(PageKind::LogIndex, &self.log_page_ids, 0)?;
+            log_index_page_id = self.write_raw_page(bytes)?;
+        }
+        let mut add_index_page_id = 0u64;
+        if !self.add_page_ids.is_empty() {
+            let bytes = serialize_index_page_v4(PageKind::AddIndex, &self.add_page_ids, 0)?;
+            add_index_page_id = self.write_raw_page(bytes)?;
+        }
+
+        let history_index = history_index.min(history.len().saturating_sub(1));
+        let current_flat = self
+            .flushed
+            .get(history_index)
+            .map(|(_, flat)| *flat)
+            .unwrap_or(0);
+        let header = EditLogHeaderV4 {
             page_count: self.next_page_id,
             source_len: self.source.len,
             source_mtime_ns: self.source.mtime_ns,
             source_fingerprint: self.source.fingerprint,
-            history_first_page_id,
-            history_page_count: history_page_count as u64,
-            history_len: history.len() as u64,
-            history_index: history_index as u64,
-            add_first_page_id,
-            add_page_count: add_page_count as u64,
-            add_len: add_bytes.len() as u64,
+            log_head_page_id: self.log_page_ids.first().copied().unwrap_or(0),
+            log_page_count: self.log_page_ids.len() as u64,
+            log_entry_count: self.next_flat.saturating_sub(1),
+            current_flat,
+            epoch: self.epoch,
+            add_head_page_id: add_head,
+            add_page_count: self.add_page_ids.len() as u64,
+            add_len: self.committed_add_len as u64,
             known_byte_len: meta.known_byte_len as u64,
             flags: (if meta.full_index {
                 EDITLOG_FLAG_FULL_INDEX
@@ -456,19 +915,26 @@ impl DiskPageStore {
                 .map(encode_encoding_origin)
                 .unwrap_or(0),
             encoding: meta.encoding,
+            vector_len: history.len() as u64,
+            log_index_page_id,
+            add_index_page_id,
         };
-        // Durability protocol:
+        // Durability protocol (same as v3):
         // 1. append all newly reachable pages first
         // 2. flush/sync those pages
         // 3. rewrite the fixed header as the authoritative commit record
         // 4. flush/sync again so reopen either sees the previous committed
         //    header or the fully updated one
         let result = (|| -> io::Result<()> {
-            file.flush()?;
-            file.sync_all()?;
-            write_editlog_header(file, header)?;
-            file.flush()?;
-            file.sync_all()?;
+            if let Some(file) = self.file.as_mut() {
+                file.flush()?;
+                file.sync_all()?;
+            }
+            if let Some(file) = self.file.as_mut() {
+                write_editlog_header_v4(file, header)?;
+                file.flush()?;
+                file.sync_all()?;
+            }
             Ok(())
         })();
 
@@ -477,38 +943,6 @@ impl DiskPageStore {
             return Err(err);
         }
         Ok(())
-    }
-
-    fn write_history_pages(&mut self, history: &[RootEntry]) -> io::Result<(u64, usize)> {
-        if history.is_empty() {
-            return Ok((0, 0));
-        }
-
-        let capacity = history_page_capacity();
-        let first_page_id = self.next_page_id.saturating_add(1);
-        let mut written = 0usize;
-        for chunk in history.chunks(capacity.max(1)) {
-            let bytes = serialize_history_page(chunk)?;
-            self.write_raw_page(bytes)?;
-            written += 1;
-        }
-        Ok((first_page_id, written))
-    }
-
-    fn write_add_pages(&mut self, add_bytes: &[u8]) -> io::Result<(u64, usize)> {
-        if add_bytes.is_empty() {
-            return Ok((0, 0));
-        }
-
-        let capacity = add_page_capacity();
-        let first_page_id = self.next_page_id.saturating_add(1);
-        let mut written = 0usize;
-        for chunk in add_bytes.chunks(capacity.max(1)) {
-            let bytes = serialize_add_page(chunk)?;
-            self.write_raw_page(bytes)?;
-            written += 1;
-        }
-        Ok((first_page_id, written))
     }
 
     fn write_raw_page(&mut self, bytes: Vec<u8>) -> io::Result<u64> {

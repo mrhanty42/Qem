@@ -1,7 +1,7 @@
 use super::{
-    FragmentationStats, PageKind, Piece, PieceSource, PieceTree, EDITLOG_HEADER_BYTES,
-    EDITLOG_PAGE_HEADER_BYTES, EDITLOG_PAGE_SIZE, INTERNAL_ENTRY_BYTES, LEAF_ENTRY_BYTES,
-    MAX_INTERNAL_CHILDREN, MAX_LEAF_PIECES,
+    FragmentationStats, PageKind, Piece, PieceSource, PieceTree, EDITLOG_PAGE_HEADER_BYTES,
+    EDITLOG_PAGE_SIZE, INTERNAL_ENTRY_BYTES, LEAF_ENTRY_BYTES, MAX_INTERNAL_CHILDREN,
+    MAX_LEAF_PIECES,
 };
 use crate::sidecar::{le_u32, le_u64};
 use crc32fast::Hasher;
@@ -73,9 +73,13 @@ pub(super) fn serialize_page(page: &PiecePage) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-pub(super) fn read_page_from_file(file: &mut File, page_id: u64) -> io::Result<PiecePage> {
+pub(super) fn read_page_from_file(
+    file: &mut File,
+    page_id: u64,
+    header_bytes: u64,
+) -> io::Result<PiecePage> {
     let mut buf = vec![0u8; EDITLOG_PAGE_SIZE];
-    let offset = (EDITLOG_HEADER_BYTES as u64).saturating_add(
+    let offset = header_bytes.saturating_add(
         page_id
             .saturating_sub(1)
             .saturating_mul(EDITLOG_PAGE_SIZE as u64),
@@ -197,7 +201,12 @@ pub(super) fn parse_page(buf: &[u8]) -> io::Result<PiecePage> {
             }
             Ok(PiecePage::Leaf { pieces })
         }
-        PageKind::History | PageKind::Add => Err(io::Error::new(
+        PageKind::History
+        | PageKind::Add
+        | PageKind::HistoryLog
+        | PageKind::AddChain
+        | PageKind::LogIndex
+        | PageKind::AddIndex => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "non-piece editlog page used as piece page",
         )),
@@ -729,8 +738,16 @@ impl PieceTree {
             return Vec::new();
         }
 
+        // Balanced page split: a one-past-capacity rebuild (an insert into a
+        // full page) must split ~evenly instead of emitting a full page plus
+        // a 1-item tail. The `chunks` form turned every insert before a full
+        // page into a [64, 1] split, so repeated inserts at the same end grew
+        // a degenerate "ladder" tree whose depth (and therefore the page path
+        // every edit rewrites) grew linearly with the edit count.
+        let page_count = pieces.len().div_ceil(MAX_LEAF_PIECES).max(1);
+        let part_len = pieces.len().div_ceil(page_count);
         pieces
-            .chunks(MAX_LEAF_PIECES)
+            .chunks(part_len)
             .map(|chunk| {
                 let chunk = chunk.to_vec();
                 // Hostile CRC-valid pages can carry totals that overflow
@@ -758,8 +775,11 @@ impl PieceTree {
             return Vec::new();
         }
 
+        // Balanced split for the same reason as the leaf aggregator above.
+        let page_count = children.len().div_ceil(MAX_INTERNAL_CHILDREN).max(1);
+        let part_len = children.len().div_ceil(page_count);
         children
-            .chunks(MAX_INTERNAL_CHILDREN)
+            .chunks(part_len)
             .map(|chunk| {
                 let chunk = chunk.to_vec();
                 // Saturate for hostile page totals, same as the leaf

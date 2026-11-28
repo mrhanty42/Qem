@@ -1,7 +1,10 @@
+use super::btree::ChildRef;
+use super::history::RootEntry;
+use super::session::{serialize_add_page, serialize_history_page};
 use super::{
     editlog_path, parse_page, serialize_page, source_metadata, DiskPageStore, FragmentationStats,
     Piece, PiecePage, PieceSource, PieceTree, SessionMeta, SourceMetadata, EDITLOG_CACHE_PAGES,
-    EDITLOG_HEADER_BYTES, RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
+    EDITLOG_HEADER_BYTES, EDITLOG_V3_HEADER_BYTES, RESIDENT_PAGES_FAILED_PERSISTENCE_CAP,
 };
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -1521,16 +1524,31 @@ fn bounded_page_count_caps_counters_by_physical_file_size() {
 
     let header_only = EDITLOG_HEADER_BYTES as u64;
     // A sidecar that only holds the header cannot hold any pages.
-    assert_eq!(bounded_page_count(Some(header_only), 5), 0);
+    assert_eq!(
+        bounded_page_count(Some(header_only), 5, EDITLOG_HEADER_BYTES as u64),
+        0
+    );
     // Without a readable file length the raw counter must never reach an
     // allocation: the chain is treated as empty instead.
-    assert_eq!(bounded_page_count(None, usize::MAX), 0);
+    assert_eq!(
+        bounded_page_count(None, usize::MAX, EDITLOG_HEADER_BYTES as u64),
+        0
+    );
 
     let three_pages = header_only + (EDITLOG_PAGE_SIZE as u64) * 3;
-    assert_eq!(bounded_page_count(Some(three_pages), 100), 3);
-    assert_eq!(bounded_page_count(Some(three_pages), 2), 2);
+    assert_eq!(
+        bounded_page_count(Some(three_pages), 100, EDITLOG_HEADER_BYTES as u64),
+        3
+    );
+    assert_eq!(
+        bounded_page_count(Some(three_pages), 2, EDITLOG_HEADER_BYTES as u64),
+        2
+    );
     // Huge files clamp to the caller-provided counter, not the other way.
-    assert_eq!(bounded_page_count(Some(u64::MAX), 7), 7);
+    assert_eq!(
+        bounded_page_count(Some(u64::MAX), 7, EDITLOG_HEADER_BYTES as u64),
+        7
+    );
 }
 
 fn flush_session_with_encoding(
@@ -1672,6 +1690,364 @@ fn editlog_open_rejects_a_legacy_v2_sidecar_as_unsupported() {
     let err = PieceTree::try_open_disk_session(&source, &storage).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// --- v4 append-only sidecar format ---
+
+fn btree_split(piece: Piece, left_len: usize) -> (Option<Piece>, Option<Piece>) {
+    let left = Piece {
+        src: piece.src,
+        start: piece.start,
+        len: left_len,
+        line_breaks: 0,
+    };
+    let right = Piece {
+        src: piece.src,
+        start: piece.start + left_len,
+        len: piece.len - left_len,
+        line_breaks: piece.line_breaks,
+    };
+    (Some(left), Some(right))
+}
+
+fn flush_meta(tree: &PieceTree) -> SessionMeta {
+    SessionMeta {
+        known_byte_len: tree.total_len(),
+        full_index: true,
+        encoding: None,
+        encoding_origin: Some(crate::document::DocumentEncodingOrigin::Utf8FastPath),
+        decoding_had_errors: false,
+    }
+}
+
+/// Regression for the sidecar growth explosion: a degenerate page split
+/// (`[64, 1]` on every overflow) turned repeated inserts at one end into a
+/// "ladder" tree whose page path - rewritten by every edit - grew linearly
+/// with the edit count, so the sidecar paid quadratic bytes. The balanced
+/// split keeps the per-edit page cost flat, so the second half of a stress
+/// run must not outgrow the first half by more than its length ratio.
+#[test]
+fn inserts_at_one_end_keep_the_sidecar_growth_linear() {
+    let dir = temp_editlog_dir("linear-growth");
+    let source = dir.join("sample.txt");
+    let original_len = 80 * 1024;
+    let mut bytes = vec![0u8; original_len];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = if (i + 1) % 5 == 0 { b'\n' } else { b'x' };
+    }
+    fs::write(&source, &bytes).unwrap();
+    let mut tree = PieceTree::from_pieces_disk(
+        &source,
+        vec![Piece {
+            src: PieceSource::Original,
+            start: 0,
+            len: original_len,
+            line_breaks: original_len / 5,
+        }],
+    )
+    .unwrap();
+    let mut split = btree_split;
+    let mut add: Vec<u8> = Vec::new();
+    let sidecar = editlog_path(&source);
+
+    for i in 0..500usize {
+        tree.insert(
+            0,
+            Piece {
+                src: PieceSource::Add,
+                start: add.len(),
+                len: 3,
+                line_breaks: 1,
+            },
+            &mut split,
+        )
+        .unwrap();
+        add.extend_from_slice(b"ab\n");
+        if (i + 1) % 50 == 0 {
+            tree.flush_session(&add, flush_meta(&tree)).unwrap();
+        }
+    }
+    let at_500 = fs::metadata(&sidecar).unwrap().len();
+    for i in 500..2000usize {
+        tree.insert(
+            0,
+            Piece {
+                src: PieceSource::Add,
+                start: add.len(),
+                len: 3,
+                line_breaks: 1,
+            },
+            &mut split,
+        )
+        .unwrap();
+        add.extend_from_slice(b"ab\n");
+        if (i + 1) % 50 == 0 {
+            tree.flush_session(&add, flush_meta(&tree)).unwrap();
+        }
+    }
+    let at_2000 = fs::metadata(&sidecar).unwrap().len();
+
+    let first_half = at_500;
+    let second_half = at_2000 - at_500;
+    // Linear growth: the second half covers 3x the edits of the first half.
+    // The degenerate ladder paid ~15x (quadratic); allow a generous 5x.
+    assert!(
+        second_half <= first_half * 5 + 1_048_576,
+        "second-half sidecar growth {} bytes must stay linear against first-half {} bytes",
+        second_half,
+        first_half
+    );
+    assert!(
+        at_2000 < 60 * 1024 * 1024,
+        "2000 edits must not inflate the sidecar to {} bytes",
+        at_2000
+    );
+
+    // The rebuilt tree must still answer correctly after all that churn.
+    drop(tree);
+    let reopened = PieceTree::open_disk(&source).unwrap();
+    assert_eq!(reopened.total_len(), original_len + 2000 * 3);
+
+    let _ = fs::remove_file(&sidecar);
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// v4 keeps the redo tail across reopen (the committed epoch marks the live
+/// entries), while a new edit after undo truncates the tail for good.
+#[test]
+fn redo_tail_survives_reopen_and_branch_truncation_ends_it() {
+    let dir = temp_editlog_dir("redo-tail");
+    let source = dir.join("sample.txt");
+    fs::write(&source, b"abcdef\n").unwrap();
+    let mut tree = PieceTree::from_pieces_disk(
+        &source,
+        vec![Piece {
+            src: PieceSource::Original,
+            start: 0,
+            len: 7,
+            line_breaks: 1,
+        }],
+    )
+    .unwrap();
+    let mut split = btree_split;
+    let mut add: Vec<u8> = Vec::new();
+    for chunk in [&b"11"[..], &b"22"[..], &b"33"[..]] {
+        tree.insert(
+            0,
+            Piece {
+                src: PieceSource::Add,
+                start: add.len(),
+                len: 2,
+                line_breaks: 0,
+            },
+            &mut split,
+        )
+        .unwrap();
+        add.extend_from_slice(chunk);
+    }
+    tree.flush_session(&add, flush_meta(&tree)).unwrap();
+    drop(tree);
+
+    // Reopen, undo back to the base state, flush: the redo tail must survive.
+    let mut reopened = PieceTree::open_disk(&source).unwrap();
+    assert_eq!(reopened.total_len(), 13);
+    for _ in 0..3 {
+        assert!(reopened.undo((7, false)).is_some());
+    }
+    assert_eq!(reopened.total_len(), 7);
+    reopened.flush_session(&add, flush_meta(&reopened)).unwrap();
+    drop(reopened);
+
+    let mut again = PieceTree::open_disk(&source).unwrap();
+    let redo_expectations = [9usize, 11, 13];
+    for expected in redo_expectations {
+        assert!(
+            again.redo((7, false)).is_some(),
+            "redo tail must survive the reopen"
+        );
+        assert_eq!(again.total_len(), expected);
+    }
+    drop(again);
+
+    // Branch after undo: the redo tail is truncated and never comes back.
+    // The reopen stands on the committed position (the base state), so redo
+    // back to the tip first.
+    let mut branch = PieceTree::open_disk(&source).unwrap();
+    assert_eq!(branch.total_len(), 7);
+    for expected in [9usize, 11, 13] {
+        assert!(branch.redo((7, false)).is_some());
+        assert_eq!(branch.total_len(), expected);
+    }
+    for _ in 0..3 {
+        assert!(branch.undo((7, false)).is_some());
+    }
+    branch
+        .insert(
+            0,
+            Piece {
+                src: PieceSource::Add,
+                start: add.len(),
+                len: 2,
+                line_breaks: 0,
+            },
+            &mut split,
+        )
+        .unwrap();
+    let mut branched_add = add.clone();
+    branched_add.extend_from_slice(b"44");
+    branch
+        .flush_session(&branched_add, flush_meta(&branch))
+        .unwrap();
+    drop(branch);
+
+    let mut after_branch = PieceTree::open_disk(&source).unwrap();
+    assert_eq!(after_branch.total_len(), 9);
+    assert!(
+        after_branch.redo((9, false)).is_none(),
+        "a branched history must not resurrect the abandoned redo tail"
+    );
+
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Legacy v3 sidecars (contiguous history/add blocks behind a 192-byte
+/// header) still recover, and the first flush converts them to the
+/// append-only format without losing the unsaved edits.
+#[test]
+fn legacy_v3_sidecar_converts_on_the_first_flush() {
+    let dir = temp_editlog_dir("v3-convert");
+    let source = dir.join("sample.txt");
+    fs::write(&source, b"abcdef\n").unwrap();
+    let source_meta = source_metadata(&source).unwrap();
+
+    // Hand-assemble a v3 sidecar: one original leaf, one add leaf, an
+    // internal root over both, then the contiguous history and add blocks.
+    // Page layout: 1 = original leaf, 2 = add leaf, 3 = root, 4 = history,
+    // 5 = add bytes.
+    let orig_piece = Piece {
+        src: PieceSource::Original,
+        start: 0,
+        len: 7,
+        line_breaks: 1,
+    };
+    let add_piece = Piece {
+        src: PieceSource::Add,
+        start: 0,
+        len: 2,
+        line_breaks: 0,
+    };
+    let orig_leaf_ref = ChildRef {
+        page_id: 1,
+        total_bytes: 7,
+        total_line_breaks: 1,
+    };
+    let add_leaf_ref = ChildRef {
+        page_id: 2,
+        total_bytes: 2,
+        total_line_breaks: 0,
+    };
+    let root_ref = ChildRef {
+        page_id: 3,
+        total_bytes: 9,
+        total_line_breaks: 1,
+    };
+    let pages: Vec<Vec<u8>> = vec![
+        serialize_page(&PiecePage::Leaf {
+            pieces: vec![orig_piece],
+        })
+        .unwrap(),
+        serialize_page(&PiecePage::Leaf {
+            pieces: vec![add_piece],
+        })
+        .unwrap(),
+        serialize_page(&PiecePage::Internal {
+            children: vec![add_leaf_ref, orig_leaf_ref],
+        })
+        .unwrap(),
+        serialize_history_page(&[
+            RootEntry {
+                root: Some(orig_leaf_ref),
+            },
+            RootEntry {
+                root: Some(root_ref),
+            },
+        ])
+        .unwrap(),
+        serialize_add_page(b"ab").unwrap(),
+    ];
+
+    // Hand-assembled 192-byte v3 header: the production v3 writer is gone
+    // (v4 is the only written format), so the fixture builds the raw layout.
+    let mut header = [0u8; EDITLOG_V3_HEADER_BYTES];
+    header[0..8].copy_from_slice(b"QEMEDT1\0");
+    header[8..12].copy_from_slice(&3u32.to_le_bytes());
+    header[12..16].copy_from_slice(&(super::EDITLOG_PAGE_SIZE as u32).to_le_bytes());
+    header[16..24].copy_from_slice(&(pages.len() as u64).to_le_bytes());
+    header[24..32].copy_from_slice(&source_meta.len.to_le_bytes());
+    header[32..40].copy_from_slice(&source_meta.mtime_ns.to_le_bytes());
+    header[40..48].copy_from_slice(&source_meta.fingerprint.to_le_bytes());
+    header[48..56].copy_from_slice(&4u64.to_le_bytes()); // history first page
+    header[56..64].copy_from_slice(&1u64.to_le_bytes()); // history page count
+    header[64..72].copy_from_slice(&2u64.to_le_bytes()); // history len
+    header[72..80].copy_from_slice(&1u64.to_le_bytes()); // history index
+    header[80..88].copy_from_slice(&5u64.to_le_bytes()); // add first page
+    header[88..96].copy_from_slice(&1u64.to_le_bytes()); // add page count
+    header[96..104].copy_from_slice(&2u64.to_le_bytes()); // add len
+    header[104..112].copy_from_slice(&9u64.to_le_bytes()); // known_byte_len
+    header[112..120].copy_from_slice(&super::EDITLOG_FLAG_FULL_INDEX.to_le_bytes());
+    let sidecar = editlog_path(&source);
+    {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&sidecar)
+            .unwrap();
+        file.write_all(&header).unwrap();
+        for page in &pages {
+            file.write_all(page).unwrap();
+        }
+        file.sync_all().unwrap();
+    }
+
+    // v3 recovery: the unsaved edits (the "ab" insert) must come back.
+    let mut tree = PieceTree::open_disk(&source).unwrap();
+    assert_eq!(tree.total_len(), 9);
+
+    // A new edit + flush converts the sidecar to v4.
+    let mut split = btree_split;
+    tree.insert(
+        0,
+        Piece {
+            src: PieceSource::Add,
+            start: 2,
+            len: 2,
+            line_breaks: 0,
+        },
+        &mut split,
+    )
+    .unwrap();
+    tree.flush_session(b"abcc", flush_meta(&tree)).unwrap();
+    drop(tree);
+
+    // v4 recovery of the converted sidecar: full history including undo.
+    let mut reopened = PieceTree::open_disk(&source).unwrap();
+    assert_eq!(reopened.total_len(), 11);
+    assert!(reopened.undo((11, false)).is_some());
+    assert_eq!(reopened.total_len(), 9);
+    assert!(reopened.undo((9, false)).is_some());
+    assert_eq!(reopened.total_len(), 7);
+    drop(reopened);
+
+    // Reopen once more: the flushed state is the converted v4 snapshot.
+    let final_tree = PieceTree::open_disk(&source).unwrap();
+    assert_eq!(final_tree.total_len(), 11);
+
+    let _ = fs::remove_file(&sidecar);
     let _ = fs::remove_file(&source);
     let _ = fs::remove_dir_all(&dir);
 }
