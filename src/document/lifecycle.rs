@@ -54,6 +54,16 @@ pub(crate) enum OpenProgressPhase {
 /// it, exactly like the bounded head sample real editors use.
 pub(super) const LINE_ENDING_PROBE_MAX_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
+/// The probe slice an open may inspect for line endings: hard-capped at
+/// [`LINE_ENDING_PROBE_MAX_BYTES`], so a file without an early newline can
+/// never make the open path scan synchronously past the window (the 50 GiB
+/// freeze regression this guards against). Kept as a named function so a
+/// unit test can pin the cap - a timing-based integration test flaked on
+/// slow CI runners.
+pub(super) fn line_ending_probe_slice(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes.len().min(LINE_ENDING_PROBE_MAX_BYTES)]
+}
+
 fn line_ending_probe_bytes(bytes: &[u8]) -> usize {
     let Some(pos) = memchr::memchr2(b'\n', b'\r', bytes) else {
         return bytes.len();
@@ -1043,7 +1053,7 @@ impl Document {
             .map(|analysis| analysis.line_ending)
             .unwrap_or_else(|| {
                 let bytes = storage.bytes();
-                let probe = &bytes[..bytes.len().min(LINE_ENDING_PROBE_MAX_BYTES)];
+                let probe = line_ending_probe_slice(bytes);
                 inspected_source_bytes = line_ending_probe_bytes(probe);
                 progress.report_inspected(inspected_source_bytes);
                 detect_line_ending(probe)

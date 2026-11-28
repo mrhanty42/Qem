@@ -799,7 +799,7 @@ mod tests {
             .open(&source_path)
             .unwrap();
         let snapshot_path = dir.join("snapshot.bin");
-        let mut snapshot = super::copy_into_snapshot(&mut source, &snapshot_path).unwrap();
+        let snapshot = super::copy_into_snapshot(&mut source, &snapshot_path).unwrap();
 
         let mut contents = Vec::new();
         snapshot

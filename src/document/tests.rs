@@ -8648,7 +8648,19 @@ fn piece_table_promotion_rope_history_covers_post_promotion_edits() {
 }
 
 #[test]
-fn line_ending_probe_is_bounded_when_first_break_is_beyond_window() {
+fn line_ending_probe_slice_is_capped_at_the_window() {
+    let bytes = vec![b'a'; super::lifecycle::LINE_ENDING_PROBE_MAX_BYTES + 1024 * 1024];
+    let probe = super::lifecycle::line_ending_probe_slice(&bytes);
+    assert_eq!(probe.len(), super::lifecycle::LINE_ENDING_PROBE_MAX_BYTES);
+    // A shorter file keeps its whole content inside the probe.
+    assert_eq!(
+        super::lifecycle::line_ending_probe_slice(&bytes[..64]).len(),
+        64
+    );
+}
+
+#[test]
+fn line_ending_probe_first_break_beyond_window_still_opens_as_lf() {
     let dir = std::env::temp_dir().join(format!("qem-probe-bound-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("no-early-newline.bin");
@@ -8659,15 +8671,12 @@ fn line_ending_probe_is_bounded_when_first_break_is_beyond_window() {
     content.extend_from_slice(b"\r\ntail\n");
     std::fs::write(&path, &content).unwrap();
 
-    let started = Instant::now();
+    // The probe cap is pinned by the unit test below (a timing assert
+    // flaked on a slow CI runner); this test keeps the end-to-end behavior:
+    // a document whose first break sits past the window still opens and
+    // detects Lf.
     let doc = Document::open(&path).unwrap();
-    let elapsed = started.elapsed();
-
     assert_eq!(doc.line_ending(), LineEnding::Lf);
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "open scanned past the probe window in {elapsed:?}"
-    );
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
