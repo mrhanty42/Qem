@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- `.qem.lineidx` pages now carry a CRC32 (sidecar format version 4), so a
+  flipped byte inside a checkpoint value fails typed and the stale sidecar
+  rebuilds instead of parsing into silently wrong line starts (the fix the
+  roadmap parked with the next sidecar format bump). Sidecars written by
+  older builds are rejected as stale and rebuilt automatically.
 - Long editing sessions no longer grind to a halt. Two defects compounded:
   (1) the `.qem.editlog` sidecar rewrote the whole history vector and the
   whole add buffer on every flush and kept every dead page, so a session of

@@ -1,6 +1,7 @@
 use crate::sidecar::{le_u32, le_u64};
 use crate::source_identity::sampled_content_fingerprint;
 use crate::storage::FileStorage;
+use crc32fast::Hasher;
 use memchr::memchr2_iter;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -14,7 +15,7 @@ const INDEX_MAGIC: &[u8; 8] = b"QEMIDX1\0";
 // `.qem.lineidx` is an internal cache sidecar rather than a stable external
 // format. Qem may bump this version across releases and rebuild the cache
 // instead of preserving compatibility with older index files.
-const INDEX_VERSION: u32 = 3;
+const INDEX_VERSION: u32 = 4;
 const INDEX_PAGE_SIZE: usize = 4096;
 const INDEX_HEADER_BYTES: usize = 128;
 const INDEX_PAGE_HEADER_BYTES: usize = 16;
@@ -830,7 +831,7 @@ fn write_page(
 ) -> io::Result<u64> {
     let page_id = page_count.saturating_add(1);
     let mut buf = vec![0u8; INDEX_PAGE_SIZE];
-    buf[0] = kind as u8;
+    buf[4] = kind as u8;
     buf[8..16].copy_from_slice(&(entries.len() as u64).to_le_bytes());
     let mut cursor = INDEX_PAGE_HEADER_BYTES;
     for entry in entries {
@@ -839,6 +840,9 @@ fn write_page(
         buf[cursor + 16..cursor + 24].copy_from_slice(&entry.child_page.to_le_bytes());
         cursor += INDEX_ENTRY_BYTES;
     }
+    let mut hasher = Hasher::new();
+    hasher.update(&buf[4..]);
+    buf[0..4].copy_from_slice(&hasher.finalize().to_le_bytes());
     file.seek(SeekFrom::End(0))?;
     file.write_all(&buf)?;
     *page_count = page_id;
@@ -894,9 +898,27 @@ fn read_header(file: &mut File) -> io::Result<FileHeader> {
 }
 
 fn parse_page(buf: &[u8]) -> io::Result<Page> {
-    let kind = match buf.first().copied() {
-        Some(1) => PageKind::Internal,
-        Some(2) => PageKind::Leaf,
+    // Every page carries a CRC32 over everything after the checksum itself,
+    // so a flipped byte inside a checkpoint value fails typed instead of
+    // parsing into silently wrong line starts.
+    if buf.len() != INDEX_PAGE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid qem line index page size",
+        ));
+    }
+    let expected_crc = le_u32(buf, 0, "qem line index page")?;
+    let mut hasher = Hasher::new();
+    hasher.update(&buf[4..]);
+    if hasher.finalize() != expected_crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "qem line index page checksum mismatch",
+        ));
+    }
+    let kind = match buf[4] {
+        1 => PageKind::Internal,
+        2 => PageKind::Leaf,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -904,8 +926,8 @@ fn parse_page(buf: &[u8]) -> io::Result<Page> {
             ));
         }
     };
-    // Index pages carry no checksum, so the raw entry counter is bounded by
-    // what a page can physically hold before it reaches the allocation below.
+    // The checksummed entry counter is still bounded by what a page can
+    // physically hold before it reaches the allocation below.
     let max_entries = (INDEX_PAGE_SIZE - INDEX_PAGE_HEADER_BYTES) / INDEX_ENTRY_BYTES;
     let count = le_u64(buf, 8, "qem line index page")? as usize;
     if count > max_entries {
@@ -983,9 +1005,11 @@ mod tests {
     use super::{
         build_index_file, build_or_open_index, merge_contiguous_ranges, sidecar_path,
         source_metadata, DiskLineIndex, FileHeader, PageKind, ReadyDiskLineIndex,
-        INDEX_HEADER_BYTES, INDEX_PAGE_HEADER_BYTES, INDEX_PAGE_SIZE,
+        INDEX_CHECKPOINT_STRIDE_LINES, INDEX_ENTRY_BYTES, INDEX_HEADER_BYTES,
+        INDEX_PAGE_HEADER_BYTES, INDEX_PAGE_SIZE,
     };
     use crate::storage::FileStorage;
+    use crc32fast::Hasher;
     use std::fs;
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Mutex;
@@ -1147,12 +1171,28 @@ mod tests {
         );
     }
 
+    fn checksummed_page(kind: u8, entries: &[(u64, u64, u64)]) -> Vec<u8> {
+        let mut buf = vec![0u8; INDEX_PAGE_SIZE];
+        buf[4] = kind;
+        buf[8..16].copy_from_slice(&(entries.len() as u64).to_le_bytes());
+        let mut cursor = INDEX_PAGE_HEADER_BYTES;
+        for (line0, byte0, child_page) in entries {
+            buf[cursor..cursor + 8].copy_from_slice(&line0.to_le_bytes());
+            buf[cursor + 8..cursor + 16].copy_from_slice(&byte0.to_le_bytes());
+            buf[cursor + 16..cursor + 24].copy_from_slice(&child_page.to_le_bytes());
+            cursor += INDEX_ENTRY_BYTES;
+        }
+        let mut hasher = Hasher::new();
+        hasher.update(&buf[4..]);
+        buf[0..4].copy_from_slice(&hasher.finalize().to_le_bytes());
+        buf
+    }
+
     #[test]
     fn parse_page_rejects_overfull_entry_counts() {
-        // Index pages carry no checksum; a corrupt counter must surface as a
-        // typed error instead of driving the allocation below.
-        let mut buf = vec![0u8; INDEX_PAGE_SIZE];
-        buf[0] = 2; // Leaf
+        // A checksummed but overfull counter must surface as a typed error
+        // instead of driving the allocation below.
+        let mut buf = checksummed_page(2, &[]);
         buf[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
 
         let err = super::parse_page(&buf).unwrap_err();
@@ -1161,10 +1201,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_page_rejects_a_corrupted_page_bytes() {
+        // The motivating defect: a flipped byte inside a checkpoint value
+        // must fail typed instead of parsing into silently wrong line starts.
+        let mut buf = checksummed_page(
+            1,
+            &[(0, 0, 2), (INDEX_CHECKPOINT_STRIDE_LINES, 1_048_576, 3)],
+        );
+        let cursor = INDEX_PAGE_HEADER_BYTES + INDEX_ENTRY_BYTES + 8; // second entry byte0
+        buf[cursor] ^= 0x40;
+
+        let err = super::parse_page(&buf).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parse_page_accepts_a_well_formed_page() {
+        let buf = checksummed_page(
+            1,
+            &[(0, 0, 2), (INDEX_CHECKPOINT_STRIDE_LINES, 1_048_576, 3)],
+        );
+
+        let page = super::parse_page(&buf).unwrap();
+
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[1].byte0, 1_048_576);
+    }
+
+    #[test]
     fn parse_page_rejects_internal_pages_with_zero_child_references() {
-        let mut buf = vec![0u8; INDEX_PAGE_SIZE];
-        buf[0] = 1; // Internal
-        buf[8..16].copy_from_slice(&1u64.to_le_bytes());
+        let mut buf = checksummed_page(1, &[(0, 0, 1)]);
         let cursor = INDEX_PAGE_HEADER_BYTES;
         buf[cursor + 16..cursor + 24].copy_from_slice(&0u64.to_le_bytes());
 
@@ -1175,13 +1242,7 @@ mod tests {
 
     #[test]
     fn parse_page_accepts_well_formed_internal_pages() {
-        let mut buf = vec![0u8; INDEX_PAGE_SIZE];
-        buf[0] = 1; // Internal
-        buf[8..16].copy_from_slice(&1u64.to_le_bytes());
-        let cursor = INDEX_PAGE_HEADER_BYTES;
-        buf[cursor..cursor + 8].copy_from_slice(&5u64.to_le_bytes());
-        buf[cursor + 8..cursor + 16].copy_from_slice(&64u64.to_le_bytes());
-        buf[cursor + 16..cursor + 24].copy_from_slice(&1u64.to_le_bytes());
+        let buf = checksummed_page(1, &[(5, 64, 1)]);
 
         let page = super::parse_page(&buf).unwrap();
 
