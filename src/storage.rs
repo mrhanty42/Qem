@@ -286,6 +286,12 @@ fn open_snapshot_backing(path: &Path) -> Result<StorageBacking, StorageOpenError
 #[cfg(not(windows))]
 fn copy_into_snapshot(source: &mut File, snapshot_path: &Path) -> io::Result<File> {
     source.seek(SeekFrom::Start(0))?;
+    // Clone-on-write snapshots make opening a huge file on macOS and Linux
+    // instant instead of paying a full-file copy (the whole point of the
+    // snapshot backing); filesystems without cloning fall back to the copy.
+    if let Some(snapshot) = try_reflink_snapshot(source, snapshot_path)? {
+        return Ok(snapshot);
+    }
     let mut snapshot = OpenOptions::new()
         .create_new(true)
         .read(true)
@@ -296,6 +302,66 @@ fn copy_into_snapshot(source: &mut File, snapshot_path: &Path) -> io::Result<Fil
     snapshot.sync_all()?;
     snapshot.seek(SeekFrom::Start(0))?;
     Ok(snapshot)
+}
+
+/// Attempts a filesystem-level clone for the snapshot backing. Returns
+/// `Ok(Some(file))` when the clone succeeded, and `Ok(None)` when the
+/// filesystem cannot clone - every clone failure is a fallback to the full
+/// copy, never a hard error, because the copy path is always correct.
+#[cfg(unix)]
+fn try_reflink_snapshot(source: &File, snapshot_path: &Path) -> io::Result<Option<File>> {
+    use std::os::unix::io::AsRawFd;
+
+    #[cfg(target_os = "macos")]
+    {
+        // fclonefileat clones an open source into a not-yet-existing
+        // destination path atomically.
+        let c_path = std::ffi::CString::new(snapshot_path.as_os_str().as_encoded_bytes())?;
+        let rc =
+            unsafe { libc::fclonefileat(source.as_raw_fd(), libc::AT_FDCWD, c_path.as_ptr(), 0) };
+        if rc != 0 {
+            // The destination may exist as an empty file on some failure
+            // paths; remove it so the fallback can create it fresh.
+            let _ = fs::remove_file(snapshot_path);
+            return Ok(None);
+        }
+        let mut snapshot = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(snapshot_path)?;
+        snapshot.seek(SeekFrom::Start(0))?;
+        Ok(Some(snapshot))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut snapshot = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(snapshot_path)?;
+        // FICLONE shares the source blocks copy-on-write; EINVAL/ENOTTY on
+        // filesystems without reflink support fall back to the copy.
+        let rc = unsafe {
+            libc::ioctl(
+                snapshot.as_raw_fd(),
+                libc::FICLONE as libc::c_ulong,
+                source.as_raw_fd(),
+            )
+        };
+        if rc != 0 {
+            drop(snapshot);
+            let _ = fs::remove_file(snapshot_path);
+            return Ok(None);
+        }
+        snapshot.seek(SeekFrom::Start(0))?;
+        Ok(Some(snapshot))
+    }
+}
+
+#[cfg(all(not(windows), not(unix)))]
+fn try_reflink_snapshot(_source: &File, _snapshot_path: &Path) -> io::Result<Option<File>> {
+    Ok(None)
 }
 
 #[cfg(not(windows))]
@@ -712,6 +778,37 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Clone-on-write snapshots (or the full-copy fallback on filesystems
+    /// without reflink support) must hand back a file whose content matches
+    /// the source: CI covers both paths (APFS clones on macOS, ext4 falls
+    /// back on Linux).
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_backing_matches_source_content_on_unix() {
+        use std::io::Read;
+
+        let dir = test_dir("reflink-snapshot");
+        let source_path = dir.join("source.bin");
+        let expected = vec![b'A'; 8192];
+        fs::write(&source_path, &expected).unwrap();
+
+        let mut source = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&source_path)
+            .unwrap();
+        let snapshot_path = dir.join("snapshot.bin");
+        let mut snapshot = super::copy_into_snapshot(&mut source, &snapshot_path).unwrap();
+
+        let mut contents = Vec::new();
+        snapshot
+            .by_ref()
+            .take(expected.len() as u64)
+            .read_to_end(&mut contents)
+            .unwrap();
+        assert_eq!(contents, expected);
+    }
 
     #[test]
     fn read_range_returns_requested_slice() {

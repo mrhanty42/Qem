@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Opening files on macOS and Linux no longer pays a full-file copy for the
+  snapshot backing: filesystems with clone support (APFS on macOS, reflink
+  on Linux) hand back an instant copy-on-write snapshot, and filesystems
+  without cloning fall back to the copy path unchanged. A 50 GB file opens
+  in seconds instead of minutes on supported filesystems.
 - `.qem.lineidx` pages now carry a CRC32 (sidecar format version 4), so a
   flipped byte inside a checkpoint value fails typed and the stale sidecar
   rebuilds instead of parsing into silently wrong line starts (the fix the

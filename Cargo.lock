@@ -2378,6 +2378,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "encoding_rs",
+ "libc",
  "memchr",
  "memmap2",
  "proptest",
