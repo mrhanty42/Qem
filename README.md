@@ -1,5 +1,9 @@
 # Qem
 
+[![ci](https://github.com/mrhanty42/Qem/actions/workflows/ci.yml/badge.svg)](https://github.com/mrhanty42/Qem/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/qem.svg)](https://crates.io/crates/qem)
+[![docs](https://img.shields.io/docsrs/qem)](https://docs.rs/qem)
+
 Qem is a Rust text engine for editors, viewers, and tools that need to work
 with files too large to load into one `String`.
 
