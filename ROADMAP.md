@@ -115,23 +115,14 @@ fix was verified by temporarily reverting it and watching that test fail.
   the next save and reopen. A cap or sliding window changes the
   user-visible undo depth, so it needs an explicit product decision before
   implementation.
-- **Checksums for `.qem.lineidx` pages.** Index pages validate their
-  structural invariants but carry no CRC, so a flipped byte inside a
-  checkpoint value parses cleanly and yields silently wrong line starts.
-  The fix belongs with the next sidecar format bump.
-- **Cheaper snapshot backing off Windows.** Non-Windows snapshot backing
-  still copies the whole source file at open; a cheaper backing needs
-  design work. Snapshot `save_async` should also share the edit buffer
-  through `Arc` instead of cloning it on the caller thread.
-- **Remove `unwrap` and `expect` from recoverable paths**, replacing the
-  remaining default-value patterns with typed error propagation.
+- **Share the edit buffer through `Arc` in snapshot `save_async`** instead
+  of cloning it on the caller thread (the snapshot backing itself now
+  clones copy-on-write on supported filesystems).
 - **Backing transitions surface as events.** The `mmap → piece_table`
   promotion is observable today only through typed status polling;
   surfacing transitions as typed events lets frontends react instead of
   guessing.
-- **Regression benchmarks in CI.** Open, first viewport, first edit on huge
-  files, edited save, literal search, and regex search each get a short
-  regression bench tied to the recorded baselines.
+
 
 ## Completed after the 1.0 release
 
@@ -162,6 +153,20 @@ fix was verified by temporarily reverting it and watching that test fail.
   panicked on leads above 0x9F and is resized to 11280 entries). The port
   was verified by a differential sweep against encoding_rs on all three
   encodings.
+- **Regression benchmarks run in CI.** A short `regression` benchmark
+  (open + first viewport, first edit + save, literal and regex search on a
+  20k-line fixture with tightened criterion settings) runs on every CI
+  push; the numbers land in the job log and a criterion-results artifact,
+  ready to be compared against the recorded baselines in
+  `benches/baselines/`. Threshold gating stays out of CI on purpose:
+  shared-runner timing noise would flake.
+- **Recoverable paths carry no `unwrap`/`expect`.** A full sweep of the
+  non-test code found no recoverable `unwrap`/`expect` calls: the remaining
+  ones are either test fixtures or static invariants whose inputs are
+  compile-time constants or checked earlier in the same function ("this
+  encoding is a known label", "piece-table presence checked above"), each
+  with a message describing the invariant. New code inherits the typed
+  error propagation conventions of the frozen surface.
 - **The overgrown modules are split into focused units.** `src/document.rs`
   (piece_table, scan, fixtures, pieces) and `src/piece_tree.rs` (store,
   btree, session, history) are now module directories. The public surface

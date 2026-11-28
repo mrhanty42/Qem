@@ -67,5 +67,9 @@ name = "frontend_session"
 required-features = ["editor"]
 
 [[bench]]
+name = "regression"
+harness = false
+
+[[bench]]
 name = "document_perf"
 harness = false
