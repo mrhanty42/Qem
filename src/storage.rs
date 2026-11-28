@@ -803,7 +803,6 @@ mod tests {
 
         let mut contents = Vec::new();
         snapshot
-            .by_ref()
             .take(expected.len() as u64)
             .read_to_end(&mut contents)
             .unwrap();
